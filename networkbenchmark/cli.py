@@ -308,8 +308,22 @@ def cmd_protocols(args):
 
 
 def cmd_webui(args):
+    import importlib.util
     import os
     import subprocess
+
+    # The web UI runs as a `streamlit run` subprocess using this same
+    # interpreter. Fail early with an actionable message if its dependencies
+    # are not installed in *this* Python environment.
+    missing = [m for m in ("streamlit", "pandas") if importlib.util.find_spec(m) is None]
+    if missing:
+        print("ERROR: the web UI requires these packages, which are not installed "
+              f"in this Python environment:\n    {', '.join(missing)}\n")
+        print(f"Interpreter: {sys.executable}\n")
+        print("Install the dependencies with:")
+        print(f"    {sys.executable} -m pip install -r requirements.txt")
+        print("(or run this command with the same interpreter you used for `pip install`).")
+        sys.exit(1)
 
     app_path = os.path.join(os.path.dirname(__file__), "webui", "app.py")
     cmd = [sys.executable, "-m", "streamlit", "run", app_path]

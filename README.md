@@ -63,6 +63,15 @@ networkbenchmark webui
 > imports and will raise `attempted relative import with no known parent
 > package`. Use `NetBench.py`, `-m networkbenchmark`, or the console script.
 
+**Install dependencies first, into the interpreter you launch with.** The
+dependencies (`streamlit`, `pandas`, `ipwhois`) must be installed for the
+*same* Python you run. If you use the virtualenv, activate it (or call
+`.venv/bin/python NetBench.py ...`) so `python`/`python3` resolves to the
+venv. Running `python3 NetBench.py webui` against your *system* Python will
+fail with a "streamlit not found" style error until you either activate the
+venv or `pip install -r requirements.txt` for that interpreter. The `webui`
+command now checks this up front and prints the exact install command.
+
 All usage examples below use the `networkbenchmark` console script, but you
 can substitute `python NetBench.py` for any of them.
 
