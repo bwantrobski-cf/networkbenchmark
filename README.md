@@ -171,3 +171,8 @@ Override the location per-run with `--log-dir <path>`.
   macOS/Windows report `n/a` (no stable public API from Python).
 - MTR/PMTUD/ESP/GRE are implemented with raw sockets using the Python
   standard library only (no scapy dependency).
+- The GRE reachability probe emits a standard **GRE version-0** header
+  (RFC 2784: zero flags/version, protocol type `0x0800`/IPv4) -- the same
+  variant used by default on Cisco IOS, the Linux `ip_gre` module, and Palo
+  Alto GRE tunnels -- so it traverses GRE-aware middleboxes like real tunnel
+  traffic. (GRE version 1 is PPTP-only and is not used.)

@@ -17,9 +17,13 @@ from . import packetutils as pkt
 
 
 def _raw_proto_echo_check(server_ip: str, proto: int, label: str,
-                           timeout_sec: float = 2.0, attempts: int = 3) -> dict:
+                           timeout_sec: float = 2.0, attempts: int = 3,
+                           header: bytes = b"") -> dict:
     marker = secrets.token_bytes(8)
-    payload = constants.CONNECTIVITY_MAGIC + marker
+    # `header` (e.g. a GRE v0 header) precedes the reachability magic so the
+    # packet is a well-formed instance of the protocol on the wire. The server
+    # echoes the whole body back verbatim, so the round-trip comparison holds.
+    payload = header + constants.CONNECTIVITY_MAGIC + marker
 
     result = {"success": False, "protocol": label, "target": server_ip, "rtt_ms": None, "error": None}
 
@@ -72,7 +76,9 @@ def esp_native_check(server_ip: str, timeout_sec: float = 2.0) -> dict:
 
 
 def gre_check(server_ip: str, timeout_sec: float = 2.0) -> dict:
-    return _raw_proto_echo_check(server_ip, constants.IPPROTO_GRE, "gre", timeout_sec)
+    # Emit a standard GRE version-0 header (RFC 2784) ahead of the payload.
+    return _raw_proto_echo_check(server_ip, constants.IPPROTO_GRE, "gre", timeout_sec,
+                                  header=constants.GRE_V0_HEADER)
 
 
 def esp_udp_check(server_ip: str, timeout_sec: float = 2.0) -> dict:

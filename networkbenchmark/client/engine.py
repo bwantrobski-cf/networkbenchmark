@@ -71,8 +71,22 @@ def _client_dispatch_loop(control: ControlChannel, phase: run_mode.RunPhase,
 
 
 def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
-    """Establish all N data streams. Returns dict index -> (sock, dest_addr)."""
+    """Establish all N data streams.
+
+    Each stream binds to an OS-assigned ephemeral source port (bind port 0).
+    Because every stream socket stays open simultaneously and we never enable
+    SO_REUSEADDR/SO_REUSEPORT, the kernel guarantees a distinct source port per
+    stream. We additionally capture and verify uniqueness explicitly so a
+    collision (e.g. if the OS is misconfigured) fails loudly instead of
+    silently multiplexing two streams onto one 5-tuple.
+
+    Returns (streams, source_ports) where:
+      streams:      dict index -> (sock, dest_addr)
+      source_ports: dict index -> local source port (int)
+    """
     streams = {}
+    source_ports = {}
+    used_ports = set()
     for i, port in enumerate(ports):
         if cfg.transport == "tcp":
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -87,7 +101,16 @@ def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
             dest = (cfg.server_host, port)
             sock.sendto(stream_worker.build_preamble(run_id, i), dest)
             streams[i] = (sock, dest)
-    return streams
+
+        src_port = sock.getsockname()[1]
+        if src_port in used_ports:
+            raise ThroughputError(
+                f"duplicate source port {src_port} assigned to stream {i}; "
+                "each stream must use a unique source port")
+        used_ports.add(src_port)
+        source_ports[i] = src_port
+
+    return streams, source_ports
 
 
 def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requested: threading.Event = None,
@@ -122,7 +145,10 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
             text_log.append(f"WARNING: server is using base port {ports[0]}, "
                              f"client expected start_port {cfg.start_port}")
 
-        streams = _connect_streams(cfg, run_id, ports)
+        streams, source_ports = _connect_streams(cfg, run_id, ports)
+        text_log.append("Per-stream 5-tuples (unique source port each): " + ", ".join(
+            f"stream {i}: src :{source_ports[i]} -> {server_ip}:{ports[i]}/{cfg.transport}"
+            for i in sorted(source_ports)))
 
         for _ in range(cfg.streams):
             ready_msg = control.recv(timeout=30)
@@ -222,7 +248,7 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
             except OSError:
                 pass
 
-        summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log)
+        summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, source_ports)
         json_path, log_path = logging_store.save_result(
             constants.TEST_TYPE_THROUGHPUT, summary, text_log, base_dir=log_base_dir)
         summary["log_json"] = json_path
@@ -243,8 +269,14 @@ def _aggregate_totals(counters: dict) -> dict:
     return totals
 
 
-def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log):
-    per_stream = [c.snapshot() for c in counters.values()]
+def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, source_ports=None):
+    source_ports = source_ports or {}
+    per_stream = []
+    for c in counters.values():
+        snap = c.snapshot()
+        idx = snap.get("index")
+        snap["source_port"] = source_ports.get(idx)
+        per_stream.append(snap)
     totals = _aggregate_totals(counters)
 
     duration = cfg.duration_sec
@@ -269,6 +301,7 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log):
         "direction": cfg.direction,
         "streams": cfg.streams,
         "duration_sec": cfg.duration_sec,
+        "source_ports": source_ports,
         "totals": totals,
         "send_mbps": send_mbps,
         "recv_mbps": recv_mbps,

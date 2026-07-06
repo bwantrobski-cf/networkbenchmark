@@ -22,6 +22,15 @@ IPSEC_NATT_PORT = 4500
 IPPROTO_ESP = 50
 IPPROTO_GRE = 47
 
+# Standard GRE version-0 header (RFC 2784), as used by default on Cisco IOS,
+# the Linux `ip_gre` module, and Palo Alto GRE tunnels. First 2 bytes are the
+# flags + version field (all zero: no checksum/key/sequence, version 0); next
+# 2 bytes are the Protocol Type, 0x0800 = IPv4. This 4-byte header precedes our
+# reachability payload so the probe looks like real GRE v0 on the wire.
+GRE_V0_PROTOCOL_TYPE_IPV4 = 0x0800
+GRE_V0_HEADER = b"\x00\x00" + GRE_V0_PROTOCOL_TYPE_IPV4.to_bytes(2, "big")
+GRE_V0_HEADER_LEN = len(GRE_V0_HEADER)
+
 # ---------------------------------------------------------------------------
 # Throughput test timing
 # ---------------------------------------------------------------------------

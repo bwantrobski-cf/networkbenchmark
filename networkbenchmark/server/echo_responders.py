@@ -140,7 +140,7 @@ def natt_udp_listener(ctx):
     sock.close()
 
 
-def _raw_proto_echo_listener(ctx, proto: int, label: str):
+def _raw_proto_echo_listener(ctx, proto: int, label: str, magic_offset: int = 0):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
     except (PermissionError, OSError) as exc:
@@ -148,6 +148,9 @@ def _raw_proto_echo_listener(ctx, proto: int, label: str):
         return
     sock.settimeout(0.5)
     ctx.log(f"{label} (protocol {proto}) raw echo responder active")
+
+    magic = constants.CONNECTIVITY_MAGIC
+    end = magic_offset + len(magic)
 
     while not ctx.stop_event.is_set():
         try:
@@ -161,7 +164,9 @@ def _raw_proto_echo_listener(ctx, proto: int, label: str):
         if not ip:
             continue
         body = raw[ip["ihl"]:]
-        if len(body) >= 16 and body[:8] == constants.CONNECTIVITY_MAGIC:
+        # The magic may be preceded by a protocol header (e.g. GRE v0), so match
+        # it at the expected offset. Echo the entire body back verbatim.
+        if len(body) >= end + 8 and body[magic_offset:end] == magic:
             try:
                 sock.sendto(body, (ip["src"], 0))
             except OSError:
@@ -175,4 +180,6 @@ def esp_native_listener(ctx):
 
 
 def gre_listener(ctx):
-    _raw_proto_echo_listener(ctx, constants.IPPROTO_GRE, "GRE")
+    # GRE probes carry a standard GRE version-0 header before the magic.
+    _raw_proto_echo_listener(ctx, constants.IPPROTO_GRE, "GRE",
+                             magic_offset=constants.GRE_V0_HEADER_LEN)
