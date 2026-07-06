@@ -10,28 +10,35 @@ import platform
 import socket
 import struct
 
-_LINUX_TCP_INFO_FMT = "=6B2B23I"  # 8 bytes fixed header + 23 x u32
-_LINUX_TCP_INFO_SIZE = struct.calcsize(_LINUX_TCP_INFO_FMT)
-_LINUX_TOTAL_RETRANS_INDEX = 23  # 0-based index into the 24-field u32 array (24th field)
+# Linux `struct tcp_info` begins with an 8-byte fixed header (8 x u8), followed
+# by a stable sequence of u32 fields. `tcpi_total_retrans` is the 24th u32
+# (0-based index 23), i.e. at byte offset 8 + 23*4 = 100. We read it by offset
+# rather than unpacking the whole struct, since the struct has grown across
+# kernel versions and its total size is not fixed.
+_LINUX_HEADER_BYTES = 8
+_LINUX_TOTAL_RETRANS_U32_INDEX = 23
+_LINUX_TOTAL_RETRANS_OFFSET = _LINUX_HEADER_BYTES + _LINUX_TOTAL_RETRANS_U32_INDEX * 4  # 100
+_LINUX_TCP_INFO_BUFSIZE = 256  # request generously; kernel returns its actual size
 
 
 def get_tcp_retransmits(sock: socket.socket):
     """Return total retransmitted segments for this socket, or None if
-    unavailable on this platform."""
-    system = platform.system()
-    if system != "Linux":
+    unavailable on this platform. Never raises."""
+    if platform.system() != "Linux":
         return None
 
     try:
-        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, _LINUX_TCP_INFO_SIZE)
-        if len(raw) < _LINUX_TCP_INFO_SIZE:
-            return None
-        fields = struct.unpack(_LINUX_TCP_INFO_FMT, raw)
-        # fields[0:8] are the individual bytes/bitfields, fields[8:] are the u32 array
-        u32_fields = fields[8:]
-        return u32_fields[_LINUX_TOTAL_RETRANS_INDEX]
-    except (OSError, AttributeError, struct.error):
+        raw = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, _LINUX_TCP_INFO_BUFSIZE)
+    except (OSError, AttributeError):
         return None
+
+    if len(raw) < _LINUX_TOTAL_RETRANS_OFFSET + 4:
+        return None
+    try:
+        (total_retrans,) = struct.unpack_from("=I", raw, _LINUX_TOTAL_RETRANS_OFFSET)
+    except struct.error:
+        return None
+    return total_retrans
 
 
 def tcp_retransmit_support() -> bool:

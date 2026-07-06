@@ -18,6 +18,7 @@ code, dependencies, and metadata needed to run and redistribute the tool
 
 ```
 networkbenchmark/            <- self-contained project root (commit this)
+├── NetBench.py             <- directly-runnable launcher (python NetBench.py ...)
 ├── pyproject.toml
 ├── requirements.txt
 ├── README.md
@@ -41,6 +42,30 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+## Running
+
+There are three equivalent ways to launch the tool:
+
+```bash
+# 1. Directly-runnable launcher script (no install / activation required,
+#    just the dependencies) -- takes the same arguments as everything below:
+python NetBench.py webui
+
+# 2. As a module (requires the package to be importable, e.g. after install):
+python -m networkbenchmark webui
+
+# 3. The installed console script (created by `pip install -e .`):
+networkbenchmark webui
+```
+
+> Note: you cannot run the package's internal files directly
+> (e.g. `python networkbenchmark/cli.py`) -- they use package-relative
+> imports and will raise `attempted relative import with no known parent
+> package`. Use `NetBench.py`, `-m networkbenchmark`, or the console script.
+
+All usage examples below use the `networkbenchmark` console script, but you
+can substitute `python NetBench.py` for any of them.
+
 ## Raw sockets / privileges
 
 MTR, PMTUD, and native ESP/GRE protocol checks use raw sockets and require
@@ -50,9 +75,17 @@ at startup and **gracefully degrades**: unsupported tests are disabled
 crashing. Basic ICMP (via the system `ping`), UDP, TCP, and IPSEC-over-UDP
 (NAT-T, port 4500) checks work without elevated privileges.
 
+Because the console script and dependencies live inside the virtualenv,
+`sudo networkbenchmark ...` will fail with **command not found** (sudo uses
+root's `PATH`, not your venv). Invoke the venv's Python explicitly instead:
+
 ```bash
-sudo networkbenchmark server ...     # for full diagnostics support
-sudo networkbenchmark webui          # same, for the web UI
+sudo .venv/bin/python NetBench.py webui          # web UI, full diagnostics
+sudo .venv/bin/python NetBench.py server ...     # server, full diagnostics
+
+# equivalent alternatives:
+sudo .venv/bin/python -m networkbenchmark webui
+sudo "$(which networkbenchmark)" webui           # with the venv activated
 ```
 
 ## Usage

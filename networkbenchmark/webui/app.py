@@ -200,7 +200,10 @@ def render_throughput_tab():
 
     if st.session_state.tp_running:
         holder = st.session_state.get("tp_result_holder", {})
-        live = st.session_state.tp_live
+        # Snapshot the shared list: the background worker thread appends to it
+        # concurrently, so build the DataFrame from a stable copy to avoid a
+        # length-mismatch race in pandas.
+        live = list(st.session_state.tp_live)
 
         if live:
             last = live[-1]
@@ -461,12 +464,23 @@ def render_settings_tab():
 
 def main():
     render_header()
-    tab1, tab2, tab3 = st.tabs(["NetworkBenchmark", "Diagnostics", "Settings"])
-    with tab1:
+    # A radio-based selector (rather than st.tabs) guarantees the pages are
+    # mutually exclusive: only the selected page's body is executed/rendered.
+    # st.tabs renders every tab's body on each run and can visually bleed
+    # across the auto-reruns used for live test polling.
+    page = st.radio(
+        "View",
+        ["NetworkBenchmark", "Diagnostics", "Settings"],
+        horizontal=True,
+        key="active_page",
+        label_visibility="collapsed",
+    )
+    st.divider()
+    if page == "NetworkBenchmark":
         render_throughput_tab()
-    with tab2:
+    elif page == "Diagnostics":
         render_diagnostics_tab()
-    with tab3:
+    else:
         render_settings_tab()
 
 

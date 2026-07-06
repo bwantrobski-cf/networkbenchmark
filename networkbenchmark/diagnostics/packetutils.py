@@ -43,7 +43,7 @@ def parse_ip_header(data: bytes):
     ihl = (ver_ihl & 0x0F) * 4
     if len(data) < ihl:
         return None
-    total_len, ident, flags_frag, ttl, proto = struct.unpack("!HHHBB", data[2:9])
+    total_len, ident, flags_frag, ttl, proto = struct.unpack("!HHHBB", data[2:10])
     src = socket.inet_ntoa(data[12:16])
     dst = socket.inet_ntoa(data[16:20])
     return {
