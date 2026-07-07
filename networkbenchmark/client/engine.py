@@ -605,6 +605,7 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
         "transport": cfg.transport,
         "direction": cfg.direction,
         "streams": cfg.streams,
+        "procs": cfg.procs,
         "duration_sec": cfg.duration_sec,
         "source_ports": source_ports,
         "totals": totals,

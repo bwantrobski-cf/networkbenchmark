@@ -176,6 +176,69 @@ To raise the ceiling itself on Ubuntu, enlarge the socket buffers
 streams across cores (`-P` / `--procs`), and enable NIC RSS/RPS — unpaced UDP
 is packet-rate (CPU) bound, not bandwidth bound.
 
+### Full benchmark matrix (`fullbench`)
+
+For scripting/automation, `fullbench` runs a whole matrix of throughput tests
+in one command — TCP and/or UDP, upload and/or download, across a list of
+stream counts — stores each test's result locally, and can POST each result as
+JSON to an HTTP(S) endpoint (e.g. a Cloudflare Worker that writes to D1).
+
+```bash
+# TCP + UDP, upload + download, at 1/8/16/32 streams. UDP uses loss-target
+# tuning (<=1% loss, up to 30s each); results POST to an ingestion endpoint.
+networkbenchmark fullbench --server-ip 10.0.0.5 \
+    --streams 1,8,16,32 --procs 1,4,8,8 \
+    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --export-url https://viz.example.com/ingest \
+    --export-header "Authorization: Bearer $TOKEN" --export-slim
+```
+
+- `--streams` is a comma-separated list of stream counts (e.g. `1,8,16,32`).
+- `--procs` is either a single value applied to every run, or a comma-separated
+  list **paired** with `--streams` (so `1,8,16,32` + `1,4,8,8` uses 1 proc for
+  the 1-stream run, 4 for 8 streams, 8 for 16 and 32).
+- `--transports` (default `tcp,udp`) and `--directions` (default `up,down`)
+  select which combinations to run.
+- `--time` sets the duration for TCP (and non-tuning UDP) tests. Adding
+  `--acceptable-loss PCT` switches **UDP** tests to loss-target tuning, with
+  `--udp-max-duration` as each search's budget; TCP tests still use `--time`.
+- Every test is saved individually to `logs/` (JSON + text), and a combined
+  `fullbench` manifest is written summarizing the whole run.
+- `--export-url` POSTs each test's JSON result as it completes. Use
+  `--export-method` (`POST`/`PUT`), repeatable `--export-header "Key: Value"`
+  for auth, and `--export-slim` to drop the bulky `interval_series` /
+  `per_stream` arrays for lighter payloads. A failed export is logged but does
+  not abort the run.
+- `--dry-run` prints the planned matrix without executing.
+
+**Identity / ingestion metadata.** For storing results in a database (e.g. a
+Cloudflare D1 table via a results-API Worker), each test can carry identity
+fields recorded alongside the metrics:
+
+```bash
+networkbenchmark fullbench --server-ip 10.0.0.5 --streams 1,8,16,32 \
+    --run-id 137 --vm-name web-01 --cloud aws --environment prod \
+    --export-url https://viz.example.com/networkbenchmark-results \
+    --export-header "Authorization: Bearer $TOKEN"
+```
+
+- `--run-id` is an integer set by your orchestration (e.g. from the results-API
+  `/run-id` allocator); it is recorded with every test. NetworkBenchmark does
+  not allocate it — scripts own that logic.
+- `--vm-name` (default: hostname), `--cloud`, `--environment`, `--tool-version`,
+  and `--test-type` (default `networkbenchmark`) are recorded per test too.
+- Each individual test gets its own unique `recorded_at` timestamp, plus a
+  per-test UUID (`nb_run_id`) and a shared `benchmark_id` for the whole run.
+
+Each exported payload uses the results-API conventions at the top level
+(`recorded_at`, `test_type`, `run_id`, `vm_name`, `cloud`, `environment`,
+`tool_version`) plus benchmark grouping (`benchmark_id`, `test_index`, `label`,
+`nb_run_id`, `transport`, `direction`, `streams`, `procs`, `tuned`) and the full
+`result` object (throughput, loss, latency-under-load, bufferbloat, per-stream
+counters, per-second `interval_series`, and — for tuned UDP — the per-trial
+rate-vs-loss series and best sustainable rate). Ingestion endpoints should read
+`result.*` for the metrics and can persist the whole body for full fidelity.
+
 ### Diagnostics
 
 ```bash

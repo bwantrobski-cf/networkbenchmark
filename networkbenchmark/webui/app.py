@@ -411,7 +411,12 @@ def render_mtr_section():
         if holder.get("error"):
             st.session_state.mtr_error = holder["error"]
         if holder.get("done"):
+            # Worker has stopped: flip state and rerun immediately so the
+            # Start/Stop buttons (already drawn above with the stale "running"
+            # value) redraw in the stopped state. Without this the user has to
+            # click Stop a second time to re-enable Start.
             st.session_state.mtr_running = False
+            st.rerun()
 
     if st.session_state.mtr_error:
         st.error(st.session_state.mtr_error)

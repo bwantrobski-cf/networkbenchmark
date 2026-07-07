@@ -3,6 +3,7 @@
 Subcommands:
     server        run as a server (throughput + diagnostics responders)
     throughput    run a client throughput test (iperf3+bbperf style)
+    fullbench     run a full matrix of throughput tests (scripting/automation)
     mtr           run an MTR (ICMP/UDP/TCP) diagnostic
     connectivity  quick ICMP/UDP/TCP connectivity check against a server
     pmtud         Path MTU Discovery test against a server
@@ -17,6 +18,7 @@ import threading
 
 from .common import constants, privileges, logging_store
 from .client.engine import ThroughputClientConfig, run_throughput_test
+from .client import fullbench as fullbench_mod
 from .diagnostics.mtr import MtrRunner, MtrError
 from .diagnostics import connectivity, protocols
 from .diagnostics.pmtud import run_pmtud, PmtudError
@@ -66,6 +68,63 @@ def build_parser() -> argparse.ArgumentParser:
                             f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s; overrides --time as the budget).")
     p_tp.add_argument("--log-dir", default=None)
     p_tp.set_defaults(func=cmd_throughput)
+
+    p_fb = sub.add_parser(
+        "fullbench",
+        help="run a full matrix of throughput tests (TCP/UDP x up/down x stream counts)",
+        description="Run a matrix of throughput tests for scripting/automation. Stores each "
+                    "test's result locally and can POST each result as JSON to an HTTP(S) endpoint.")
+    p_fb.add_argument("--server-ip", required=True, help="server hostname or IP")
+    p_fb.add_argument("--control-port", type=int, default=constants.DEFAULT_CONTROL_PORT)
+    p_fb.add_argument("--transports", default="tcp,udp",
+                       help="comma-separated transports to test: tcp, udp (default: tcp,udp)")
+    p_fb.add_argument("--directions", default="up,down",
+                       help="comma-separated directions to test: up, down (default: up,down)")
+    p_fb.add_argument("--streams", default="1,8,16,32",
+                       help="comma-separated list of parallel-stream counts, e.g. 1,8,16,32 "
+                            "(default: 1,8,16,32)")
+    p_fb.add_argument("--procs", default="1",
+                       help="worker processes per test: a single value applied to every run, or a "
+                            "comma-separated list matching --streams (paired per stream count). "
+                            "Default: 1.")
+    p_fb.add_argument("-t", "--time", type=float, default=constants.DEFAULT_TEST_DURATION_SEC,
+                       help="duration (sec) for TCP and non-tuning UDP tests (default: 10)")
+    p_fb.add_argument("--acceptable-loss", type=float, default=None, metavar="PCT",
+                       help="enable UDP loss-target tuning: find the max UDP rate whose loss stays "
+                            "<= PCT%%. Applies to UDP tests only; TCP tests still use --time.")
+    p_fb.add_argument("--udp-max-duration", type=float, default=constants.DEFAULT_MAX_DURATION_SEC,
+                       metavar="SEC",
+                       help=f"max time budget for each UDP tuning search "
+                            f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s)")
+    p_fb.add_argument("--start-port", type=int, default=None,
+                       help="server base port (auto per transport if omitted)")
+    p_fb.add_argument("--bind", default="0.0.0.0", help="local address to bind data sockets")
+    p_fb.add_argument("--label", default=None, help="optional label attached to every result")
+    p_fb.add_argument("--run-id", type=int, default=None,
+                       help="global run id recorded with every test (orchestration scripts set "
+                            "this, e.g. from the results-API /run-id allocator). Optional.")
+    p_fb.add_argument("--vm-name", default=None,
+                       help="host/VM identifier recorded with every test (default: hostname)")
+    p_fb.add_argument("--cloud", default=None, help="cloud/provider label recorded with every test")
+    p_fb.add_argument("--environment", default=None, help="environment label recorded with every test")
+    p_fb.add_argument("--tool-version", type=int, default=1,
+                       help="tool_version integer recorded with every test (default: 1)")
+    p_fb.add_argument("--test-type", default="networkbenchmark",
+                       help="test_type recorded with every test (default: networkbenchmark)")
+    p_fb.add_argument("--export-url", default=None,
+                       help="HTTP(S) endpoint to POST each test's JSON result to")
+    p_fb.add_argument("--export-method", default="POST", choices=["POST", "PUT"],
+                       help="HTTP method for export (default: POST)")
+    p_fb.add_argument("--export-header", action="append", default=[], metavar="'Key: Value'",
+                       help="extra HTTP header for export (repeatable), e.g. for auth tokens")
+    p_fb.add_argument("--export-slim", action="store_true",
+                       help="omit bulky arrays (interval_series, per_stream) from exported payloads")
+    p_fb.add_argument("--export-timeout", type=float, default=15.0,
+                       help="per-request export timeout in seconds (default: 15)")
+    p_fb.add_argument("--dry-run", action="store_true",
+                       help="print the planned test matrix and exit without running")
+    p_fb.add_argument("--log-dir", default=None)
+    p_fb.set_defaults(func=cmd_fullbench)
 
     p_mtr = sub.add_parser("mtr", help="MTR diagnostic to any IP/FQDN")
     p_mtr.add_argument("target", help="target IP address or FQDN")
@@ -220,6 +279,92 @@ def _print_throughput_summary(summary):
           f"bloat_factor={bb.get('bloat_factor')}")
     print(f"  log: {summary.get('log_json')}")
     print(f"       {summary.get('log_text')}")
+
+
+def cmd_fullbench(args):
+    try:
+        cfg = fullbench_mod.FullBenchConfig(
+            server_ip=args.server_ip,
+            control_port=args.control_port,
+            transports=fullbench_mod.parse_csv_choices(args.transports, ("tcp", "udp"), "transports"),
+            directions=fullbench_mod.parse_csv_choices(args.directions, ("up", "down"), "directions"),
+            streams=fullbench_mod.parse_int_list(args.streams, "streams"),
+            procs=fullbench_mod.parse_int_list(args.procs, "procs"),
+            duration_sec=args.time,
+            acceptable_loss_pct=args.acceptable_loss,
+            udp_max_duration_sec=args.udp_max_duration,
+            bind=args.bind,
+            start_port=args.start_port,
+            export_url=args.export_url,
+            export_method=args.export_method,
+            export_headers=fullbench_mod.parse_headers(args.export_header),
+            export_slim=args.export_slim,
+            export_timeout_sec=args.export_timeout,
+            label=args.label,
+            run_id=args.run_id,
+            vm_name=args.vm_name,
+            cloud=args.cloud,
+            environment=args.environment,
+            tool_version=args.tool_version,
+            test_type=args.test_type,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(2)
+
+    plan = cfg.build_plan()
+    print(f"fullbench plan: {len(plan)} test(s) -> {cfg.server_ip}")
+    print(f"identity: run_id={cfg.run_id} vm_name={cfg.vm_name} cloud={cfg.cloud} "
+          f"environment={cfg.environment} test_type={cfg.test_type}")
+    for i, spec in enumerate(plan, start=1):
+        mode = (f"tune<= {cfg.acceptable_loss_pct}% (<= {cfg.udp_max_duration_sec:.0f}s)"
+                if spec["tune"] else f"fixed {cfg.duration_sec:.0f}s")
+        print(f"  [{i}] {spec['transport']} {spec['direction']} "
+              f"streams={spec['streams']} procs={spec['procs']}  [{mode}]")
+    if cfg.export_url:
+        print(f"export: {cfg.export_method} {cfg.export_url}"
+              + ("  (slim)" if cfg.export_slim else ""))
+
+    if args.dry_run:
+        print("\n(dry run -- not executing)")
+        return
+
+    stop_requested = threading.Event()
+
+    def handle_sigint(_signum, _frame):
+        print("\nstopping fullbench (finishing current test)...", flush=True)
+        stop_requested.set()
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    print()
+    manifest = fullbench_mod.run_fullbench(cfg, on_progress=lambda m: print(m, flush=True),
+                                           stop_requested=stop_requested, log_base_dir=args.log_dir)
+    _print_fullbench_summary(manifest)
+
+
+def _print_fullbench_summary(manifest):
+    print("\n=== Full Benchmark Summary ===")
+    print(f"  benchmark_id: {manifest['benchmark_id']}")
+    print(f"  completed: {manifest['completed']}/{manifest['test_count']}")
+    header = (f"  {'transport':<9} {'dir':<5} {'streams':>7} {'procs':>5} {'send Mbps':>11} "
+              f"{'recv Mbps':>11} {'send pps':>11} {'recv pps':>11} {'loss %':>8}")
+    print(header)
+    for t in manifest["tests"]:
+        if not t.get("ok"):
+            print(f"  {t['transport']:<9} {t['direction']:<5} {t['streams']:>7} {t['procs']:>5}"
+                  f"  FAILED: {t.get('error')}")
+            continue
+        loss = t.get("loss_pct")
+        loss_str = f"{loss:.3f}" if isinstance(loss, (int, float)) else "-"
+        exp = t.get("export")
+        exp_str = ""
+        if exp is not None:
+            exp_str = f"  export={'ok' if exp['ok'] else 'FAIL(' + str(exp.get('error')) + ')'}"
+        print(f"  {t['transport']:<9} {t['direction']:<5} {t['streams']:>7} {t['procs']:>5} "
+              f"{t.get('send_mbps', 0):>11.1f} {t.get('recv_mbps', 0):>11.1f} "
+              f"{t.get('send_pps', 0):>11.0f} {t.get('recv_pps', 0):>11.0f} {loss_str:>8}{exp_str}")
+    print(f"  manifest: {manifest.get('manifest_json')}")
 
 
 def cmd_mtr(args):

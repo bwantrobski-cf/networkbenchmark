@@ -98,6 +98,7 @@ MTR_PROTOCOLS = ("icmp", "udp", "tcp")
 LOG_DIR_NAME = "logs"
 
 TEST_TYPE_THROUGHPUT = "throughput"
+TEST_TYPE_FULLBENCH = "fullbench"
 TEST_TYPE_MTR = "mtr"
 TEST_TYPE_CONNECTIVITY = "connectivity"
 TEST_TYPE_PMTUD = "pmtud"
