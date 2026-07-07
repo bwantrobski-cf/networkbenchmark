@@ -164,8 +164,15 @@ def render_throughput_tab():
         duration = st.number_input("Duration (sec)", min_value=1, max_value=3600, value=10, disabled=running)
 
     default_start_port = st.session_state.udp_port if transport == "UDP" else st.session_state.tcp_port
-    start_port = st.number_input("Server base port for this transport", min_value=1, max_value=65535,
-                                  value=default_start_port, disabled=running)
+    pcol1, pcol2 = st.columns(2)
+    with pcol1:
+        start_port = st.number_input("Server base port for this transport", min_value=1, max_value=65535,
+                                      value=default_start_port, disabled=running)
+    with pcol2:
+        procs = st.number_input("Worker processes (--procs)", min_value=1, max_value=64, value=1,
+                                disabled=running,
+                                help="Spread streams across CPU cores to reach higher rates. "
+                                     "Requires more than one stream; the server mirrors this setting.")
 
     bcol1, bcol2 = st.columns(2)
     start_clicked = bcol1.button("Start Test", type="primary", disabled=running, use_container_width=True)
@@ -180,6 +187,7 @@ def render_throughput_tab():
             streams=int(streams),
             duration_sec=float(duration),
             start_port=int(start_port),
+            procs=int(procs),
         )
         stop_event = threading.Event()
         live_list = []
@@ -207,11 +215,12 @@ def render_throughput_tab():
 
         if live:
             last = live[-1]
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Send", f"{last.get('send_mbps', 0):.2f} Mbps")
             m2.metric("Recv", f"{last.get('recv_mbps', 0):.2f} Mbps")
+            m3.metric("Packets/s", f"{last.get('recv_pps', 0):,.0f}")
             rtt = last.get("rtt_ms")
-            m3.metric("Loaded RTT", f"{rtt:.2f} ms" if rtt is not None else "n/a")
+            m4.metric("Loaded RTT", f"{rtt:.2f} ms" if rtt is not None else "n/a")
 
             df = pd.DataFrame(live)
             if "t" in df.columns:
@@ -219,6 +228,10 @@ def render_throughput_tab():
                 cols = [c for c in ["send_mbps", "recv_mbps"] if c in df.columns]
                 if cols:
                     st.line_chart(df[cols])
+                pps_cols = [c for c in ["send_pps", "recv_pps"] if c in df.columns]
+                if pps_cols:
+                    st.caption("Packets per second")
+                    st.line_chart(df[pps_cols])
 
         if holder.get("done"):
             st.session_state.tp_running = False
@@ -244,6 +257,10 @@ def render_throughput_tab():
             m3.metric("TCP Retransmits", summary["retransmits"])
         bloat_factor = (summary.get("bufferbloat") or {}).get("bloat_factor")
         m4.metric("Bloat factor", f"{bloat_factor:.2f}" if bloat_factor is not None else "n/a")
+
+        p1, p2 = st.columns(2)
+        p1.metric("Send packets/s", f"{summary.get('send_pps', 0):,.0f}")
+        p2.metric("Recv packets/s", f"{summary.get('recv_pps', 0):,.0f}")
 
         lr = summary.get("loaded_rtt") or {}
         st.write("**Latency (control-channel probe RTT)**")

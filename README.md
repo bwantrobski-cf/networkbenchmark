@@ -113,7 +113,31 @@ networkbenchmark throughput --server-ip 10.0.0.5 --time 10
 
 # Download, UDP, 4 parallel streams, 30s
 networkbenchmark throughput --server-ip 10.0.0.5 --udp -R -P 4 --time 30
+
+# High-rate UDP upload: 8 streams spread across 8 worker processes (multi-core)
+networkbenchmark throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 ```
+
+Every run reports both bitrate (Mbps) and **packets/sec** (send and recv),
+plus UDP loss / TCP retransmits and latency-under-load.
+
+### Scaling with multiple CPU cores (`--procs`)
+
+At very high packet rates a single Python process becomes CPU-bound (the GIL
+serialises per-packet work), capping throughput well below the link. Use
+`--procs N` to spread the parallel streams (`-P`) across `N` worker processes
+so send/receive work runs on multiple cores:
+
+- Requires more than one stream (`-P > 1`); with a single stream it is a no-op.
+- The **server mirrors the client's `--procs`** automatically over the control
+  channel — no server-side flag is needed.
+- Per-stream UDP loss accounting is preserved (each stream is owned end-to-end
+  by one process, backed by shared-memory counters).
+- Falls back to the single-process/threaded path on platforms without `fork`
+  (e.g. Windows).
+
+A good starting point is `--procs` equal to `-P`, up to the number of physical
+cores on the slower of the two hosts.
 
 ### Diagnostics
 

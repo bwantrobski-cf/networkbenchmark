@@ -184,6 +184,82 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
         pass
 
 
+def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict,
+                      duration_sec: float, wait_start=None, stopped=None):
+    """Run the sender/receiver loops for a group of streams as threads within
+    the current (possibly worker) process.
+
+    Shared by the multiprocessing worker pools on both the client and server.
+
+    Args:
+        socks: dict index -> (sock, dest_addr). dest_addr is the UDP peer
+               (used by UDP sender/receiver) or None for TCP.
+        role: 'send' or 'recv' (the role THIS side plays for the streams).
+        transport: 'tcp' or 'udp'.
+        counter_views: dict index -> counter object (StreamCounters or a
+               shared_counters.SharedCounterView) with add_sent/add_received/
+               set_retransmits.
+        duration_sec: test duration (senders self-stop after this).
+        wait_start: optional callable that blocks until the group should start.
+        stopped: optional callable returning True once the group should stop.
+
+    Note: start/stop are passed as *callables* (typically polling a lock-free
+    ``multiprocessing.Value``) rather than ``multiprocessing.Event`` objects.
+    A worker process may exit on its own (senders self-stop at duration); an
+    Event's shared Condition lock could be left held by such a worker and
+    deadlock the parent's ``set()``. Lock-free polling avoids that entirely.
+    """
+    if wait_start is not None:
+        while not wait_start():
+            time.sleep(0.02)
+    start_time = time.time()
+
+    local_stops = {}
+    threads = []
+    for i, (sock, dest) in socks.items():
+        stop_ev = threading.Event()
+        local_stops[i] = stop_ev
+        view = counter_views[i]
+        if role == "send":
+            if transport == "tcp":
+                th = threading.Thread(target=tcp_sender_loop,
+                                       args=(sock, view, stop_ev, duration_sec, start_time),
+                                       daemon=True)
+            else:
+                th = threading.Thread(target=udp_sender_loop,
+                                       args=(sock, dest, i, view, stop_ev, duration_sec, start_time),
+                                       daemon=True)
+        else:
+            if transport == "tcp":
+                th = threading.Thread(target=tcp_receiver_loop,
+                                       args=(sock, view, stop_ev), daemon=True)
+            else:
+                th = threading.Thread(target=udp_receiver_loop,
+                                       args=(sock, view, stop_ev),
+                                       kwargs={"known_peer_addr": dest}, daemon=True)
+        th.start()
+        threads.append(th)
+
+    if stopped is not None:
+        def _monitor():
+            while not stopped():
+                if all(not t.is_alive() for t in threads):
+                    break
+                time.sleep(0.1)
+            for ev in local_stops.values():
+                ev.set()
+        threading.Thread(target=_monitor, daemon=True).start()
+
+    for th in threads:
+        th.join()
+
+    if transport == "tcp":
+        for i, (sock, _dest) in socks.items():
+            retrans = tcp_info.get_tcp_retransmits(sock)
+            if retrans is not None:
+                counter_views[i].set_retransmits(retrans)
+
+
 def feed_udp_data_frame(counters, data: bytes) -> bool:
     """Parse one already-received UDP data frame into counters. Used by the
     shared base-port listener, which must remain the sole reader of its

@@ -55,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="base port the server is using for this transport "
                             "(default: 10000 for UDP, 11000 for TCP)")
     p_tp.add_argument("--bind", default="0.0.0.0", help="local address to bind data sockets")
+    p_tp.add_argument("--procs", type=int, default=1,
+                       help="spread streams across N worker processes to use multiple CPU cores "
+                            "(default: 1 = single-process/threaded). Requires >1 stream.")
     p_tp.add_argument("--log-dir", default=None)
     p_tp.set_defaults(func=cmd_throughput)
 
@@ -125,6 +128,7 @@ def cmd_throughput(args):
         duration_sec=args.time,
         start_port=args.start_port,
         bind=args.bind,
+        procs=args.procs,
     )
 
     stop_requested = threading.Event()
@@ -141,7 +145,9 @@ def cmd_throughput(args):
         rtt = entry.get("rtt_ms")
         rtt_str = f"{rtt:.2f}ms" if rtt is not None else "n/a"
         print(f"  t={entry['t']:.1f}  send={entry['send_mbps']:.2f} Mbps  "
-              f"recv={entry['recv_mbps']:.2f} Mbps  rtt={rtt_str}", flush=True)
+              f"recv={entry['recv_mbps']:.2f} Mbps  "
+              f"send={entry.get('send_pps', 0):.0f} pps  recv={entry.get('recv_pps', 0):.0f} pps  "
+              f"rtt={rtt_str}", flush=True)
 
     print(f"Running throughput test: server={args.server_ip} transport={cfg.transport} "
           f"direction={cfg.direction} streams={cfg.streams} duration={cfg.duration_sec}s", flush=True)
@@ -154,6 +160,7 @@ def cmd_throughput(args):
 def _print_throughput_summary(summary):
     print("\n=== Throughput Test Summary ===")
     print(f"  send: {summary['send_mbps']:.2f} Mbps   recv: {summary['recv_mbps']:.2f} Mbps")
+    print(f"  send: {summary.get('send_pps', 0):.1f} pps   recv: {summary.get('recv_pps', 0):.1f} pps")
     if summary.get("loss_pct") is not None:
         print(f"  UDP packet loss: {summary['loss_pct']:.3f}%")
     if summary.get("retransmits") is not None:

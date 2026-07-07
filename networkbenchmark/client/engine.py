@@ -5,13 +5,14 @@ bbperf-style calibration -> running lifecycle and latency-under-load /
 bufferbloat measurement (see transport.metrics.compute_bufferbloat).
 """
 
+import multiprocessing
 import socket
 import threading
 import time
 import uuid
 
 from ..common import addr, constants, logging_store, tcp_info
-from ..transport import stream_worker, metrics, latency_probe, run_mode
+from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
 from ..transport.control_connection import ControlChannel
 
 
@@ -19,7 +20,7 @@ class ThroughputClientConfig:
     def __init__(self, server_ip, control_port=None, transport="tcp", direction="up",
                  streams=1, duration_sec=constants.DEFAULT_TEST_DURATION_SEC,
                  start_port=None, bind="0.0.0.0", calibration_sec=constants.CALIBRATION_TIME_SEC,
-                 probe_interval_sec=constants.PROBE_INTERVAL_SEC):
+                 probe_interval_sec=constants.PROBE_INTERVAL_SEC, procs=1):
         self.server_host = server_ip
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transport = transport
@@ -31,6 +32,9 @@ class ThroughputClientConfig:
         self.bind = bind
         self.calibration_sec = calibration_sec
         self.probe_interval_sec = probe_interval_sec
+        # Number of worker processes to spread streams across (1 = threaded,
+        # the default). Clamped to the stream count at run time.
+        self.procs = max(1, int(procs))
 
 
 class ThroughputError(Exception):
@@ -113,6 +117,99 @@ def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
     return streams, source_ports
 
 
+def _should_use_multiprocess(cfg: ThroughputClientConfig) -> bool:
+    """Multiprocessing requires >1 process, >1 stream, and a 'fork' start
+    method (so worker processes inherit the shared-memory counters). Falls
+    back to the threaded path otherwise (e.g. Windows)."""
+    if cfg.procs <= 1 or cfg.streams <= 1:
+        return False
+    return "fork" in multiprocessing.get_all_start_methods()
+
+
+def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
+                         shared, start_flag, stop_flag, connected_q):
+    """Worker process: owns a subset of streams end-to-end (its own sockets),
+    so per-stream UDP loss tracking stays entirely within one process.
+
+    start_flag / stop_flag are lock-free multiprocessing.Value('b') shared with
+    the parent; the worker only reads them (see run_stream_group for why we
+    avoid multiprocessing.Event here)."""
+    socks = {}
+    src_ports = {}
+    try:
+        for i, port in assignments:
+            if conn["transport"] == "tcp":
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind((conn["bind"], 0))
+                s.settimeout(constants.SOCKET_TIMEOUT_SEC)
+                s.connect((conn["server_ip"], port))
+                s.sendall(stream_worker.build_preamble(run_id, i))
+                socks[i] = (s, None)
+            else:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.bind((conn["bind"], 0))
+                dest = (conn["server_ip"], port)
+                s.sendto(stream_worker.build_preamble(run_id, i), dest)
+                socks[i] = (s, dest)
+            src_ports[i] = s.getsockname()[1]
+    except OSError as exc:
+        connected_q.put(("error", str(exc)))
+        return
+
+    connected_q.put(("ok", src_ports))
+
+    views = {i: shared.view(i) for i, _port in assignments}
+    stream_worker.run_stream_group(socks, role, conn["transport"], views,
+                                    conn["duration_sec"],
+                                    wait_start=lambda: bool(start_flag.value),
+                                    stopped=lambda: bool(stop_flag.value))
+
+    for s, _dest in socks.values():
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: str,
+                           ports: list, mp_ctx, shared):
+    """Spawn worker processes and wait for every stream to connect. Returns a
+    state dict; source ports are collected back from the workers."""
+    n = len(ports)
+    nproc = min(cfg.procs, n)
+    groups = [[] for _ in range(nproc)]
+    for idx, port in enumerate(ports):
+        groups[idx % nproc].append((idx, port))
+    active_groups = [g for g in groups if g]
+
+    role = "send" if cfg.direction == "up" else "recv"
+    conn = {"server_ip": server_ip, "bind": cfg.bind, "transport": cfg.transport,
+            "duration_sec": cfg.duration_sec}
+    start_flag = mp_ctx.Value("b", 0, lock=False)
+    stop_flag = mp_ctx.Value("b", 0, lock=False)
+    connected_q = mp_ctx.Queue()
+
+    procs = []
+    for g in active_groups:
+        p = mp_ctx.Process(target=_client_worker_proc,
+                           args=(conn, run_id, g, role, shared, start_flag, stop_flag, connected_q),
+                           daemon=True)
+        p.start()
+        procs.append(p)
+
+    source_ports = {}
+    for _ in range(len(active_groups)):
+        status, payload = connected_q.get(timeout=60)
+        if status != "ok":
+            for p in procs:
+                p.terminate()
+            raise ThroughputError(f"stream worker failed to connect: {payload}")
+        source_ports.update(payload)
+
+    return {"procs": procs, "start_flag": start_flag, "stop_flag": stop_flag,
+            "source_ports": source_ports, "nproc": len(active_groups)}
+
+
 def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requested: threading.Event = None,
                          log_base_dir: str = None) -> dict:
     server_ip = addr.resolve_host(cfg.server_host)
@@ -129,6 +226,7 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         "direction": cfg.direction,
         "streams": cfg.streams,
         "duration_sec": cfg.duration_sec,
+        "procs": cfg.procs,
     }
 
     text_log = [f"NetworkBenchmark throughput test  run_id={run_id}",
@@ -145,7 +243,21 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
             text_log.append(f"WARNING: server is using base port {ports[0]}, "
                              f"client expected start_port {cfg.start_port}")
 
-        streams, source_ports = _connect_streams(cfg, run_id, ports)
+        use_mp = _should_use_multiprocess(cfg)
+        streams = None
+        mp_state = None
+        if use_mp:
+            mp_ctx = multiprocessing.get_context("fork")
+            shared = shared_counters.SharedCounters(cfg.streams, ctx=mp_ctx)
+            counters = {i: shared.view(i) for i in range(cfg.streams)}
+            mp_state = _start_client_workers(cfg, server_ip, run_id, ports, mp_ctx, shared)
+            source_ports = mp_state["source_ports"]
+            text_log.append(f"Execution: multiprocessing ({mp_state['nproc']} worker "
+                            f"process(es) for {cfg.streams} streams)")
+        else:
+            streams, source_ports = _connect_streams(cfg, run_id, ports)
+            counters = {i: metrics.StreamCounters(i) for i in range(cfg.streams)}
+            text_log.append("Execution: single process (threaded)")
         text_log.append("Per-stream 5-tuples (unique source port each): " + ", ".join(
             f"stream {i}: src :{source_ports[i]} -> {server_ip}:{ports[i]}/{cfg.transport}"
             for i in sorted(source_ports)))
@@ -162,7 +274,6 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
 
         phase = run_mode.RunPhase()
         rtt_tracker = metrics.RttTracker()
-        counters = {i: metrics.StreamCounters(i) for i in range(cfg.streams)}
         done_event = threading.Event()
 
         dispatch_thread = threading.Thread(target=_client_dispatch_loop,
@@ -187,7 +298,9 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         stream_threads = []
         start_time = time.time()
 
-        if cfg.direction == "up":
+        if use_mp:
+            mp_state["start_flag"].value = 1
+        elif cfg.direction == "up":
             for i, (sock, dest) in streams.items():
                 stop_ev = threading.Event()
                 stream_stop_events[i] = stop_ev
@@ -227,26 +340,31 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
                 on_interval(entry)
 
         control.send("stop")
-        for ev in stream_stop_events.values():
-            ev.set()
-
-        # capture final local TCP retransmit counts before closing sockets
-        if cfg.transport == "tcp":
-            for i, (sock, _dest) in streams.items():
-                retrans = tcp_info.get_tcp_retransmits(sock)
-                if retrans is not None:
-                    counters[i].set_retransmits(retrans)
+        if use_mp:
+            mp_state["stop_flag"].value = 1
+            for p in mp_state["procs"]:
+                p.join(timeout=10)
+        else:
+            for ev in stream_stop_events.values():
+                ev.set()
+            # capture final local TCP retransmit counts before closing sockets
+            if cfg.transport == "tcp":
+                for i, (sock, _dest) in streams.items():
+                    retrans = tcp_info.get_tcp_retransmits(sock)
+                    if retrans is not None:
+                        counters[i].set_retransmits(retrans)
 
         done_event.wait(timeout=5)
         prober_stop.set()
         phase.stop()
         dispatch_thread.join(timeout=2)
 
-        for sock, _dest in streams.values():
-            try:
-                sock.close()
-            except OSError:
-                pass
+        if not use_mp:
+            for sock, _dest in streams.values():
+                try:
+                    sock.close()
+                except OSError:
+                    pass
 
         summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, source_ports)
         json_path, log_path = logging_store.save_result(
@@ -282,6 +400,8 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
     duration = cfg.duration_sec
     send_mbps = (totals["bytes_sent"] * 8 / duration) / 1e6 if duration else 0
     recv_mbps = (totals["bytes_received"] * 8 / duration) / 1e6 if duration else 0
+    send_pps = (totals["packets_sent"] / duration) if duration else 0
+    recv_pps = (totals["packets_received"] / duration) if duration else 0
 
     loss_pct = None
     if cfg.transport == "udp":
@@ -305,6 +425,8 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
         "totals": totals,
         "send_mbps": send_mbps,
         "recv_mbps": recv_mbps,
+        "send_pps": send_pps,
+        "recv_pps": recv_pps,
         "loss_pct": loss_pct,
         "retransmits": totals["retransmits"] if cfg.transport == "tcp" else None,
         "unloaded_rtt_ms": unloaded_rtt_ms,
@@ -316,6 +438,7 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
 
     text_log.append("")
     text_log.append(f"Aggregate throughput: send={send_mbps:.2f} Mbps  recv={recv_mbps:.2f} Mbps")
+    text_log.append(f"Packets/sec: send={send_pps:.1f} pps  recv={recv_pps:.1f} pps")
     if loss_pct is not None:
         text_log.append(f"UDP packet loss: {loss_pct:.3f}%")
     if summary["retransmits"] is not None:

@@ -3,17 +3,28 @@ per-stream port listeners, and relaying this side's local stats back to the
 client over the control channel every SAMPLE_INTERVAL_SEC.
 """
 
+import multiprocessing
+import queue
 import socket
 import threading
 import time
 
 from ..common import constants, tcp_info
-from ..transport import stream_worker, metrics, latency_probe, run_mode
+from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
 from ..transport.control_connection import ControlChannel
 
 
 class ProtocolError(Exception):
     pass
+
+
+def _server_should_use_mp(params: dict, n: int) -> bool:
+    """Mirror the client: parallelize streams across processes when the client
+    requested >1 worker (params['procs']), there is >1 stream, and 'fork' is
+    available so workers inherit the shared-memory counters."""
+    if int(params.get("procs", 1)) <= 1 or n <= 1:
+        return False
+    return "fork" in multiprocessing.get_all_start_methods()
 
 
 class ThroughputSession:
@@ -24,7 +35,6 @@ class ThroughputSession:
         self.phase = run_mode.RunPhase()
         n = int(params["streams"])
         self.num_streams = n
-        self.counters = {i: metrics.StreamCounters(i) for i in range(n)}
         self.stream_ready = {i: threading.Event() for i in range(n)}
         self.stream_sockets = {}
         self.stream_addrs = {}
@@ -33,6 +43,23 @@ class ThroughputSession:
         self.threads = []
         self.data_ready_event = threading.Event()
         self.stop_received_event = threading.Event()
+
+        # Multiprocessing: stream 0 stays in the main process (it shares the
+        # always-on base-port listener); streams 1..N-1 are handled by worker
+        # processes so receive/send work uses multiple CPU cores. Counters live
+        # in shared memory so the main process can relay/aggregate them.
+        self.mp_enabled = _server_should_use_mp(params, n)
+        self.worker_indices = list(range(1, n)) if self.mp_enabled else []
+        self.worker_procs = []
+        if self.mp_enabled:
+            self.mp_ctx = multiprocessing.get_context("fork")
+            self.shared = shared_counters.SharedCounters(n, ctx=self.mp_ctx)
+            self.counters = {i: self.shared.view(i) for i in range(n)}
+            self.start_flag = self.mp_ctx.Value("b", 0, lock=False)
+            self.stop_flag = self.mp_ctx.Value("b", 0, lock=False)
+            self.worker_ready_q = self.mp_ctx.Queue()
+        else:
+            self.counters = {i: metrics.StreamCounters(i) for i in range(n)}
 
     def attach_stream(self, index: int, sock, addr=None, spawn_receiver: bool = True):
         self.stream_sockets[index] = sock
@@ -54,6 +81,10 @@ class ThroughputSession:
             self.threads.append(th)
 
     def stop_all_streams(self):
+        if self.mp_enabled:
+            self.stop_flag.value = 1
+            for p in self.worker_procs:
+                p.join(timeout=10)
         for ev in self.stream_stop_events.values():
             ev.set()
         for sock in self.listener_sockets:
@@ -116,13 +147,123 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
     return th
 
 
+def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec,
+                        shared, start_flag, stop_flag, ready_q):
+    """Worker process handling a subset of streams (indices >= 1). Binds its own
+    listener ports, accepts/reads each preamble, then runs the sender/receiver
+    loops writing into the shared-memory counters."""
+    socks = {}
+    for i, port in assignments:
+        if transport == "tcp":
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                listener.bind((bind, port))
+                listener.listen(1)
+                listener.settimeout(30.0)
+                conn, addr = listener.accept()
+                preamble_bytes = conn.recv(stream_worker.PREAMBLE_SIZE)
+            except OSError as exc:
+                ready_q.put(("error", i, str(exc)))
+                try:
+                    listener.close()
+                except OSError:
+                    pass
+                continue
+            listener.close()
+            preamble = stream_worker.parse_preamble(preamble_bytes)
+            if not preamble or preamble[1] != run_id or preamble[2] != i:
+                ready_q.put(("error", i, "bad preamble"))
+                conn.close()
+                continue
+            socks[i] = (conn, None)
+            ready_q.put(("ready", i, addr))
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((bind, port))
+            except OSError as exc:
+                ready_q.put(("error", i, str(exc)))
+                continue
+            result = stream_worker.read_udp_preamble(sock, timeout_sec=30.0)
+            if not result:
+                ready_q.put(("error", i, "preamble timeout"))
+                sock.close()
+                continue
+            rid, idx, addr = result
+            if rid != run_id or idx != i:
+                ready_q.put(("error", i, "bad preamble"))
+                sock.close()
+                continue
+            socks[i] = (sock, addr)
+            ready_q.put(("ready", i, addr))
+
+    views = {i: shared.view(i) for i, _port in assignments}
+    stream_worker.run_stream_group(socks, role, transport, views, duration_sec,
+                                    wait_start=lambda: bool(start_flag.value),
+                                    stopped=lambda: bool(stop_flag.value))
+    for sock, _dest in socks.values():
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
+    """Start worker processes for streams 1..N-1 (stream 0 stays in main)."""
+    params = session.params
+    transport = params["transport"]
+    role = "recv" if params["direction"] == "up" else "send"
+    duration_sec = params.get("duration_sec")
+    idxs = session.worker_indices
+    nproc = max(1, min(int(params.get("procs", 1)), len(idxs)))
+    groups = [[] for _ in range(nproc)]
+    for k, i in enumerate(idxs):
+        groups[k % nproc].append((i, ports[i]))
+
+    for group in [g for g in groups if g]:
+        p = session.mp_ctx.Process(
+            target=_server_worker_proc,
+            args=(group, session.run_id, role, transport, ctx.config.bind, duration_sec,
+                  session.shared, session.start_flag, session.stop_flag, session.worker_ready_q),
+            daemon=True)
+        p.start()
+        session.worker_procs.append(p)
+    ctx.log(f"session {session.run_id[:8]}: {len(session.worker_procs)} worker "
+             f"process(es) handling streams {idxs} ({role})")
+
+
+def _drain_worker_ready(session: ThroughputSession):
+    """Background thread: mark worker-handled streams ready as they connect."""
+    expected = len(session.worker_indices)
+
+    def _loop():
+        got = 0
+        while got < expected and not session.stop_received_event.is_set():
+            try:
+                status, idx, addr = session.worker_ready_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            got += 1
+            if status == "ready":
+                session.stream_addrs[idx] = addr
+                session.stream_ready[idx].set()
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def _start_sender_threads(ctx, session: ThroughputSession):
-    """Direction == 'down': server sends to the client on every stream."""
+    """Direction == 'down': server sends to the client on every stream. In
+    multiprocessing mode the worker processes send their own streams, so the
+    main process only drives stream 0."""
     transport = session.params["transport"]
     duration_sec = session.params.get("duration_sec")
     start_time = time.time()
 
     for i in range(session.num_streams):
+        if session.mp_enabled and i in session.worker_indices:
+            continue
         sock = session.stream_sockets.get(i)
         addr = session.stream_addrs.get(i)
         if sock is None:
@@ -159,6 +300,8 @@ def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChan
         elif mtype == "start_data":
             session.phase.start_running()
             session.data_ready_event.set()
+            if session.mp_enabled:
+                session.start_flag.value = 1
             if session.params["direction"] == "down":
                 _start_sender_threads(ctx, session)
         elif mtype == "stop":
@@ -190,8 +333,12 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
         ctx.log(f"session {run_id[:8]} started: {transport} {params.get('direction')} "
                  f"streams={n} duration={params.get('duration_sec')}s ports={ports}")
 
-        for i in range(1, n):
-            _spawn_extra_stream_listener(ctx, session, i, ports[i])
+        if session.mp_enabled:
+            _spawn_server_workers(ctx, session, ports)
+            _drain_worker_ready(session)
+        else:
+            for i in range(1, n):
+                _spawn_extra_stream_listener(ctx, session, i, ports[i])
 
         control.send("hello_ack", ok=True, ports=ports)
 
