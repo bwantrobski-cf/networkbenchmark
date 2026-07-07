@@ -149,28 +149,50 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
 
 def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec,
                         shared, start_flag, stop_flag, ready_q):
-    """Worker process handling a subset of streams (indices >= 1). Binds its own
-    listener ports, accepts/reads each preamble, then runs the sender/receiver
-    loops writing into the shared-memory counters."""
-    socks = {}
+    """Worker process handling a subset of streams (indices >= 1).
+
+    Runs in phases so the main process never races the client:
+      1. Bind (and, for TCP, listen on) every assigned port.
+      2. Emit a single ("bound", ...) signal -- the main process waits for one
+         from every worker before it tells the client to connect. Without this
+         barrier the fork + child-interpreter startup can lag behind the
+         client's connect(), producing spurious 'connection refused' errors.
+      3. Accept/read the preamble for each stream, emitting ("ready", i, addr).
+      4. Run the sender/receiver loops into the shared-memory counters.
+    """
+    listeners = {}
     for i, port in assignments:
+        try:
+            if transport == "tcp":
+                ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                ls.bind((bind, port))
+                ls.listen(1)
+                ls.settimeout(30.0)
+            else:
+                ls = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                ls.bind((bind, port))
+            listeners[i] = ls
+        except OSError as exc:
+            ready_q.put(("error", i, str(exc)))
+
+    ready_q.put(("bound", None, None))
+
+    socks = {}
+    for i, _port in assignments:
+        ls = listeners.get(i)
+        if ls is None:
+            continue
         if transport == "tcp":
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                listener.bind((bind, port))
-                listener.listen(1)
-                listener.settimeout(30.0)
-                conn, addr = listener.accept()
+                conn, addr = ls.accept()
                 preamble_bytes = conn.recv(stream_worker.PREAMBLE_SIZE)
             except OSError as exc:
                 ready_q.put(("error", i, str(exc)))
-                try:
-                    listener.close()
-                except OSError:
-                    pass
+                ls.close()
                 continue
-            listener.close()
+            ls.close()
             preamble = stream_worker.parse_preamble(preamble_bytes)
             if not preamble or preamble[1] != run_id or preamble[2] != i:
                 ready_q.put(("error", i, "bad preamble"))
@@ -179,24 +201,17 @@ def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec
             socks[i] = (conn, None)
             ready_q.put(("ready", i, addr))
         else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind((bind, port))
-            except OSError as exc:
-                ready_q.put(("error", i, str(exc)))
-                continue
-            result = stream_worker.read_udp_preamble(sock, timeout_sec=30.0)
+            result = stream_worker.read_udp_preamble(ls, timeout_sec=30.0)
             if not result:
                 ready_q.put(("error", i, "preamble timeout"))
-                sock.close()
+                ls.close()
                 continue
             rid, idx, addr = result
             if rid != run_id or idx != i:
                 ready_q.put(("error", i, "bad preamble"))
-                sock.close()
+                ls.close()
                 continue
-            socks[i] = (sock, addr)
+            socks[i] = (ls, addr)
             ready_q.put(("ready", i, addr))
 
     views = {i: shared.view(i) for i, _port in assignments}
@@ -222,7 +237,8 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
     for k, i in enumerate(idxs):
         groups[k % nproc].append((i, ports[i]))
 
-    for group in [g for g in groups if g]:
+    active_groups = [g for g in groups if g]
+    for group in active_groups:
         p = session.mp_ctx.Process(
             target=_server_worker_proc,
             args=(group, session.run_id, role, transport, ctx.config.bind, duration_sec,
@@ -230,8 +246,25 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
             daemon=True)
         p.start()
         session.worker_procs.append(p)
+
+    # Barrier: wait until every worker reports its ports are bound/listening
+    # before returning (the caller then sends hello_ack). This prevents the
+    # client from racing ahead and hitting 'connection refused' while a forked
+    # worker is still starting up.
+    bound = 0
+    deadline = time.time() + 30
+    while bound < len(active_groups) and time.time() < deadline:
+        try:
+            status, idx, detail = session.worker_ready_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        if status == "bound":
+            bound += 1
+        elif status == "error":
+            ctx.log(f"session {session.run_id[:8]}: worker failed to bind stream "
+                     f"{idx}: {detail}")
     ctx.log(f"session {session.run_id[:8]}: {len(session.worker_procs)} worker "
-             f"process(es) handling streams {idxs} ({role})")
+             f"process(es) handling streams {idxs} ({role}); {bound} bound")
 
 
 def _drain_worker_ready(session: ThroughputSession):
