@@ -10,9 +10,11 @@ final summary, including the bbperf-style bufferbloat model:
     bloat_factor    = buffered_bytes / bdp_bytes
 """
 
+import collections
 import threading
 import time
 
+from ..common import constants
 from ..common.stats import compute_latency_stats
 
 
@@ -132,25 +134,40 @@ def compute_bufferbloat(receiver_throughput_bps: float, unloaded_rtt_ms, loaded_
     }
 
 
+def estimate_pps(transport: str, byte_rate: float, packet_rate: float) -> float:
+    """packets/sec for display. UDP tracks real datagrams, so use them
+    directly. TCP counters only see send()/recv() syscalls (each moving many
+    wire segments), so estimate wire segments from the byte rate and MSS."""
+    if transport == "tcp":
+        return byte_rate / constants.TCP_MSS_ESTIMATE
+    return packet_rate
+
+
 class IntervalRecorder:
     """Builds a time series of interval records from periodic counter
-    snapshots (bytes/sec, pps, loss%, retransmits, rtt) for logging + UI."""
+    snapshots (bytes/sec, pps, loss%, retransmits, rtt) for logging + UI.
 
-    def __init__(self):
+    Rates are averaged over a trailing ``window_sec`` window (not a single
+    sample delta) so the peer-relayed direction -- whose stats arrive in bursts
+    over the shared control channel -- doesn't oscillate between 0 and a
+    catch-up spike.
+    """
+
+    def __init__(self, transport: str = "udp", window_sec: float = None):
         self.records = []
-        self._last_totals = {}
-        self._last_time = None
+        self.transport = transport
+        self.window_sec = window_sec if window_sec is not None else constants.RATE_WINDOW_SEC
+        self._samples = collections.deque()  # (t, totals) within the window
 
     def record(self, t: float, totals: dict, rtt_ms=None, phase="running"):
-        elapsed = None
-        deltas = {}
-        if self._last_time is not None:
-            elapsed = max(1e-6, t - self._last_time)
-            for key in ("bytes_sent", "bytes_received", "packets_sent",
-                        "packets_received", "packets_lost", "retransmits"):
-                prev = self._last_totals.get(key, 0)
-                curr = totals.get(key, 0)
-                deltas[key] = max(0, curr - prev)
+        self._samples.append((t, dict(totals)))
+        # Keep the oldest sample just beyond the window so the averaging span is
+        # ~window_sec; drop anything older.
+        while len(self._samples) > 2 and (t - self._samples[1][0]) >= self.window_sec:
+            self._samples.popleft()
+
+        t0, totals0 = self._samples[0]
+        span = t - t0
 
         entry = {
             "t": t,
@@ -158,17 +175,19 @@ class IntervalRecorder:
             "rtt_ms": rtt_ms,
             "totals": dict(totals),
         }
-        if elapsed:
-            entry["interval_sec"] = elapsed
-            entry["send_mbps"] = (deltas.get("bytes_sent", 0) * 8 / elapsed) / 1e6
-            entry["recv_mbps"] = (deltas.get("bytes_received", 0) * 8 / elapsed) / 1e6
-            entry["send_pps"] = deltas.get("packets_sent", 0) / elapsed
-            entry["recv_pps"] = deltas.get("packets_received", 0) / elapsed
-            sent_for_loss = deltas.get("packets_sent") or deltas.get("packets_received", 0)
-            entry["interval_packets_lost"] = deltas.get("packets_lost", 0)
-            entry["interval_retransmits"] = deltas.get("retransmits", 0)
+        if span > 1e-6:
+            def _delta(key):
+                return max(0, totals.get(key, 0) - totals0.get(key, 0))
+
+            send_bps = _delta("bytes_sent") / span
+            recv_bps = _delta("bytes_received") / span
+            entry["interval_sec"] = span
+            entry["send_mbps"] = send_bps * 8 / 1e6
+            entry["recv_mbps"] = recv_bps * 8 / 1e6
+            entry["send_pps"] = estimate_pps(self.transport, send_bps, _delta("packets_sent") / span)
+            entry["recv_pps"] = estimate_pps(self.transport, recv_bps, _delta("packets_received") / span)
+            entry["interval_packets_lost"] = _delta("packets_lost")
+            entry["interval_retransmits"] = _delta("retransmits")
 
         self.records.append(entry)
-        self._last_totals = dict(totals)
-        self._last_time = t
         return entry

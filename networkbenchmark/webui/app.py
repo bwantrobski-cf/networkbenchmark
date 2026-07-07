@@ -174,6 +174,24 @@ def render_throughput_tab():
                                 help="Spread streams across CPU cores to reach higher rates. "
                                      "Requires more than one stream; the server mirrors this setting.")
 
+    tune_enabled = False
+    acceptable_loss = 1.0
+    if transport == "UDP":
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            tune_enabled = st.checkbox("Tune to acceptable loss (AIMD ramp)", value=False,
+                                       disabled=running,
+                                       help="Ramp the UDP send rate to find the max rate whose loss "
+                                            "stays under the target. The Duration above becomes the "
+                                            "max time budget for the search.")
+        with tcol2:
+            acceptable_loss = st.number_input("Acceptable loss (%)", min_value=0.0, max_value=100.0,
+                                              value=1.0, step=0.1,
+                                              disabled=running or not tune_enabled)
+        if tune_enabled:
+            st.caption(f"Tuning mode: 'Duration' ({int(duration)}s) is the max search budget; "
+                       f"the result is the highest rate meeting <= {acceptable_loss:.2f}% loss.")
+
     bcol1, bcol2 = st.columns(2)
     start_clicked = bcol1.button("Start Test", type="primary", disabled=running, use_container_width=True)
     stop_clicked = bcol2.button("Stop Test", disabled=not running, use_container_width=True)
@@ -188,6 +206,9 @@ def render_throughput_tab():
             duration_sec=float(duration),
             start_port=int(start_port),
             procs=int(procs),
+            acceptable_loss_pct=(float(acceptable_loss)
+                                 if (transport == "UDP" and tune_enabled) else None),
+            max_duration_sec=float(duration),
         )
         stop_event = threading.Event()
         live_list = []
@@ -261,6 +282,36 @@ def render_throughput_tab():
         p1, p2 = st.columns(2)
         p1.metric("Send packets/s", f"{summary.get('send_pps', 0):,.0f}")
         p2.metric("Recv packets/s", f"{summary.get('recv_pps', 0):,.0f}")
+        if summary.get("transport") == "tcp":
+            st.caption(f"TCP packets/s is estimated from throughput assuming a "
+                       f"{constants.TCP_MSS_ESTIMATE}-byte MSS (the byte stream has no "
+                       "application-visible packet boundaries).")
+
+        tuning = summary.get("tuning")
+        if tuning:
+            st.write("**UDP rate tuning (AIMD ramp)**")
+            best = tuning.get("best") or {}
+            probe = tuning.get("probe") or {}
+            tc1, tc2, tc3 = st.columns(3)
+            tc1.metric("Best sustainable goodput", f"{best.get('goodput_mbps', 0):,.0f} Mbps")
+            tc2.metric("At loss", f"{best.get('loss_pct', 0):.2f}%")
+            tc3.metric("Loss target", f"{tuning.get('acceptable_loss_pct', 0):.2f}%")
+            rows = [{
+                "target": "unpaced probe",
+                "offered (Mbps)": round(probe.get("offered_mbps", 0)),
+                "goodput (Mbps)": round(probe.get("goodput_mbps", 0)),
+                "loss %": round(probe.get("loss_pct", 0), 2),
+            }]
+            for tr in tuning.get("trials", []):
+                rows.append({
+                    "target": f"{tr['target_mbps']:.0f} Mbps",
+                    "offered (Mbps)": round(tr["offered_mbps"]),
+                    "goodput (Mbps)": round(tr["goodput_mbps"]),
+                    "loss %": round(tr["loss_pct"], 2),
+                })
+            st.table(pd.DataFrame(rows))
+            if not best.get("target_mbps"):
+                st.caption("Unpaced already met the loss target -- no rate limiting needed.")
 
         lr = summary.get("loaded_rtt") or {}
         st.write("**Latency (control-channel probe RTT)**")

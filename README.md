@@ -119,7 +119,11 @@ networkbenchmark throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 ```
 
 Every run reports both bitrate (Mbps) and **packets/sec** (send and recv),
-plus UDP loss / TCP retransmits and latency-under-load.
+plus UDP loss / TCP retransmits and latency-under-load. UDP packets/sec is the
+real datagram count; TCP has no application-visible packet boundaries, so its
+packets/sec is estimated from throughput assuming a standard 1448-byte MSS.
+Live rates are averaged over a short trailing window so the reading stays
+steady rather than flickering as stats arrive.
 
 ### Scaling with multiple CPU cores (`--procs`)
 
@@ -138,6 +142,39 @@ so send/receive work runs on multiple cores:
 
 A good starting point is `--procs` equal to `-P`, up to the number of physical
 cores on the slower of the two hosts.
+
+### UDP loss-target tuning (`--acceptable-loss`)
+
+Unpaced UDP simply blasts as fast as the sender can, which overruns the
+receiver's socket buffers and the kernel silently drops the excess — that is
+why an unpaced UDP test shows high loss (e.g. 20%+) at a rate far below the
+link. (TCP can't do this: flow control + retransmit trade rate for zero loss,
+which is also why raw TCP throughput looks higher.)
+
+Instead of a fixed rate, give a **target loss** and let the tool find the
+highest UDP rate that stays under it:
+
+```bash
+# Find the max UDP upload rate with <= 1% loss, searching for up to 30s
+networkbenchmark throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+    --acceptable-loss 1.0 --max-duration 30
+```
+
+- `--acceptable-loss PCT` turns on the search (UDP only). `--time` / `--max-duration`
+  becomes the **max time budget** for the ramp rather than a fixed run length.
+- The search is an **AIMD ramp** (iperf-style): it first probes unpaced to find
+  the ceiling, then additively increases the paced send rate while loss stays
+  under target and multiplicatively backs off (refining the step) when a trial
+  breaches it, converging on the best sustainable rate.
+- Works in both directions: for upload the client paces its senders; for
+  download (`-R`) the server mirrors the target rate over the control channel.
+- The result reports the best sustainable **goodput** and packets/sec at or
+  below your loss target, plus the full per-trial rate-vs-loss series.
+
+To raise the ceiling itself on Ubuntu, enlarge the socket buffers
+(`net.core.rmem_max` / `wmem_max`), `net.core.netdev_max_backlog`, use more
+streams across cores (`-P` / `--procs`), and enable NIC RSS/RPS — unpaced UDP
+is packet-rate (CPU) bound, not bandwidth bound.
 
 ### Diagnostics
 

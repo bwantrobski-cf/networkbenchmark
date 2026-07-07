@@ -58,8 +58,12 @@ class ThroughputSession:
             self.start_flag = self.mp_ctx.Value("b", 0, lock=False)
             self.stop_flag = self.mp_ctx.Value("b", 0, lock=False)
             self.worker_ready_q = self.mp_ctx.Queue()
+            # Per-stream send rate (bytes/sec, 0 = unpaced) for download tuning;
+            # the client drives it via 'set_rate' control messages.
+            self.rate_value = self.mp_ctx.Value("d", 0.0, lock=False)
         else:
             self.counters = {i: metrics.StreamCounters(i) for i in range(n)}
+            self.rate_value = stream_worker.RateHolder(0.0)
 
     def attach_stream(self, index: int, sock, addr=None, spawn_receiver: bool = True):
         self.stream_sockets[index] = sock
@@ -148,7 +152,7 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
 
 
 def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec,
-                        shared, start_flag, stop_flag, ready_q):
+                        shared, start_flag, stop_flag, ready_q, rate_value=None):
     """Worker process handling a subset of streams (indices >= 1).
 
     Runs in phases so the main process never races the client:
@@ -217,7 +221,8 @@ def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec
     views = {i: shared.view(i) for i, _port in assignments}
     stream_worker.run_stream_group(socks, role, transport, views, duration_sec,
                                     wait_start=lambda: bool(start_flag.value),
-                                    stopped=lambda: bool(stop_flag.value))
+                                    stopped=lambda: bool(stop_flag.value),
+                                    rate_value=rate_value)
     for sock, _dest in socks.values():
         try:
             sock.close()
@@ -242,7 +247,8 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
         p = session.mp_ctx.Process(
             target=_server_worker_proc,
             args=(group, session.run_id, role, transport, ctx.config.bind, duration_sec,
-                  session.shared, session.start_flag, session.stop_flag, session.worker_ready_q),
+                  session.shared, session.start_flag, session.stop_flag, session.worker_ready_q,
+                  session.rate_value),
             daemon=True)
         p.start()
         session.worker_procs.append(p)
@@ -310,7 +316,7 @@ def _start_sender_threads(ctx, session: ThroughputSession):
         else:
             th = threading.Thread(target=stream_worker.udp_sender_loop,
                                    args=(sock, addr, i, session.counters[i], stop_ev, duration_sec, start_time),
-                                   daemon=True)
+                                   kwargs={"rate_value": session.rate_value}, daemon=True)
         th.start()
         session.threads.append(th)
 
@@ -330,6 +336,13 @@ def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChan
         mtype = msg.get("type")
         if mtype == "probe":
             latency_probe.handle_probe_message(control, msg)
+        elif mtype == "set_rate":
+            # UDP download tuning: mirror the client-requested per-stream send
+            # rate (bytes/sec, 0 = unpaced) onto our senders.
+            try:
+                session.rate_value.value = float(msg.get("per_stream_bps", 0.0))
+            except (TypeError, ValueError):
+                pass
         elif mtype == "start_data":
             session.phase.start_running()
             session.data_ready_event.set()

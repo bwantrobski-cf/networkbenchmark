@@ -35,6 +35,12 @@ GRE_V0_HEADER_LEN = len(GRE_V0_HEADER)
 # Throughput test timing
 # ---------------------------------------------------------------------------
 SAMPLE_INTERVAL_SEC = 0.1
+# Reported send/recv rates are averaged over a trailing window rather than a
+# single SAMPLE_INTERVAL_SEC delta. This smooths out the burstiness of the
+# peer-relayed direction (peer_stats share the control channel with the
+# saturating data flow and arrive in bursts) so the live rate no longer
+# oscillates between 0 and a catch-up spike.
+RATE_WINDOW_SEC = 1.0
 CALIBRATION_TIME_SEC = 2.0
 STDOUT_INTERVAL_SEC = 1.0
 SOCKET_TIMEOUT_SEC = 30
@@ -47,6 +53,30 @@ DEFAULT_STREAMS = 1
 BUFSZ = 128 * 1024
 UDP_PAYLOAD_SIZE = 1200
 TCP_CHUNK_SIZE = 128 * 1024
+
+# ---------------------------------------------------------------------------
+# UDP loss-target tuning (AIMD rate ramp)
+#
+# Unpaced UDP overruns the receiver and drops packets. When an acceptable loss
+# target is set, the client ramps the per-stream send rate iperf-style:
+# additive-increase while loss stays under target, multiplicative back-off when
+# a trial breaches it, converging on the highest rate that meets the target
+# within a max-duration budget.
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_DURATION_SEC = 30
+DEFAULT_ACCEPTABLE_LOSS_PCT = 1.0
+UDP_TUNE_PROBE_SEC = 2.0          # unpaced probe to find the ceiling + size steps
+UDP_TUNE_TRIAL_SEC = 2.0          # per-trial measurement window
+UDP_TUNE_SETTLE_SEC = 0.5         # let a new rate take effect / previous drain
+UDP_TUNE_START_FRACTION = 0.5     # start the ramp at this fraction of the ceiling
+UDP_TUNE_ADDITIVE_FRACTION = 0.1  # additive increase = this fraction of ceiling
+UDP_TUNE_BACKOFF_FACTOR = 0.75    # multiplicative decrease on a loss breach
+UDP_TUNE_MIN_STEP_FRACTION = 0.02  # converged once the step is this small
+# TCP moves a byte stream, so the per-stream counters record send()/recv()
+# syscalls, not wire packets -- useless as a packets/sec figure. For reporting
+# we estimate wire segments from throughput assuming a standard Ethernet MSS
+# (1500 MTU - 20 IP - 20 TCP - 12 TCP timestamps).
+TCP_MSS_ESTIMATE = 1448
 
 # Magic tokens for demuxing traffic that lands on the shared base ports.
 CONNECTIVITY_MAGIC = b"NBCONN01"

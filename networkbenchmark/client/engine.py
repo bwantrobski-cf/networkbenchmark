@@ -20,7 +20,8 @@ class ThroughputClientConfig:
     def __init__(self, server_ip, control_port=None, transport="tcp", direction="up",
                  streams=1, duration_sec=constants.DEFAULT_TEST_DURATION_SEC,
                  start_port=None, bind="0.0.0.0", calibration_sec=constants.CALIBRATION_TIME_SEC,
-                 probe_interval_sec=constants.PROBE_INTERVAL_SEC, procs=1):
+                 probe_interval_sec=constants.PROBE_INTERVAL_SEC, procs=1,
+                 acceptable_loss_pct=None, max_duration_sec=None):
         self.server_host = server_ip
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transport = transport
@@ -35,6 +36,25 @@ class ThroughputClientConfig:
         # Number of worker processes to spread streams across (1 = threaded,
         # the default). Clamped to the stream count at run time.
         self.procs = max(1, int(procs))
+        # UDP loss-target tuning: when acceptable_loss_pct is set (UDP only),
+        # the client ramps the send rate (AIMD) to find the max rate meeting the
+        # target, and duration becomes a *max* time budget for the search.
+        self.acceptable_loss_pct = (float(acceptable_loss_pct)
+                                    if acceptable_loss_pct is not None else None)
+        self.max_duration_sec = (float(max_duration_sec) if max_duration_sec is not None
+                                 else constants.DEFAULT_MAX_DURATION_SEC)
+
+    @property
+    def tune_udp(self) -> bool:
+        """True when this run should perform the UDP loss-target rate ramp."""
+        return self.transport == "udp" and self.acceptable_loss_pct is not None
+
+    @property
+    def sender_duration_sec(self) -> float:
+        """How long senders should stay alive. During tuning they must run for
+        the whole search budget (the controller stops them early); otherwise
+        the fixed test duration."""
+        return self.max_duration_sec if self.tune_udp else self.duration_sec
 
 
 class ThroughputError(Exception):
@@ -127,7 +147,7 @@ def _should_use_multiprocess(cfg: ThroughputClientConfig) -> bool:
 
 
 def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
-                         shared, start_flag, stop_flag, connected_q):
+                         shared, start_flag, stop_flag, connected_q, rate_value=None):
     """Worker process: owns a subset of streams end-to-end (its own sockets),
     so per-stream UDP loss tracking stays entirely within one process.
 
@@ -162,7 +182,8 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
     stream_worker.run_stream_group(socks, role, conn["transport"], views,
                                     conn["duration_sec"],
                                     wait_start=lambda: bool(start_flag.value),
-                                    stopped=lambda: bool(stop_flag.value))
+                                    stopped=lambda: bool(stop_flag.value),
+                                    rate_value=rate_value)
 
     for s, _dest in socks.values():
         try:
@@ -184,15 +205,19 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
 
     role = "send" if cfg.direction == "up" else "recv"
     conn = {"server_ip": server_ip, "bind": cfg.bind, "transport": cfg.transport,
-            "duration_sec": cfg.duration_sec}
+            "duration_sec": cfg.sender_duration_sec}
     start_flag = mp_ctx.Value("b", 0, lock=False)
     stop_flag = mp_ctx.Value("b", 0, lock=False)
+    # Per-stream target send rate in bytes/sec (0 = unpaced); driven by the UDP
+    # tuning ramp. Shared lock-free so the controller can update it live.
+    rate_value = mp_ctx.Value("d", 0.0, lock=False)
     connected_q = mp_ctx.Queue()
 
     procs = []
     for g in active_groups:
         p = mp_ctx.Process(target=_client_worker_proc,
-                           args=(conn, run_id, g, role, shared, start_flag, stop_flag, connected_q),
+                           args=(conn, run_id, g, role, shared, start_flag, stop_flag,
+                                 connected_q, rate_value),
                            daemon=True)
         p.start()
         procs.append(p)
@@ -207,7 +232,114 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
         source_ports.update(payload)
 
     return {"procs": procs, "start_flag": start_flag, "stop_flag": stop_flag,
-            "source_ports": source_ports, "nproc": len(active_groups)}
+            "rate_value": rate_value, "source_ports": source_ports,
+            "nproc": len(active_groups)}
+
+
+def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate, on_interval,
+                    stop_requested, tune_start, text_log):
+    """AIMD (iperf-style) ramp: find the highest UDP send rate whose measured
+    loss stays at or below cfg.acceptable_loss_pct, within the max-duration
+    budget. Rates are per-stream bytes/sec; apply_rate() pushes the new rate to
+    the senders (locally for upload, via a control message for download).
+
+    Returns a ``tuning`` dict (probe + per-trial series + best result)."""
+    target = cfg.acceptable_loss_pct
+    deadline = tune_start + cfg.max_duration_sec
+    streams = max(1, cfg.streams)
+    state = {"target_aggregate_mbps": 0.0}
+
+    def _sample_for(seconds):
+        end = time.time() + seconds
+        while time.time() < end and not stop_requested.is_set():
+            time.sleep(constants.SAMPLE_INTERVAL_SEC)
+            totals = _aggregate_totals(counters)
+            loaded = rtt_tracker.loaded_stats()
+            entry = recorder.record(time.time(), totals, rtt_ms=loaded.get("avg"), phase="tuning")
+            entry["target_mbps"] = state["target_aggregate_mbps"]
+            if on_interval:
+                on_interval(entry)
+
+    def _measure(rate_ps_bps):
+        """Set a per-stream rate (bytes/sec; 0 = unpaced), let it settle, then
+        measure offered rate / goodput / loss over one trial window."""
+        apply_rate(rate_ps_bps)
+        state["target_aggregate_mbps"] = (rate_ps_bps * streams * 8 / 1e6) if rate_ps_bps else 0.0
+        _sample_for(constants.UDP_TUNE_SETTLE_SEC)
+        a = _aggregate_totals(counters)
+        ta = time.time()
+        _sample_for(constants.UDP_TUNE_TRIAL_SEC)
+        b = _aggregate_totals(counters)
+        dt = max(1e-6, time.time() - ta)
+
+        d_sent_pkts = max(0, b["packets_sent"] - a["packets_sent"])
+        d_recv_pkts = max(0, b["packets_received"] - a["packets_received"])
+        d_lost = max(0, b["packets_lost"] - a["packets_lost"])
+        d_sent_bytes = max(0, b["bytes_sent"] - a["bytes_sent"])
+        d_recv_bytes = max(0, b["bytes_received"] - a["bytes_received"])
+        expected = d_recv_pkts + d_lost
+        loss_pct = (d_lost / expected * 100.0) if expected > 0 else 0.0
+        return {
+            "target_mbps": state["target_aggregate_mbps"],
+            "offered_mbps": d_sent_bytes * 8 / dt / 1e6,
+            "goodput_mbps": d_recv_bytes * 8 / dt / 1e6,
+            "offered_pps": d_sent_pkts / dt,
+            "goodput_pps": d_recv_pkts / dt,
+            "loss_pct": loss_pct,
+        }
+
+    trials = []
+    # Phase 1: one unpaced probe to find the ceiling and size the ramp steps.
+    probe = _measure(0.0)
+    probe["phase"] = "probe"
+    text_log.append(f"[tune] probe (unpaced): offered={probe['offered_mbps']:.0f} Mbps "
+                    f"goodput={probe['goodput_mbps']:.0f} Mbps loss={probe['loss_pct']:.2f}%")
+    ceiling_ps = (probe["offered_mbps"] * 1e6 / 8) / streams
+
+    best = None
+    if probe["loss_pct"] <= target:
+        # Unpaced already meets the target -- nothing to tune down to.
+        best = dict(probe)
+    else:
+        step_ps = ceiling_ps * constants.UDP_TUNE_ADDITIVE_FRACTION
+        rate_ps = ceiling_ps * constants.UDP_TUNE_START_FRACTION
+        min_step = ceiling_ps * constants.UDP_TUNE_MIN_STEP_FRACTION
+        while (not stop_requested.is_set()
+               and time.time() + constants.UDP_TUNE_SETTLE_SEC + constants.UDP_TUNE_TRIAL_SEC <= deadline
+               and step_ps >= min_step and rate_ps > 0):
+            trial = _measure(rate_ps)
+            trials.append(trial)
+            text_log.append(f"[tune] target={trial['target_mbps']:.0f} Mbps -> "
+                            f"goodput={trial['goodput_mbps']:.0f} Mbps loss={trial['loss_pct']:.2f}%")
+            if trial["loss_pct"] <= target:
+                if best is None or trial["target_mbps"] > best.get("target_mbps", 0):
+                    best = dict(trial)
+                rate_ps += step_ps                                    # additive increase
+            else:
+                rate_ps = max(step_ps, rate_ps * constants.UDP_TUNE_BACKOFF_FACTOR)  # mult. decrease
+                step_ps *= 0.5                                        # refine granularity
+
+    # Leave the senders at the best sustainable rate (or unpaced if the probe
+    # already met the target / nothing was feasible).
+    if best is not None and best.get("target_mbps"):
+        apply_rate(best["target_mbps"] * 1e6 / 8 / streams)
+    else:
+        apply_rate(0.0)
+
+    if best is not None:
+        text_log.append(f"[tune] best: target={best.get('target_mbps', 0):.0f} Mbps "
+                        f"goodput={best.get('goodput_mbps', 0):.0f} Mbps loss={best.get('loss_pct', 0):.2f}% "
+                        f"(<= {target:.2f}% target)")
+    else:
+        text_log.append(f"[tune] no rate met the {target:.2f}% loss target within the budget")
+
+    return {
+        "acceptable_loss_pct": target,
+        "max_duration_sec": cfg.max_duration_sec,
+        "probe": probe,
+        "trials": trials,
+        "best": best,
+    }
 
 
 def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requested: threading.Event = None,
@@ -225,13 +357,17 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         "transport": cfg.transport,
         "direction": cfg.direction,
         "streams": cfg.streams,
-        "duration_sec": cfg.duration_sec,
+        # Senders (client for upload, server for download) must stay alive for
+        # the whole budget when tuning; the controller stops them early.
+        "duration_sec": cfg.sender_duration_sec,
         "procs": cfg.procs,
     }
 
+    _dur_desc = (f"max_duration={cfg.max_duration_sec}s acceptable_loss={cfg.acceptable_loss_pct}%"
+                 if cfg.tune_udp else f"duration={cfg.duration_sec}s")
     text_log = [f"NetworkBenchmark throughput test  run_id={run_id}",
                 f"server={server_ip}:{cfg.control_port}  transport={cfg.transport} "
-                f"direction={cfg.direction} streams={cfg.streams} duration={cfg.duration_sec}s"]
+                f"direction={cfg.direction} streams={cfg.streams} {_dur_desc}"]
 
     try:
         control.send("hello", run_id=run_id, params=params)
@@ -298,6 +434,13 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         stream_threads = []
         start_time = time.time()
 
+        # Per-stream target send rate (bytes/sec, 0 = unpaced). For upload this
+        # drives the local senders; the tuning controller updates it live.
+        if use_mp:
+            client_rate_value = mp_state["rate_value"]
+        else:
+            client_rate_value = stream_worker.RateHolder(0.0)
+
         if use_mp:
             mp_state["start_flag"].value = 1
         elif cfg.direction == "up":
@@ -306,12 +449,13 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
                 stream_stop_events[i] = stop_ev
                 if cfg.transport == "tcp":
                     th = threading.Thread(target=stream_worker.tcp_sender_loop,
-                                           args=(sock, counters[i], stop_ev, cfg.duration_sec, start_time),
+                                           args=(sock, counters[i], stop_ev, cfg.sender_duration_sec, start_time),
                                            daemon=True)
                 else:
                     th = threading.Thread(target=stream_worker.udp_sender_loop,
-                                           args=(sock, dest, i, counters[i], stop_ev, cfg.duration_sec, start_time),
-                                           daemon=True)
+                                           args=(sock, dest, i, counters[i], stop_ev,
+                                                 cfg.sender_duration_sec, start_time),
+                                           kwargs={"rate_value": client_rate_value}, daemon=True)
                 th.start()
                 stream_threads.append(th)
         else:
@@ -328,16 +472,33 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
                 th.start()
                 stream_threads.append(th)
 
-        recorder = metrics.IntervalRecorder()
-        run_deadline = start_time + cfg.duration_sec
+        recorder = metrics.IntervalRecorder(transport=cfg.transport)
+        tuning = None
 
-        while time.time() < run_deadline and not stop_requested.is_set():
-            time.sleep(constants.SAMPLE_INTERVAL_SEC)
-            totals = _aggregate_totals(counters)
-            loaded = rtt_tracker.loaded_stats()
-            entry = recorder.record(time.time(), totals, rtt_ms=loaded.get("avg"), phase="running")
-            if on_interval:
-                on_interval(entry)
+        if cfg.tune_udp:
+            # apply_rate pushes a new per-stream rate (bytes/sec) to whichever
+            # side is sending: locally for upload, or to the server (which
+            # mirrors it onto its senders) for download.
+            if cfg.direction == "up":
+                def apply_rate(ps_bps):
+                    client_rate_value.value = ps_bps
+            else:
+                def apply_rate(ps_bps):
+                    try:
+                        control.send("set_rate", per_stream_bps=ps_bps)
+                    except OSError:
+                        pass
+            tuning = _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate,
+                                     on_interval, stop_requested, start_time, text_log)
+        else:
+            run_deadline = start_time + cfg.duration_sec
+            while time.time() < run_deadline and not stop_requested.is_set():
+                time.sleep(constants.SAMPLE_INTERVAL_SEC)
+                totals = _aggregate_totals(counters)
+                loaded = rtt_tracker.loaded_stats()
+                entry = recorder.record(time.time(), totals, rtt_ms=loaded.get("avg"), phase="running")
+                if on_interval:
+                    on_interval(entry)
 
         control.send("stop")
         if use_mp:
@@ -366,7 +527,8 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
                 except OSError:
                     pass
 
-        summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, source_ports)
+        summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log,
+                                 source_ports, tuning=tuning)
         json_path, log_path = logging_store.save_result(
             constants.TEST_TYPE_THROUGHPUT, summary, text_log, base_dir=log_base_dir)
         summary["log_json"] = json_path
@@ -387,7 +549,8 @@ def _aggregate_totals(counters: dict) -> dict:
     return totals
 
 
-def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, source_ports=None):
+def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, source_ports=None,
+                   tuning=None):
     source_ports = source_ports or {}
     per_stream = []
     for c in counters.values():
@@ -398,20 +561,42 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
     totals = _aggregate_totals(counters)
 
     duration = cfg.duration_sec
-    send_mbps = (totals["bytes_sent"] * 8 / duration) / 1e6 if duration else 0
-    recv_mbps = (totals["bytes_received"] * 8 / duration) / 1e6 if duration else 0
-    send_pps = (totals["packets_sent"] / duration) if duration else 0
-    recv_pps = (totals["packets_received"] / duration) if duration else 0
+    send_bps = (totals["bytes_sent"] / duration) if duration else 0
+    recv_bps = (totals["bytes_received"] / duration) if duration else 0
+    send_mbps = send_bps * 8 / 1e6
+    recv_mbps = recv_bps * 8 / 1e6
+    send_pps = metrics.estimate_pps(cfg.transport, send_bps,
+                                    (totals["packets_sent"] / duration) if duration else 0)
+    recv_pps = metrics.estimate_pps(cfg.transport, recv_bps,
+                                    (totals["packets_received"] / duration) if duration else 0)
 
     loss_pct = None
     if cfg.transport == "udp":
         expected = totals["packets_received"] + totals["packets_lost"]
         loss_pct = (totals["packets_lost"] / expected * 100.0) if expected else 0.0
 
+    # For a tuning run the cumulative totals span every probed rate, so they are
+    # not a meaningful "throughput". Report the best sustainable trial instead.
+    if tuning is not None:
+        best = tuning.get("best")
+        if best is not None:
+            send_mbps = best.get("offered_mbps", 0.0)
+            recv_mbps = best.get("goodput_mbps", 0.0)
+            send_pps = best.get("offered_pps", 0.0)
+            recv_pps = best.get("goodput_pps", 0.0)
+            loss_pct = best.get("loss_pct", loss_pct)
+            receiver_bps_override = recv_mbps * 1e6 / 8
+        else:
+            send_mbps = recv_mbps = send_pps = recv_pps = 0.0
+            receiver_bps_override = 0.0
+    else:
+        receiver_bps_override = None
+
     unloaded_rtt_ms = rtt_tracker.unloaded_rtt_ms()
     loaded_stats = rtt_tracker.loaded_stats()
 
-    receiver_bps = (totals["bytes_received"] / duration) if duration else 0
+    receiver_bps = (receiver_bps_override if receiver_bps_override is not None
+                    else ((totals["bytes_received"] / duration) if duration else 0))
     bloat = metrics.compute_bufferbloat(receiver_bps, unloaded_rtt_ms, loaded_stats.get("avg"))
 
     summary = {
@@ -434,6 +619,7 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
         "bufferbloat": bloat,
         "per_stream": per_stream,
         "interval_series": recorder.records,
+        "tuning": tuning,
     }
 
     text_log.append("")

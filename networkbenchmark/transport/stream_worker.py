@@ -109,15 +109,53 @@ def tcp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
 # UDP
 # ---------------------------------------------------------------------------
 
+class RateHolder:
+    """Minimal shared holder for a per-stream target send rate in bytes/sec
+    (0 == unpaced / flat-out). Exposes ``.value`` so the same sender loop can
+    read either this (threaded mode) or a ``multiprocessing.Value`` (MP mode)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: float = 0.0):
+        self.value = value
+
+
 def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
-                     stop_event: threading.Event, duration_sec: float, start_time: float):
+                     stop_event: threading.Event, duration_sec: float, start_time: float,
+                     rate_value=None):
+    """Send UDP datagrams until stopped or ``duration_sec`` elapses.
+
+    If ``rate_value`` is provided and its ``.value`` is > 0, sends are paced to
+    that many bytes/sec via a token bucket (used by the loss-target tuning
+    ramp). A value of 0 means unpaced (send as fast as possible)."""
     seq = 0
     payload = _padding(max(0, constants.UDP_PAYLOAD_SIZE - UDP_HEADER_SIZE))
+    packet_size = UDP_HEADER_SIZE + len(payload)
     sock.settimeout(1.0)
+    tokens = 0.0
+    last = time.perf_counter()
     try:
         while not stop_event.is_set():
             if duration_sec and (time.time() - start_time) > duration_sec:
                 break
+
+            now = time.perf_counter()
+            rate = rate_value.value if rate_value is not None else 0.0
+            if rate and rate > 0:
+                # Token bucket: accrue budget at `rate` bytes/sec, cap the burst
+                # to ~5 ms so pacing stays smooth, and sleep when short.
+                tokens += (now - last) * rate
+                last = now
+                burst_cap = max(packet_size, rate * 0.005)
+                if tokens > burst_cap:
+                    tokens = burst_cap
+                if tokens < packet_size:
+                    time.sleep(min(0.002, (packet_size - tokens) / rate))
+                    continue
+                tokens -= packet_size
+            else:
+                last = now
+
             header = struct.pack(UDP_HEADER_FMT, stream_index, seq, time.time(), UDP_FLAG_DATA)
             packet = header + payload
             try:
@@ -185,7 +223,7 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
 
 
 def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict,
-                      duration_sec: float, wait_start=None, stopped=None):
+                      duration_sec: float, wait_start=None, stopped=None, rate_value=None):
     """Run the sender/receiver loops for a group of streams as threads within
     the current (possibly worker) process.
 
@@ -228,7 +266,7 @@ def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict
             else:
                 th = threading.Thread(target=udp_sender_loop,
                                        args=(sock, dest, i, view, stop_ev, duration_sec, start_time),
-                                       daemon=True)
+                                       kwargs={"rate_value": rate_value}, daemon=True)
         else:
             if transport == "tcp":
                 th = threading.Thread(target=tcp_receiver_loop,

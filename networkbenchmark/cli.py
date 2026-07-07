@@ -58,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tp.add_argument("--procs", type=int, default=1,
                        help="spread streams across N worker processes to use multiple CPU cores "
                             "(default: 1 = single-process/threaded). Requires >1 stream.")
+    p_tp.add_argument("--acceptable-loss", type=float, default=None, metavar="PCT",
+                       help="UDP only: tune the send rate (AIMD ramp) to find the max rate whose "
+                            "loss stays <= PCT%%. In this mode --time becomes a max-duration budget.")
+    p_tp.add_argument("--max-duration", type=float, default=None, metavar="SEC",
+                       help="UDP tuning: max time budget for the rate search "
+                            f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s; overrides --time as the budget).")
     p_tp.add_argument("--log-dir", default=None)
     p_tp.set_defaults(func=cmd_throughput)
 
@@ -119,6 +125,11 @@ def cmd_server(args):
 
 
 def cmd_throughput(args):
+    if args.acceptable_loss is not None and args.transport != "udp":
+        print("error: --acceptable-loss is only valid for UDP (--udp)", flush=True)
+        return
+    max_dur = args.max_duration if args.max_duration is not None else args.time
+
     cfg = ThroughputClientConfig(
         server_ip=args.server_ip,
         control_port=args.control_port,
@@ -129,6 +140,8 @@ def cmd_throughput(args):
         start_port=args.start_port,
         bind=args.bind,
         procs=args.procs,
+        acceptable_loss_pct=args.acceptable_loss,
+        max_duration_sec=max_dur,
     )
 
     stop_requested = threading.Event()
@@ -144,20 +157,53 @@ def cmd_throughput(args):
             return
         rtt = entry.get("rtt_ms")
         rtt_str = f"{rtt:.2f}ms" if rtt is not None else "n/a"
+        tgt = entry.get("target_mbps")
+        tgt_str = (f"  target={tgt:.0f} Mbps" if tgt else "  target=unpaced") if cfg.tune_udp else ""
         print(f"  t={entry['t']:.1f}  send={entry['send_mbps']:.2f} Mbps  "
               f"recv={entry['recv_mbps']:.2f} Mbps  "
               f"send={entry.get('send_pps', 0):.0f} pps  recv={entry.get('recv_pps', 0):.0f} pps  "
-              f"rtt={rtt_str}", flush=True)
+              f"rtt={rtt_str}{tgt_str}", flush=True)
 
-    print(f"Running throughput test: server={args.server_ip} transport={cfg.transport} "
-          f"direction={cfg.direction} streams={cfg.streams} duration={cfg.duration_sec}s", flush=True)
+    if cfg.tune_udp:
+        print(f"Running UDP loss-target tuning: server={args.server_ip} "
+              f"direction={cfg.direction} streams={cfg.streams} "
+              f"acceptable_loss={cfg.acceptable_loss_pct}% max_duration={cfg.max_duration_sec}s", flush=True)
+    else:
+        print(f"Running throughput test: server={args.server_ip} transport={cfg.transport} "
+              f"direction={cfg.direction} streams={cfg.streams} duration={cfg.duration_sec}s", flush=True)
 
     summary = run_throughput_test(cfg, on_interval=on_interval, stop_requested=stop_requested,
                                    log_base_dir=args.log_dir)
     _print_throughput_summary(summary)
 
 
+def _print_tuning_summary(tuning):
+    print("\n=== UDP Rate Tuning (AIMD ramp) ===")
+    target = tuning.get("acceptable_loss_pct")
+    probe = tuning.get("probe") or {}
+    print(f"  acceptable loss target: {target:.2f}%")
+    print(f"  unpaced probe: offered={probe.get('offered_mbps', 0):.0f} Mbps  "
+          f"goodput={probe.get('goodput_mbps', 0):.0f} Mbps  loss={probe.get('loss_pct', 0):.2f}%")
+    trials = tuning.get("trials") or []
+    if trials:
+        print("  ramp trials (target -> goodput @ loss):")
+        for tr in trials:
+            flag = "ok" if tr["loss_pct"] <= target else "BREACH"
+            print(f"    {tr['target_mbps']:8.0f} Mbps -> {tr['goodput_mbps']:8.0f} Mbps "
+                  f"@ {tr['loss_pct']:5.2f}%  [{flag}]")
+    best = tuning.get("best")
+    if best:
+        label = "unpaced (already under target)" if not best.get("target_mbps") else f"{best['target_mbps']:.0f} Mbps target"
+        print(f"  BEST sustainable: {label} -> goodput={best.get('goodput_mbps', 0):.0f} Mbps "
+              f"({best.get('goodput_pps', 0):.0f} pps) at {best.get('loss_pct', 0):.2f}% loss")
+    else:
+        print("  no rate met the loss target within the budget")
+
+
 def _print_throughput_summary(summary):
+    tuning = summary.get("tuning")
+    if tuning:
+        _print_tuning_summary(tuning)
     print("\n=== Throughput Test Summary ===")
     print(f"  send: {summary['send_mbps']:.2f} Mbps   recv: {summary['recv_mbps']:.2f} Mbps")
     print(f"  send: {summary.get('send_pps', 0):.1f} pps   recv: {summary.get('recv_pps', 0):.1f} pps")
