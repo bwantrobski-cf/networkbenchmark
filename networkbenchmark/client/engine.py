@@ -307,32 +307,59 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate, on_interva
     step_ps = _ps_for_aggregate(constants.UDP_TUNE_STEP_MBPS)
     min_step = _ps_for_aggregate(constants.UDP_TUNE_MIN_STEP_MBPS)
 
+    def _goodput(m):
+        return float(m.get("goodput_mbps") or 0.0)
+
+    # best        -> highest-goodput trial that also met the loss target.
+    # best_effort -> highest-goodput trial overall (used for reporting when
+    #                nothing met the target, so we never report 0 while data
+    #                was actually flowing).
     best = None
+    best_effort = None
+
+    def _record(m):
+        nonlocal best, best_effort
+        if best_effort is None or _goodput(m) > _goodput(best_effort):
+            best_effort = dict(m)
+        if m["loss_pct"] <= target and (best is None or _goodput(m) > _goodput(best)):
+            best = dict(m)
+
+    _record(probe)
+    # Best goodput accepted so far (loss under target); drives plateau detection.
+    accepted_goodput = _goodput(probe) if probe["loss_pct"] <= target else None
+
     if probe["loss_pct"] <= target:
         # Start rate is within the loss target -- keep it and try to climb.
-        best = dict(probe)
         rate_ps = start_ps + step_ps
     else:
         # Start rate already breaches the loss target -- back off below it.
         rate_ps = max(min_step, start_ps * constants.UDP_TUNE_BACKOFF_FACTOR)
         step_ps *= 0.5
 
-    # Phase 2: AIMD around the start rate -- additive increase while loss stays
-    # under target, multiplicative decrease + finer steps on a breach.
+    # Phase 2: AIMD around the start rate. A trial is a "breach" when it either
+    # loses more than the target OR fails to raise goodput meaningfully (the path
+    # is saturated and the extra offered load is only filling a buffer -- loss
+    # stays ~0 but latency balloons). Both cases back off + refine the step.
     while (not stop_requested.is_set()
            and time.time() + constants.UDP_TUNE_SETTLE_SEC + constants.UDP_TUNE_TRIAL_SEC <= deadline
            and step_ps >= min_step and rate_ps > 0):
         trial = _measure(rate_ps)
         trials.append(trial)
+        gp = _goodput(trial)
+        plateaued = (trial["loss_pct"] <= target
+                     and accepted_goodput is not None
+                     and gp <= accepted_goodput * (1.0 + constants.UDP_TUNE_MIN_GOODPUT_GAIN))
+        breach = trial["loss_pct"] > target or plateaued
         text_log.append(f"[tune] target={trial['target_mbps']:.0f} Mbps -> "
-                        f"goodput={trial['goodput_mbps']:.0f} Mbps loss={trial['loss_pct']:.2f}%")
-        if trial["loss_pct"] <= target:
-            if best is None or trial["target_mbps"] > best.get("target_mbps", 0):
-                best = dict(trial)
-            rate_ps += step_ps                                    # additive increase
-        else:
+                        f"goodput={gp:.0f} Mbps loss={trial['loss_pct']:.2f}%"
+                        + ("  (saturated)" if plateaued else ""))
+        _record(trial)
+        if breach:
             rate_ps = max(step_ps, rate_ps * constants.UDP_TUNE_BACKOFF_FACTOR)  # mult. decrease
             step_ps *= 0.5                                        # refine granularity
+        else:
+            accepted_goodput = max(accepted_goodput or 0.0, gp)
+            rate_ps += step_ps                                    # additive increase
 
     # Leave the senders at the best sustainable paced rate (or unpaced only if
     # nothing was measurable).
@@ -346,7 +373,9 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate, on_interva
                         f"goodput={best.get('goodput_mbps', 0):.0f} Mbps loss={best.get('loss_pct', 0):.2f}% "
                         f"(<= {target:.2f}% target)")
     else:
-        text_log.append(f"[tune] no rate met the {target:.2f}% loss target within the budget")
+        text_log.append(f"[tune] no rate met the {target:.2f}% loss target within the budget"
+                        + (f"; best effort goodput={best_effort.get('goodput_mbps', 0):.0f} Mbps "
+                           f"loss={best_effort.get('loss_pct', 0):.2f}%" if best_effort else ""))
 
     return {
         "acceptable_loss_pct": target,
@@ -354,6 +383,7 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate, on_interva
         "probe": probe,
         "trials": trials,
         "best": best,
+        "best_effort": best_effort,
     }
 
 
@@ -591,9 +621,12 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
         loss_pct = (totals["packets_lost"] / expected * 100.0) if expected else 0.0
 
     # For a tuning run the cumulative totals span every probed rate, so they are
-    # not a meaningful "throughput". Report the best sustainable trial instead.
+    # not a meaningful "throughput". Report the best sustainable trial. When no
+    # trial met the loss target, fall back to the best-effort trial (highest
+    # goodput measured) so we still report the real throughput/loss instead of
+    # zeros while data was clearly flowing.
     if tuning is not None:
-        best = tuning.get("best")
+        best = tuning.get("best") or tuning.get("best_effort")
         if best is not None:
             send_mbps = best.get("offered_mbps", 0.0)
             recv_mbps = best.get("goodput_mbps", 0.0)

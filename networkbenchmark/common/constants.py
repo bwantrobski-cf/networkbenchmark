@@ -77,6 +77,12 @@ UDP_TUNE_BACKOFF_FACTOR = 0.75    # multiplicative decrease on a loss breach
 UDP_TUNE_START_MBPS = 250.0       # aggregate Mbps the UDP ramp starts at
 UDP_TUNE_STEP_MBPS = 100.0        # additive increase per successful trial (aggregate Mbps)
 UDP_TUNE_MIN_STEP_MBPS = 25.0     # converged once the step shrinks below this (aggregate Mbps)
+# Loss alone can't detect a saturated path with a deep buffer: packets pile into
+# the buffer (huge latency) instead of being dropped, so loss stays ~0 while the
+# offered rate runs far above the real goodput. Treat a higher offered rate that
+# fails to raise goodput by at least this fraction as "saturated" and back off,
+# so the ramp settles near the true goodput instead of over-driving the buffer.
+UDP_TUNE_MIN_GOODPUT_GAIN = 0.05  # required goodput improvement to keep climbing
 # TCP moves a byte stream, so the per-stream counters record send()/recv()
 # syscalls, not wire packets -- useless as a packets/sec figure. For reporting
 # we estimate wire segments from throughput assuming a standard Ethernet MSS
