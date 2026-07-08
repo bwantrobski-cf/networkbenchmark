@@ -146,6 +146,57 @@ def _should_use_multiprocess(cfg: ThroughputClientConfig) -> bool:
     return "fork" in multiprocessing.get_all_start_methods()
 
 
+# The UDP setup preamble is a single unacknowledged datagram. If it is dropped
+# the server never registers the stream, times out, and the whole run fails with
+# "did not receive stream_ready" -- increasingly likely as the stream count (and
+# thus the number of preambles that must all survive) grows. Resend the preamble
+# periodically until the start handshake completes; the server consumes the first
+# copy and skips any duplicates (stream_worker.is_preamble).
+_PREAMBLE_RESEND_INTERVAL_SEC = 0.1
+_PREAMBLE_RESEND_MAX_SEC = 30.0
+
+
+def _resend_preambles(streams: dict, run_id: str):
+    for i, (sock, dest) in streams.items():
+        try:
+            sock.sendto(stream_worker.build_preamble(run_id, i), dest)
+        except OSError:
+            pass
+
+
+def _make_preamble_resender(streams: dict, run_id: str):
+    """Return a throttled callback that resends every stream's UDP preamble at
+    most once per interval, giving up after a bounded window so a failed setup
+    can't spin forever."""
+    state = {"last": 0.0, "started": time.time()}
+
+    def _tick():
+        now = time.time()
+        if now - state["started"] > _PREAMBLE_RESEND_MAX_SEC:
+            return
+        if now - state["last"] < _PREAMBLE_RESEND_INTERVAL_SEC:
+            return
+        state["last"] = now
+        _resend_preambles(streams, run_id)
+
+    return _tick
+
+
+def _start_preamble_resender_thread(streams: dict, run_id: str) -> threading.Event:
+    """Threaded-path equivalent of the resender: resend preambles in the
+    background until stopped (or the bounded window elapses)."""
+    stop = threading.Event()
+
+    def _loop():
+        deadline = time.time() + _PREAMBLE_RESEND_MAX_SEC
+        while not stop.is_set() and time.time() < deadline:
+            _resend_preambles(streams, run_id)
+            stop.wait(_PREAMBLE_RESEND_INTERVAL_SEC)
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return stop
+
+
 def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
                          shared, start_flag, stop_flag, connected_q, rate_value=None):
     """Worker process: owns a subset of streams end-to-end (its own sockets),
@@ -178,12 +229,17 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
 
     connected_q.put(("ok", src_ports))
 
+    # Keep the preamble alive across setup-time UDP loss until the parent flips
+    # start_flag (i.e. every stream has been acknowledged and the run begins).
+    on_wait_tick = _make_preamble_resender(socks, run_id) if conn["transport"] == "udp" else None
+
     views = {i: shared.view(i) for i, _port in assignments}
     stream_worker.run_stream_group(socks, role, conn["transport"], views,
                                     conn["duration_sec"],
                                     wait_start=lambda: bool(start_flag.value),
                                     stopped=lambda: bool(stop_flag.value),
-                                    rate_value=rate_value)
+                                    rate_value=rate_value,
+                                    on_wait_tick=on_wait_tick)
 
     for s, _dest in socks.values():
         try:
@@ -443,10 +499,20 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
             f"stream {i}: src :{source_ports[i]} -> {server_ip}:{ports[i]}/{cfg.transport}"
             for i in sorted(source_ports)))
 
-        for _ in range(cfg.streams):
-            ready_msg = control.recv(timeout=30)
-            if not ready_msg or ready_msg.get("type") != "stream_ready":
-                raise ThroughputError(f"did not receive stream_ready: {ready_msg}")
+        # In the threaded path there is no worker wait-loop to piggyback the
+        # preamble retransmit on, so drive it from a background thread until every
+        # stream is acknowledged.
+        preamble_resend_stop = None
+        if cfg.transport == "udp" and not use_mp:
+            preamble_resend_stop = _start_preamble_resender_thread(streams, run_id)
+        try:
+            for _ in range(cfg.streams):
+                ready_msg = control.recv(timeout=30)
+                if not ready_msg or ready_msg.get("type") != "stream_ready":
+                    raise ThroughputError(f"did not receive stream_ready: {ready_msg}")
+        finally:
+            if preamble_resend_stop is not None:
+                preamble_resend_stop.set()
 
         control.send("start")
         ack = control.recv(timeout=30)

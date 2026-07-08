@@ -45,6 +45,17 @@ def parse_preamble(data: bytes):
     return magic, run_id, stream_index
 
 
+def is_preamble(data: bytes) -> bool:
+    """True if a datagram is a stream preamble (magic prefix) rather than a
+    data frame. The UDP preamble is unacknowledged, so the client resends it
+    during setup to survive packet loss; those duplicates can arrive interleaved
+    with the first data packets, so receivers must skip them or they corrupt the
+    sequence/loss accounting. A data frame starts with a small stream_index int,
+    never the magic, so the prefix check is unambiguous."""
+    magic = constants.DATA_STREAM_MAGIC
+    return len(data) >= len(magic) and data[:len(magic)] == magic
+
+
 def _padding(size: int) -> bytes:
     if size <= 0:
         return b""
@@ -211,6 +222,11 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
             if known_peer_addr is not None and addr_ != known_peer_addr:
                 continue
 
+            if is_preamble(data):
+                # A resent setup preamble that raced ahead of the data; ignore
+                # it so it isn't miscounted as a (lost/duplicate) data packet.
+                continue
+
             if len(data) < UDP_HEADER_SIZE:
                 continue
 
@@ -223,7 +239,8 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
 
 
 def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict,
-                      duration_sec: float, wait_start=None, stopped=None, rate_value=None):
+                      duration_sec: float, wait_start=None, stopped=None, rate_value=None,
+                      on_wait_tick=None):
     """Run the sender/receiver loops for a group of streams as threads within
     the current (possibly worker) process.
 
@@ -249,6 +266,8 @@ def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict
     """
     if wait_start is not None:
         while not wait_start():
+            if on_wait_tick is not None:
+                on_wait_tick()
             time.sleep(0.02)
     start_time = time.time()
 
@@ -303,6 +322,8 @@ def feed_udp_data_frame(counters, data: bytes) -> bool:
     shared base-port listener, which must remain the sole reader of its
     socket (see server.echo_responders). Returns False if not a data frame.
     """
+    if is_preamble(data):
+        return False
     if len(data) < UDP_HEADER_SIZE:
         return False
     _stream_index, seq, _send_ts, flag = struct.unpack(UDP_HEADER_FMT, data[:UDP_HEADER_SIZE])
