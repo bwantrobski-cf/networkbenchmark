@@ -243,7 +243,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "test_index": idx,
             "test_count": total,
             "label": label,
-            "benchmark_label": cfg.label,
+            "crypto_setting": cfg.label,
             "transport": spec["transport"],
             "direction": spec["direction"],
             "streams": spec["streams"],

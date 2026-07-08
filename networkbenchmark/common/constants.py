@@ -65,13 +65,18 @@ TCP_CHUNK_SIZE = 128 * 1024
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_DURATION_SEC = 30
 DEFAULT_ACCEPTABLE_LOSS_PCT = 1.0
-UDP_TUNE_PROBE_SEC = 2.0          # unpaced probe to find the ceiling + size steps
+UDP_TUNE_PROBE_SEC = 2.0          # paced probe window at the start rate
 UDP_TUNE_TRIAL_SEC = 2.0          # per-trial measurement window
 UDP_TUNE_SETTLE_SEC = 0.5         # let a new rate take effect / previous drain
-UDP_TUNE_START_FRACTION = 0.5     # start the ramp at this fraction of the ceiling
-UDP_TUNE_ADDITIVE_FRACTION = 0.1  # additive increase = this fraction of ceiling
 UDP_TUNE_BACKOFF_FACTOR = 0.75    # multiplicative decrease on a loss breach
-UDP_TUNE_MIN_STEP_FRACTION = 0.02  # converged once the step is this small
+# The ramp is PACED from a fixed start rate (in aggregate Mbps) rather than an
+# unpaced line-rate burst. An unpaced probe can momentarily send multi-Gbps,
+# which looks like a UDP flood/DDoS and gets dropped or rate-limited by network
+# security devices. Starting at UDP_TUNE_START_MBPS and adjusting up/down avoids
+# that.
+UDP_TUNE_START_MBPS = 250.0       # aggregate Mbps the UDP ramp starts at
+UDP_TUNE_STEP_MBPS = 100.0        # additive increase per successful trial (aggregate Mbps)
+UDP_TUNE_MIN_STEP_MBPS = 25.0     # converged once the step shrinks below this (aggregate Mbps)
 # TCP moves a byte stream, so the per-stream counters record send()/recv()
 # syscalls, not wire packets -- useless as a packets/sec figure. For reporting
 # we estimate wire segments from throughput assuming a standard Ethernet MSS

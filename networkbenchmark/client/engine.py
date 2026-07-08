@@ -288,39 +288,54 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate, on_interva
             "loss_pct": loss_pct,
         }
 
+    def _ps_for_aggregate(mbps):
+        """Per-stream bytes/sec needed to offer the given aggregate Mbps."""
+        return (mbps * 1e6 / 8.0) / streams
+
     trials = []
-    # Phase 1: one unpaced probe to find the ceiling and size the ramp steps.
-    probe = _measure(0.0)
+    # Phase 1: a PACED probe at the configured start rate (default 250 Mbps
+    # aggregate) instead of an unpaced line-rate burst. The old unpaced probe
+    # could momentarily send multi-Gbps, which looks like a UDP flood/DDoS and
+    # gets dropped or rate-limited by network security devices.
+    start_ps = _ps_for_aggregate(constants.UDP_TUNE_START_MBPS)
+    probe = _measure(start_ps)
     probe["phase"] = "probe"
-    text_log.append(f"[tune] probe (unpaced): offered={probe['offered_mbps']:.0f} Mbps "
+    text_log.append(f"[tune] probe (paced {constants.UDP_TUNE_START_MBPS:.0f} Mbps): "
+                    f"offered={probe['offered_mbps']:.0f} Mbps "
                     f"goodput={probe['goodput_mbps']:.0f} Mbps loss={probe['loss_pct']:.2f}%")
-    ceiling_ps = (probe["offered_mbps"] * 1e6 / 8) / streams
+
+    step_ps = _ps_for_aggregate(constants.UDP_TUNE_STEP_MBPS)
+    min_step = _ps_for_aggregate(constants.UDP_TUNE_MIN_STEP_MBPS)
 
     best = None
     if probe["loss_pct"] <= target:
-        # Unpaced already meets the target -- nothing to tune down to.
+        # Start rate is within the loss target -- keep it and try to climb.
         best = dict(probe)
+        rate_ps = start_ps + step_ps
     else:
-        step_ps = ceiling_ps * constants.UDP_TUNE_ADDITIVE_FRACTION
-        rate_ps = ceiling_ps * constants.UDP_TUNE_START_FRACTION
-        min_step = ceiling_ps * constants.UDP_TUNE_MIN_STEP_FRACTION
-        while (not stop_requested.is_set()
-               and time.time() + constants.UDP_TUNE_SETTLE_SEC + constants.UDP_TUNE_TRIAL_SEC <= deadline
-               and step_ps >= min_step and rate_ps > 0):
-            trial = _measure(rate_ps)
-            trials.append(trial)
-            text_log.append(f"[tune] target={trial['target_mbps']:.0f} Mbps -> "
-                            f"goodput={trial['goodput_mbps']:.0f} Mbps loss={trial['loss_pct']:.2f}%")
-            if trial["loss_pct"] <= target:
-                if best is None or trial["target_mbps"] > best.get("target_mbps", 0):
-                    best = dict(trial)
-                rate_ps += step_ps                                    # additive increase
-            else:
-                rate_ps = max(step_ps, rate_ps * constants.UDP_TUNE_BACKOFF_FACTOR)  # mult. decrease
-                step_ps *= 0.5                                        # refine granularity
+        # Start rate already breaches the loss target -- back off below it.
+        rate_ps = max(min_step, start_ps * constants.UDP_TUNE_BACKOFF_FACTOR)
+        step_ps *= 0.5
 
-    # Leave the senders at the best sustainable rate (or unpaced if the probe
-    # already met the target / nothing was feasible).
+    # Phase 2: AIMD around the start rate -- additive increase while loss stays
+    # under target, multiplicative decrease + finer steps on a breach.
+    while (not stop_requested.is_set()
+           and time.time() + constants.UDP_TUNE_SETTLE_SEC + constants.UDP_TUNE_TRIAL_SEC <= deadline
+           and step_ps >= min_step and rate_ps > 0):
+        trial = _measure(rate_ps)
+        trials.append(trial)
+        text_log.append(f"[tune] target={trial['target_mbps']:.0f} Mbps -> "
+                        f"goodput={trial['goodput_mbps']:.0f} Mbps loss={trial['loss_pct']:.2f}%")
+        if trial["loss_pct"] <= target:
+            if best is None or trial["target_mbps"] > best.get("target_mbps", 0):
+                best = dict(trial)
+            rate_ps += step_ps                                    # additive increase
+        else:
+            rate_ps = max(step_ps, rate_ps * constants.UDP_TUNE_BACKOFF_FACTOR)  # mult. decrease
+            step_ps *= 0.5                                        # refine granularity
+
+    # Leave the senders at the best sustainable paced rate (or unpaced only if
+    # nothing was measurable).
     if best is not None and best.get("target_mbps"):
         apply_rate(best["target_mbps"] * 1e6 / 8 / streams)
     else:
