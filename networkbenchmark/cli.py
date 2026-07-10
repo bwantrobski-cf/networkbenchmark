@@ -270,6 +270,8 @@ def _print_throughput_summary(summary):
     print("\n=== Throughput Test Summary ===")
     print(f"  path MTU: {summary.get('path_mtu')} bytes  "
           f"source={summary.get('pmtud', {}).get('path_mtu_source', 'unknown')}")
+    print(f"  packet sizing: TCP MSS={summary.get('tcp_mss_bytes')} bytes  "
+          f"UDP datagram={summary.get('udp_datagram_bytes')} bytes")
     print(f"  send: {summary['send_mbps']:.2f} Mbps   recv: {summary['recv_mbps']:.2f} Mbps")
     print(f"  send: {summary.get('send_pps', 0):.1f} pps   recv: {summary.get('recv_pps', 0):.1f} pps")
     if summary.get("loss_pct") is not None:
@@ -358,6 +360,8 @@ def _print_fullbench_summary(manifest):
     print(f"  benchmark_id: {manifest['benchmark_id']}")
     pmtud = manifest.get("pmtud") or {}
     print(f"  path MTU: {pmtud.get('path_mtu')} bytes  source={pmtud.get('path_mtu_source', 'unknown')}")
+    print(f"  packet sizing: TCP MSS={pmtud.get('tcp_mss_bytes')} bytes  "
+          f"UDP datagram={pmtud.get('udp_datagram_bytes')} bytes")
     print(f"  completed: {manifest['completed']}/{manifest['test_count']}")
     header = (f"  {'transport':<9} {'dir':<5} {'streams':>7} {'procs':>5} {'send Mbps':>11} "
               f"{'recv Mbps':>11} {'send pps':>11} {'recv pps':>11} {'loss %':>8}")

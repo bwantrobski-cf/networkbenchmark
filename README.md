@@ -149,6 +149,29 @@ packets/sec is estimated from throughput assuming a standard 1448-byte MSS.
 Live rates are averaged over a short trailing window so the reading stays
 steady rather than flickering as stats arrive.
 
+### PMTUD sizing for TCP and UDP
+
+Throughput and `fullbench` run Path MTU Discovery before the throughput tests.
+The resulting `path_mtu` is one shared network-path value used for both TCP and
+UDP; the tool does not use separate PMTUD values for the two transports.
+
+The packet sizing is then derived differently because TCP and UDP have different
+headers:
+
+- **TCP:** the path MTU is reduced by 40 bytes for the IPv4 and TCP headers to
+  calculate the TCP MSS. A 1500-byte path MTU therefore produces a 1460-byte
+  MSS, and the TCP socket is configured with that MSS when supported.
+- **UDP:** the path MTU is reduced by 28 bytes for the IPv4 and UDP headers to
+  calculate the maximum benchmark datagram size. A 1500-byte path MTU therefore
+  produces a 1472-byte UDP datagram target, including the benchmark's internal
+  framing within that datagram.
+
+For example, with `path_mtu=1500`, both transports use the same 1500-byte path
+limit, but TCP uses a 1460-byte MSS while UDP targets 1472-byte datagrams. The
+selected `path_mtu`, derived TCP MSS, and derived UDP datagram size are written
+to the throughput log for verification. If PMTUD is unavailable but ICMP
+reachability succeeds, the conservative fallback MTU is used for both.
+
 ### Scaling with multiple CPU cores (`--procs`)
 
 At very high packet rates a single Python process becomes CPU-bound (the GIL
@@ -250,10 +273,10 @@ python NetBench.py fullbench --server-ip 10.0.0.5 --transports udp --directions 
 - Every test is saved individually to `logs/` (JSON + text), and a combined
   `fullbench` manifest is written summarizing the whole run.
 - Throughput and fullbench tests run PMTUD before sending traffic, use the
-  discovered path MTU for TCP/UDP sizing, and record `path_mtu` in local
-  results and exported fullbench payloads. If PMTUD discovery is blocked but
-  ICMP reachability succeeds, the test continues with the conservative fallback
-  MTU.
+  discovered path MTU for TCP/UDP sizing, and record `path_mtu`,
+  `tcp_mss_bytes`, and `udp_datagram_bytes` in local results and exported
+  fullbench payloads. If PMTUD discovery is blocked but ICMP reachability
+  succeeds, the test continues with the conservative fallback MTU.
 - `--export-url` POSTs each test's JSON result as it completes. Use
   `--export-method` (`POST`/`PUT`), repeatable `--export-header "Key: Value"`
   for auth, and `--export-slim` to drop the bulky `interval_series` /

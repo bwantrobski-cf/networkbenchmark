@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from ..common import addr, constants, logging_store
 from ..diagnostics import connectivity
 from ..diagnostics.pmtud import PmtudError, run_pmtud
+from ..transport import stream_worker
 from .engine import ThroughputClientConfig, run_throughput_test
 
 
@@ -234,21 +235,26 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         else:
             pmtud_result["path_mtu_source"] = "unavailable"
 
+    path_mtu = pmtud_result.get("path_mtu")
+    tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(path_mtu)
+    udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(path_mtu)
     pmtud_text_lines = [
         f"PMTUD to {pmtud_server_ip}:{pmtud_udp_port}",
         f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
-        f"path_mtu={pmtud_result.get('path_mtu')} payload={pmtud_result.get('path_mtu_payload_bytes')}",
+        f"path_mtu={path_mtu} payload={pmtud_result.get('path_mtu_payload_bytes')}",
         f"path_mtu_source={pmtud_result.get('path_mtu_source', 'pmtud')} fallback_used={pmtud_fallback_used}",
+        f"tcp_mss_bytes={tcp_mss_bytes} udp_datagram_bytes={udp_datagram_bytes}",
         str(pmtud_result),
     ]
     pmtud_json_path, pmtud_log_path = logging_store.save_result(
         constants.TEST_TYPE_PMTUD, pmtud_result, pmtud_text_lines, base_dir=log_base_dir)
-    path_mtu = pmtud_result.get("path_mtu")
     pmtud_info = {
         "server_ip": pmtud_server_ip,
         "udp_port": pmtud_udp_port,
         "success": bool(pmtud_result.get("success")),
         "path_mtu": path_mtu,
+        "tcp_mss_bytes": tcp_mss_bytes,
+        "udp_datagram_bytes": udp_datagram_bytes,
         "path_mtu_source": pmtud_result.get("path_mtu_source", "pmtud"),
         "fallback_used": pmtud_fallback_used,
         "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
@@ -315,6 +321,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "procs": spec["procs"],
             "tuned": spec["tune"],
             "path_mtu": path_mtu,
+            "tcp_mss_bytes": tcp_mss_bytes,
+            "udp_datagram_bytes": udp_datagram_bytes,
             "pmtud": pmtud_info,
         }
 
@@ -330,10 +338,14 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             record["send_pps"] = summary.get("send_pps")
             record["recv_pps"] = summary.get("recv_pps")
             record["loss_pct"] = summary.get("loss_pct")
+            record["path_mtu"] = summary.get("path_mtu")
+            record["tcp_mss_bytes"] = summary.get("tcp_mss_bytes")
+            record["udp_datagram_bytes"] = summary.get("udp_datagram_bytes")
             record["log_json"] = summary.get("log_json")
             log(f"[{idx}/{total}] {label}: send={summary.get('send_mbps', 0):.1f} Mbps "
                 f"recv={summary.get('recv_mbps', 0):.1f} Mbps "
-                f"loss={summary.get('loss_pct')}")
+                f"loss={summary.get('loss_pct')} mtu={summary.get('path_mtu')} "
+                f"tcp_mss={summary.get('tcp_mss_bytes')} udp_datagram={summary.get('udp_datagram_bytes')}")
         except Exception as exc:  # noqa: BLE001 -- one test failing must not kill the run
             record["ok"] = False
             record["error"] = str(exc)
@@ -389,13 +401,16 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     text_lines = [
         f"fullbench {benchmark_id} -> {cfg.server_ip}",
         f"PMTUD path MTU: {path_mtu} bytes",
+        f"Packet sizing: TCP MSS={tcp_mss_bytes} bytes  UDP datagram={udp_datagram_bytes} bytes",
         f"PMTUD local log: {pmtud_json_path}",
         "",
     ]
     for t in tests:
         if t["ok"]:
             text_lines.append(f"{t['label']}: send={t.get('send_mbps')} Mbps "
-                              f"recv={t.get('recv_mbps')} Mbps loss={t.get('loss_pct')}")
+                              f"recv={t.get('recv_mbps')} Mbps loss={t.get('loss_pct')} "
+                              f"mtu={t.get('path_mtu')} tcp_mss={t.get('tcp_mss_bytes')} "
+                              f"udp_datagram={t.get('udp_datagram_bytes')}")
         else:
             text_lines.append(f"{t['label']}: FAILED: {t.get('error')}")
     json_path, log_path = logging_store.save_result(

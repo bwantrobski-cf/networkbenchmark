@@ -798,6 +798,9 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
                     else ((totals["bytes_received"] / duration) if duration else 0))
     bloat = metrics.compute_bufferbloat(receiver_bps, unloaded_rtt_ms, loaded_stats.get("avg"))
 
+    tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu)
+    udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu)
+
     summary = {
         "run_id": run_id,
         "server": cfg.server_host,
@@ -807,6 +810,8 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
         "procs": cfg.procs,
         "duration_sec": cfg.duration_sec,
         "path_mtu": cfg.path_mtu,
+        "tcp_mss_bytes": tcp_mss_bytes,
+        "udp_datagram_bytes": udp_datagram_bytes,
         "pmtud": cfg.pmtud_info,
         "source_ports": source_ports,
         "totals": totals,
@@ -827,6 +832,7 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
     text_log.append("")
     text_log.append(f"Path MTU: {cfg.path_mtu} bytes")
     text_log.append(f"PMTUD source: {(cfg.pmtud_info or {}).get('path_mtu_source', 'unknown')}")
+    text_log.append(f"Packet sizing: TCP MSS={tcp_mss_bytes} bytes  UDP datagram={udp_datagram_bytes} bytes")
     text_log.append(f"Aggregate throughput: send={send_mbps:.2f} Mbps  recv={recv_mbps:.2f} Mbps")
     text_log.append(f"Packets/sec: send={send_pps:.1f} pps  recv={recv_pps:.1f} pps")
     if loss_pct is not None:
