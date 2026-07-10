@@ -44,36 +44,32 @@ pip install -e .
 
 ## Running
 
-There are three equivalent ways to launch the tool:
+The examples below show both supported command forms:
 
 ```bash
-# 1. Directly-runnable launcher script (no install / activation required,
-#    just the dependencies) -- takes the same arguments as everything below:
-python NetBench.py webui
+# Installed console script (after `pip install -e .`, usually with .venv active)
+networkbenchmark <command> [options]
 
-# 2. As a module (requires the package to be importable, e.g. after install):
-python -m networkbenchmark webui
+# Direct launcher from this project folder (requires dependencies in `python`)
+python NetBench.py <command> [options]
 
-# 3. The installed console script (created by `pip install -e .`):
-networkbenchmark webui
+# A third equivalent form is also available after installation:
+python -m networkbenchmark <command> [options]
 ```
 
-> Note: you cannot run the package's internal files directly
-> (e.g. `python networkbenchmark/cli.py`) -- they use package-relative
-> imports and will raise `attempted relative import with no known parent
-> package`. Use `NetBench.py`, `-m networkbenchmark`, or the console script.
+Use the same subcommand and options with either `networkbenchmark` or
+`python NetBench.py`. The direct launcher does not require package activation,
+but its Python interpreter must have the dependencies installed.
 
-**Install dependencies first, into the interpreter you launch with.** The
-dependencies (`streamlit`, `pandas`, `ipwhois`) must be installed for the
-*same* Python you run. If you use the virtualenv, activate it (or call
-`.venv/bin/python NetBench.py ...`) so `python`/`python3` resolves to the
-venv. Running `python3 NetBench.py webui` against your *system* Python will
-fail with a "streamlit not found" style error until you either activate the
-venv or `pip install -r requirements.txt` for that interpreter. The `webui`
-command now checks this up front and prints the exact install command.
+> Note: do not run package internals directly (for example,
+> `python networkbenchmark/cli.py`). They use package-relative imports and will
+> raise `attempted relative import with no known parent package`.
 
-All usage examples below use the `networkbenchmark` console script, but you
-can substitute `python NetBench.py` for any of them.
+**Install dependencies into the interpreter you launch with.** The
+dependencies (`streamlit`, `pandas`, `ipwhois`) must be installed for the same
+Python. With the virtualenv, activate it or use `.venv/bin/python NetBench.py`
+explicitly. The `webui` command checks dependencies and reports the exact
+install command if they are missing.
 
 ## Raw sockets / privileges
 
@@ -101,21 +97,49 @@ sudo "$(which networkbenchmark)" webui           # with the venv activated
 
 ### Server
 
+Start the server on the host that will receive throughput connections. The
+installed console script and the direct launcher accept identical options.
+
 ```bash
+# Installed command
 networkbenchmark server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
+
+# Direct launcher
+python NetBench.py server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
+
+# Custom ports and a dedicated log directory
+networkbenchmark server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
+    --control-port 22000 --log-dir ./server-logs
+python NetBench.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
+    --control-port 22000 --log-dir ./server-logs
 ```
 
 ### Client: throughput test
 
 ```bash
-# Upload, TCP, single stream, 10s
-networkbenchmark throughput --server-ip 10.0.0.5 --time 10
+# TCP upload, one stream, 10 seconds
+networkbenchmark throughput --server-ip 10.0.0.5 --tcp --time 10
+python NetBench.py throughput --server-ip 10.0.0.5 --tcp --time 10
 
-# Download, UDP, 4 parallel streams, 30s
-networkbenchmark throughput --server-ip 10.0.0.5 --udp -R -P 4 --time 30
+# UDP download, four parallel streams, 30 seconds
+networkbenchmark throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
+python NetBench.py throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
 
-# High-rate UDP upload: 8 streams spread across 8 worker processes (multi-core)
+# High-rate UDP upload using eight streams across eight worker processes
 networkbenchmark throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
+python NetBench.py throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
+
+# UDP loss-target tuning: find the highest rate at or below 1% loss
+networkbenchmark throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+    --acceptable-loss 1.0 --max-duration 30
+python NetBench.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+    --acceptable-loss 1.0 --max-duration 30
+
+# Use non-default server ports and save local logs elsewhere
+networkbenchmark throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
+    --control-port 22000 --log-dir ./client-logs --time 20
+python NetBench.py throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
+    --control-port 22000 --log-dir ./client-logs --time 20
 ```
 
 Every run reports both bitrate (Mbps) and **packets/sec** (send and recv),
@@ -158,6 +182,8 @@ highest UDP rate that stays under it:
 # Find the max UDP upload rate with <= 1% loss, searching for up to 30s
 networkbenchmark throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
+python NetBench.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+    --acceptable-loss 1.0 --max-duration 30
 ```
 
 - `--acceptable-loss PCT` turns on the search (UDP only). `--time` / `--max-duration`
@@ -191,6 +217,25 @@ networkbenchmark fullbench --server-ip 10.0.0.5 \
     --acceptable-loss 1.0 --udp-max-duration 30 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
+python NetBench.py fullbench --server-ip 10.0.0.5 \
+    --streams 1,8,16,32 --procs 1,4,8,8 \
+    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --export-url https://viz.example.com/ingest \
+    --export-header "Authorization: Bearer $TOKEN" --export-slim
+
+# Preview a small matrix without connecting to the server.
+networkbenchmark fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
+    --streams 1,4 --procs 1,2 --time 15 --dry-run
+python NetBench.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
+    --streams 1,4 --procs 1,2 --time 15 --dry-run
+
+# Run only UDP downloads and write the combined manifest to a custom log folder.
+networkbenchmark fullbench --server-ip 10.0.0.5 --transports udp --directions down \
+    --streams 4,8 --procs 4,8 --acceptable-loss 0.5 --udp-max-duration 45 \
+    --log-dir ./fullbench-logs
+python NetBench.py fullbench --server-ip 10.0.0.5 --transports udp --directions down \
+    --streams 4,8 --procs 4,8 --acceptable-loss 0.5 --udp-max-duration 45 \
+    --log-dir ./fullbench-logs
 ```
 
 - `--streams` is a comma-separated list of stream counts (e.g. `1,8,16,32`).
@@ -204,6 +249,11 @@ networkbenchmark fullbench --server-ip 10.0.0.5 \
   `--udp-max-duration` as each search's budget; TCP tests still use `--time`.
 - Every test is saved individually to `logs/` (JSON + text), and a combined
   `fullbench` manifest is written summarizing the whole run.
+- Throughput and fullbench tests run PMTUD before sending traffic, use the
+  discovered path MTU for TCP/UDP sizing, and record `path_mtu` in local
+  results and exported fullbench payloads. If PMTUD discovery is blocked but
+  ICMP reachability succeeds, the test continues with the conservative fallback
+  MTU.
 - `--export-url` POSTs each test's JSON result as it completes. Use
   `--export-method` (`POST`/`PUT`), repeatable `--export-header "Key: Value"`
   for auth, and `--export-slim` to drop the bulky `interval_series` /
@@ -220,6 +270,25 @@ networkbenchmark fullbench --server-ip 10.0.0.5 --streams 1,8,16,32 \
     --run-id 137 --vm-name web-01 --cloud aws --environment prod \
     --export-url https://viz.example.com/networkbenchmark-results \
     --export-header "Authorization: Bearer $TOKEN"
+
+python NetBench.py fullbench --server-ip 10.0.0.5 --streams 1,8,16,32 \
+    --run-id 137 --vm-name web-01 --cloud aws --environment prod \
+    --export-url https://viz.example.com/networkbenchmark-results \
+    --export-header "Authorization: Bearer $TOKEN"
+
+# Add a label and use PUT with multiple headers for an idempotent ingestion job.
+networkbenchmark fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
+    --streams 8 --label nightly-mk3 --run-id 138 --vm-name web-02 \
+    --cloud gcp --environment staging --tool-version 2 --test-type nightly \
+    --export-url https://viz.example.com/networkbenchmark-results \
+    --export-method PUT --export-header "Authorization: Bearer $TOKEN" \
+    --export-header "X-Job: nightly-mk3"
+python NetBench.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
+    --streams 8 --label nightly-mk3 --run-id 138 --vm-name web-02 \
+    --cloud gcp --environment staging --tool-version 2 --test-type nightly \
+    --export-url https://viz.example.com/networkbenchmark-results \
+    --export-method PUT --export-header "Authorization: Bearer $TOKEN" \
+    --export-header "X-Job: nightly-mk3"
 ```
 
 - `--run-id` is an integer set by your orchestration (e.g. from the results-API
@@ -241,22 +310,62 @@ rate-vs-loss series and best sustainable rate). Ingestion endpoints should read
 
 ### Diagnostics
 
+Every diagnostic has both an installed-command form and a direct-launcher form.
+
 ```bash
-networkbenchmark mtr 8.8.8.8 --protocol icmp --interval-ms 200
-networkbenchmark mtr example.com --protocol tcp --port 443
+# MTR using ICMP, with a 200 ms interval and 20 rounds
+networkbenchmark mtr 8.8.8.8 --protocol icmp --interval-ms 200 --count 20
+python NetBench.py mtr 8.8.8.8 --protocol icmp --interval-ms 200 --count 20
+
+# MTR using TCP to an HTTPS service
+networkbenchmark mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
+python NetBench.py mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
+
+# Check ICMP, UDP, and TCP reachability against the throughput server
 networkbenchmark connectivity --server-ip 10.0.0.5
+python NetBench.py connectivity --server-ip 10.0.0.5
+
+# Use custom diagnostic ports and save the result logs
+networkbenchmark connectivity --server-ip 10.0.0.5 --udp-port 20000 \
+    --tcp-port 21000 --timeout 5 --log-dir ./diagnostic-logs
+python NetBench.py connectivity --server-ip 10.0.0.5 --udp-port 20000 \
+    --tcp-port 21000 --timeout 5 --log-dir ./diagnostic-logs
+
+# Discover the largest path MTU using DF-marked probes
 networkbenchmark pmtud --server-ip 10.0.0.5
+python NetBench.py pmtud --server-ip 10.0.0.5
+
+# Narrow the PMTUD search and use the server's configured UDP port
+networkbenchmark pmtud --server-ip 10.0.0.5 --udp-port 20000 \
+    --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
+python NetBench.py pmtud --server-ip 10.0.0.5 --udp-port 20000 \
+    --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
+
+# Run the UDP/TCP/ICMP/ESP/NAT-T/GRE reachability matrix
 networkbenchmark protocols --server-ip 10.0.0.5
+python NetBench.py protocols --server-ip 10.0.0.5
+
+# Use custom ports and a longer timeout for protocol checks
+networkbenchmark protocols --server-ip 10.0.0.5 --udp-port 20000 \
+    --tcp-port 21000 --timeout 5 --log-dir ./protocol-logs
+python NetBench.py protocols --server-ip 10.0.0.5 --udp-port 20000 \
+    --tcp-port 21000 --timeout 5 --log-dir ./protocol-logs
 ```
 
 ### Web UI
 
 ```bash
+# Launch on Streamlit's default port
 networkbenchmark webui
+python NetBench.py webui
+
+# Launch on a custom port
+networkbenchmark webui --port 8502
+python NetBench.py webui --port 8502
 ```
 
 The web UI always acts as the **client**, testing against a server started
-separately via `networkbenchmark server`. It has a persistent Server IP
+separately via `networkbenchmark server` or `python NetBench.py server`. It has a persistent Server IP
 field (top of page) plus a "Check Connectivity" button, a default
 **NetworkBenchmark** tab for throughput tests, a **Diagnostics** tab
 (MTR / PMTUD / Protocol Checks), and a **Settings** tab for the UDP/TCP/
