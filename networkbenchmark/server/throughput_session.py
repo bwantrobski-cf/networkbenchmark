@@ -66,6 +66,8 @@ class ThroughputSession:
             self.rate_value = stream_worker.RateHolder(0.0)
 
     def attach_stream(self, index: int, sock, addr=None, spawn_receiver: bool = True):
+        if self.params["transport"] == "tcp":
+            stream_worker.configure_tcp_socket(sock, self.params.get("path_mtu"))
         self.stream_sockets[index] = sock
         if addr is not None:
             self.stream_addrs[index] = addr
@@ -152,7 +154,8 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
 
 
 def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec,
-                        shared, start_flag, stop_flag, ready_q, rate_value=None):
+                        shared, start_flag, stop_flag, ready_q, rate_value=None,
+                        path_mtu=None):
     """Worker process handling a subset of streams (indices >= 1).
 
     Runs in phases so the main process never races the client:
@@ -202,6 +205,7 @@ def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec
                 ready_q.put(("error", i, "bad preamble"))
                 conn.close()
                 continue
+            stream_worker.configure_tcp_socket(conn, path_mtu)
             socks[i] = (conn, None)
             ready_q.put(("ready", i, addr))
         else:
@@ -222,7 +226,8 @@ def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec
     stream_worker.run_stream_group(socks, role, transport, views, duration_sec,
                                     wait_start=lambda: bool(start_flag.value),
                                     stopped=lambda: bool(stop_flag.value),
-                                    rate_value=rate_value)
+                                    rate_value=rate_value,
+                                    path_mtu=path_mtu)
     for sock, _dest in socks.values():
         try:
             sock.close()
@@ -236,6 +241,7 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
     transport = params["transport"]
     role = "recv" if params["direction"] == "up" else "send"
     duration_sec = params.get("duration_sec")
+    path_mtu = params.get("path_mtu")
     idxs = session.worker_indices
     nproc = max(1, min(int(params.get("procs", 1)), len(idxs)))
     groups = [[] for _ in range(nproc)]
@@ -248,7 +254,7 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
             target=_server_worker_proc,
             args=(group, session.run_id, role, transport, ctx.config.bind, duration_sec,
                   session.shared, session.start_flag, session.stop_flag, session.worker_ready_q,
-                  session.rate_value),
+                  session.rate_value, path_mtu),
             daemon=True)
         p.start()
         session.worker_procs.append(p)
@@ -311,12 +317,14 @@ def _start_sender_threads(ctx, session: ThroughputSession):
         session.stream_stop_events[i] = stop_ev
         if transport == "tcp":
             th = threading.Thread(target=stream_worker.tcp_sender_loop,
-                                   args=(sock, session.counters[i], stop_ev, duration_sec, start_time),
+                                   args=(sock, session.counters[i], stop_ev, duration_sec, start_time,
+                                         session.params.get("path_mtu")),
                                    daemon=True)
         else:
             th = threading.Thread(target=stream_worker.udp_sender_loop,
                                    args=(sock, addr, i, session.counters[i], stop_ev, duration_sec, start_time),
-                                   kwargs={"rate_value": session.rate_value}, daemon=True)
+                                   kwargs={"rate_value": session.rate_value,
+                                           "path_mtu": session.params.get("path_mtu")}, daemon=True)
         th.start()
         session.threads.append(th)
 

@@ -21,7 +21,7 @@ class ThroughputClientConfig:
                  streams=1, duration_sec=constants.DEFAULT_TEST_DURATION_SEC,
                  start_port=None, bind="0.0.0.0", calibration_sec=constants.CALIBRATION_TIME_SEC,
                  probe_interval_sec=constants.PROBE_INTERVAL_SEC, procs=1,
-                 acceptable_loss_pct=None, max_duration_sec=None):
+                 acceptable_loss_pct=None, max_duration_sec=None, path_mtu=None):
         self.server_host = server_ip
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transport = transport
@@ -43,6 +43,7 @@ class ThroughputClientConfig:
                                     if acceptable_loss_pct is not None else None)
         self.max_duration_sec = (float(max_duration_sec) if max_duration_sec is not None
                                  else constants.DEFAULT_MAX_DURATION_SEC)
+        self.path_mtu = path_mtu
 
     @property
     def tune_udp(self) -> bool:
@@ -115,6 +116,7 @@ def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
         if cfg.transport == "tcp":
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.bind((cfg.bind, 0))
+            stream_worker.configure_tcp_socket(sock, cfg.path_mtu)
             sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
             sock.connect((cfg.server_host, port))
             sock.sendall(stream_worker.build_preamble(run_id, i))
@@ -212,6 +214,7 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
             if conn["transport"] == "tcp":
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.bind((conn["bind"], 0))
+                stream_worker.configure_tcp_socket(s, conn.get("path_mtu"))
                 s.settimeout(constants.SOCKET_TIMEOUT_SEC)
                 s.connect((conn["server_ip"], port))
                 s.sendall(stream_worker.build_preamble(run_id, i))
@@ -239,7 +242,8 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
                                     wait_start=lambda: bool(start_flag.value),
                                     stopped=lambda: bool(stop_flag.value),
                                     rate_value=rate_value,
-                                    on_wait_tick=on_wait_tick)
+                                    on_wait_tick=on_wait_tick,
+                                    path_mtu=conn.get("path_mtu"))
 
     for s, _dest in socks.values():
         try:
@@ -261,7 +265,7 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
 
     role = "send" if cfg.direction == "up" else "recv"
     conn = {"server_ip": server_ip, "bind": cfg.bind, "transport": cfg.transport,
-            "duration_sec": cfg.sender_duration_sec}
+            "duration_sec": cfg.sender_duration_sec, "path_mtu": cfg.path_mtu}
     start_flag = mp_ctx.Value("b", 0, lock=False)
     stop_flag = mp_ctx.Value("b", 0, lock=False)
     # Per-stream target send rate in bytes/sec (0 = unpaced); driven by the UDP
@@ -462,6 +466,7 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         # the whole budget when tuning; the controller stops them early.
         "duration_sec": cfg.sender_duration_sec,
         "procs": cfg.procs,
+        "path_mtu": cfg.path_mtu,
     }
 
     _dur_desc = (f"max_duration={cfg.max_duration_sec}s acceptable_loss={cfg.acceptable_loss_pct}%"
@@ -469,6 +474,10 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
     text_log = [f"NetworkBenchmark throughput test  run_id={run_id}",
                 f"server={server_ip}:{cfg.control_port}  transport={cfg.transport} "
                 f"direction={cfg.direction} streams={cfg.streams} {_dur_desc}"]
+    if cfg.path_mtu is not None:
+        text_log.append(f"Path MTU: {cfg.path_mtu} bytes  TCP MSS: "
+                        f"{stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu)} bytes  "
+                        f"UDP datagram: {stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu)} bytes")
 
     try:
         control.send("hello", run_id=run_id, params=params)
@@ -560,13 +569,14 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
                 stream_stop_events[i] = stop_ev
                 if cfg.transport == "tcp":
                     th = threading.Thread(target=stream_worker.tcp_sender_loop,
-                                           args=(sock, counters[i], stop_ev, cfg.sender_duration_sec, start_time),
+                                           args=(sock, counters[i], stop_ev, cfg.sender_duration_sec, start_time,
+                                                 cfg.path_mtu),
                                            daemon=True)
                 else:
                     th = threading.Thread(target=stream_worker.udp_sender_loop,
                                            args=(sock, dest, i, counters[i], stop_ev,
                                                  cfg.sender_duration_sec, start_time),
-                                           kwargs={"rate_value": client_rate_value}, daemon=True)
+                                           kwargs={"rate_value": client_rate_value, "path_mtu": cfg.path_mtu}, daemon=True)
                 th.start()
                 stream_threads.append(th)
         else:

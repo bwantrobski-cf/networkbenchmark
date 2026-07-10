@@ -62,14 +62,52 @@ def _padding(size: int) -> bytes:
     return secrets.token_bytes(size)
 
 
+def udp_packet_size_for_path_mtu(path_mtu):
+    if path_mtu is None:
+        return constants.UDP_PAYLOAD_SIZE
+    try:
+        mtu = int(path_mtu)
+    except (TypeError, ValueError):
+        return constants.UDP_PAYLOAD_SIZE
+    return max(UDP_HEADER_SIZE, mtu - 28)
+
+
+def tcp_mss_for_path_mtu(path_mtu):
+    if path_mtu is None:
+        return None
+    try:
+        mtu = int(path_mtu)
+    except (TypeError, ValueError):
+        return None
+    return max(64, mtu - 40)
+
+
+def tcp_write_size_for_path_mtu(path_mtu):
+    mss = tcp_mss_for_path_mtu(path_mtu)
+    if mss is None:
+        return constants.TCP_CHUNK_SIZE
+    return min(constants.TCP_CHUNK_SIZE, max(mss, mss * 32))
+
+
+def configure_tcp_socket(sock: socket.socket, path_mtu=None):
+    mss = tcp_mss_for_path_mtu(path_mtu)
+    option = getattr(socket, "TCP_MAXSEG", None)
+    if mss is None or option is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, option, mss)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # TCP
 # ---------------------------------------------------------------------------
 
 def tcp_sender_loop(sock: socket.socket, counters, stop_event: threading.Event,
-                     duration_sec: float, start_time: float):
+                     duration_sec: float, start_time: float, path_mtu=None):
     """Send as fast as possible until stop_event is set or duration elapses."""
-    chunk = _padding(constants.TCP_CHUNK_SIZE)
+    chunk = _padding(tcp_write_size_for_path_mtu(path_mtu))
     sock.settimeout(1.0)
     try:
         while not stop_event.is_set():
@@ -133,14 +171,15 @@ class RateHolder:
 
 def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
                      stop_event: threading.Event, duration_sec: float, start_time: float,
-                     rate_value=None):
+                     rate_value=None, path_mtu=None):
     """Send UDP datagrams until stopped or ``duration_sec`` elapses.
 
     If ``rate_value`` is provided and its ``.value`` is > 0, sends are paced to
     that many bytes/sec via a token bucket (used by the loss-target tuning
     ramp). A value of 0 means unpaced (send as fast as possible)."""
     seq = 0
-    payload = _padding(max(0, constants.UDP_PAYLOAD_SIZE - UDP_HEADER_SIZE))
+    udp_packet_size = udp_packet_size_for_path_mtu(path_mtu)
+    payload = _padding(max(0, udp_packet_size - UDP_HEADER_SIZE))
     packet_size = UDP_HEADER_SIZE + len(payload)
     sock.settimeout(1.0)
     tokens = 0.0
@@ -240,7 +279,7 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
 
 def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict,
                       duration_sec: float, wait_start=None, stopped=None, rate_value=None,
-                      on_wait_tick=None):
+                      on_wait_tick=None, path_mtu=None):
     """Run the sender/receiver loops for a group of streams as threads within
     the current (possibly worker) process.
 
@@ -280,12 +319,12 @@ def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict
         if role == "send":
             if transport == "tcp":
                 th = threading.Thread(target=tcp_sender_loop,
-                                       args=(sock, view, stop_ev, duration_sec, start_time),
+                                       args=(sock, view, stop_ev, duration_sec, start_time, path_mtu),
                                        daemon=True)
             else:
                 th = threading.Thread(target=udp_sender_loop,
                                        args=(sock, dest, i, view, stop_ev, duration_sec, start_time),
-                                       kwargs={"rate_value": rate_value}, daemon=True)
+                                       kwargs={"rate_value": rate_value, "path_mtu": path_mtu}, daemon=True)
         else:
             if transport == "tcp":
                 th = threading.Thread(target=tcp_receiver_loop,

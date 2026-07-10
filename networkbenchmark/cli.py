@@ -338,8 +338,12 @@ def cmd_fullbench(args):
     signal.signal(signal.SIGINT, handle_sigint)
 
     print()
-    manifest = fullbench_mod.run_fullbench(cfg, on_progress=lambda m: print(m, flush=True),
-                                           stop_requested=stop_requested, log_base_dir=args.log_dir)
+    try:
+        manifest = fullbench_mod.run_fullbench(cfg, on_progress=lambda m: print(m, flush=True),
+                                               stop_requested=stop_requested, log_base_dir=args.log_dir)
+    except PmtudError as exc:
+        print(f"ERROR: fullbench PMTUD failed: {exc}")
+        sys.exit(1)
     _print_fullbench_summary(manifest)
 
 
