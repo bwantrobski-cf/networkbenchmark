@@ -12,6 +12,8 @@ import time
 import uuid
 
 from ..common import addr, constants, logging_store, tcp_info
+from ..diagnostics import connectivity
+from ..diagnostics.pmtud import PmtudError, run_pmtud
 from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
 from ..transport.control_connection import ControlChannel
 
@@ -21,7 +23,8 @@ class ThroughputClientConfig:
                  streams=1, duration_sec=constants.DEFAULT_TEST_DURATION_SEC,
                  start_port=None, bind="0.0.0.0", calibration_sec=constants.CALIBRATION_TIME_SEC,
                  probe_interval_sec=constants.PROBE_INTERVAL_SEC, procs=1,
-                 acceptable_loss_pct=None, max_duration_sec=None, path_mtu=None):
+                 acceptable_loss_pct=None, max_duration_sec=None, path_mtu=None,
+                 pmtud_info=None):
         self.server_host = server_ip
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transport = transport
@@ -44,6 +47,7 @@ class ThroughputClientConfig:
         self.max_duration_sec = (float(max_duration_sec) if max_duration_sec is not None
                                  else constants.DEFAULT_MAX_DURATION_SEC)
         self.path_mtu = path_mtu
+        self.pmtud_info = pmtud_info
 
     @property
     def tune_udp(self) -> bool:
@@ -60,6 +64,63 @@ class ThroughputClientConfig:
 
 class ThroughputError(Exception):
     pass
+
+
+def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir: str = None):
+    pmtud_udp_port = cfg.start_port if cfg.transport == "udp" else constants.DEFAULT_UDP_PORT
+    try:
+        pmtud_result = run_pmtud(server_ip, udp_port=pmtud_udp_port)
+    except (PmtudError, OSError, ValueError) as exc:
+        pmtud_result = {
+            "server_ip": server_ip,
+            "udp_port": pmtud_udp_port,
+            "success": False,
+            "connectivity_confirmed": False,
+            "path_mtu": None,
+            "path_mtu_payload_bytes": None,
+            "reported_next_hop_mtu": None,
+            "trace": [],
+            "error": str(exc),
+        }
+
+    fallback_used = False
+    if not pmtud_result.get("success") or not isinstance(pmtud_result.get("path_mtu"), int):
+        ping_result = connectivity.icmp_ping(server_ip)
+        pmtud_result["icmp_ping"] = ping_result
+        if ping_result.get("success"):
+            fallback_used = True
+            pmtud_result["path_mtu"] = constants.FALLBACK_PATH_MTU
+            pmtud_result["path_mtu_source"] = "icmp_reachability_fallback"
+            pmtud_result["discovery_blocked"] = True
+            pmtud_result["fallback_reason"] = "PMTUD discovery failed but ICMP ping succeeded"
+        else:
+            pmtud_result["path_mtu_source"] = "unavailable"
+
+    text_lines = [
+        f"PMTUD to {server_ip}:{pmtud_udp_port}",
+        f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
+        f"path_mtu={pmtud_result.get('path_mtu')} payload={pmtud_result.get('path_mtu_payload_bytes')}",
+        f"path_mtu_source={pmtud_result.get('path_mtu_source', 'pmtud')} fallback_used={fallback_used}",
+        str(pmtud_result),
+    ]
+    pmtud_json_path, pmtud_log_path = logging_store.save_result(
+        constants.TEST_TYPE_PMTUD, pmtud_result, text_lines, base_dir=log_base_dir)
+    path_mtu = pmtud_result.get("path_mtu")
+    if not isinstance(path_mtu, int):
+        raise ThroughputError(pmtud_result.get("error") or "PMTUD did not determine a path MTU and ping failed")
+
+    return path_mtu, {
+        "server_ip": server_ip,
+        "udp_port": pmtud_udp_port,
+        "success": bool(pmtud_result.get("success")),
+        "path_mtu": path_mtu,
+        "path_mtu_source": pmtud_result.get("path_mtu_source", "pmtud"),
+        "fallback_used": fallback_used,
+        "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
+        "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
+        "log_json": pmtud_json_path,
+        "log_text": pmtud_log_path,
+    }
 
 
 def _client_dispatch_loop(control: ControlChannel, phase: run_mode.RunPhase,
@@ -452,6 +513,17 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
     server_ip = addr.resolve_host(cfg.server_host)
     stop_requested = stop_requested or threading.Event()
 
+    if cfg.path_mtu is None:
+        cfg.path_mtu, cfg.pmtud_info = _discover_path_mtu(cfg, server_ip, log_base_dir)
+    elif cfg.pmtud_info is None:
+        cfg.pmtud_info = {
+            "server_ip": server_ip,
+            "udp_port": (cfg.start_port if cfg.transport == "udp" else constants.DEFAULT_UDP_PORT),
+            "path_mtu": cfg.path_mtu,
+            "path_mtu_source": "provided",
+            "fallback_used": False,
+        }
+
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     control_sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
     control_sock.connect((server_ip, cfg.control_port))
@@ -478,6 +550,9 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         text_log.append(f"Path MTU: {cfg.path_mtu} bytes  TCP MSS: "
                         f"{stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu)} bytes  "
                         f"UDP datagram: {stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu)} bytes")
+    if cfg.pmtud_info:
+        text_log.append(f"PMTUD source: {cfg.pmtud_info.get('path_mtu_source', 'pmtud')}  "
+                        f"log: {cfg.pmtud_info.get('log_json', 'n/a')}")
 
     try:
         control.send("hello", run_id=run_id, params=params)
@@ -731,6 +806,8 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
         "streams": cfg.streams,
         "procs": cfg.procs,
         "duration_sec": cfg.duration_sec,
+        "path_mtu": cfg.path_mtu,
+        "pmtud": cfg.pmtud_info,
         "source_ports": source_ports,
         "totals": totals,
         "send_mbps": send_mbps,
@@ -748,6 +825,8 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
     }
 
     text_log.append("")
+    text_log.append(f"Path MTU: {cfg.path_mtu} bytes")
+    text_log.append(f"PMTUD source: {(cfg.pmtud_info or {}).get('path_mtu_source', 'unknown')}")
     text_log.append(f"Aggregate throughput: send={send_mbps:.2f} Mbps  recv={recv_mbps:.2f} Mbps")
     text_log.append(f"Packets/sec: send={send_pps:.1f} pps  recv={recv_pps:.1f} pps")
     if loss_pct is not None:

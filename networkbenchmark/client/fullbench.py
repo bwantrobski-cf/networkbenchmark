@@ -244,6 +244,18 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     pmtud_json_path, pmtud_log_path = logging_store.save_result(
         constants.TEST_TYPE_PMTUD, pmtud_result, pmtud_text_lines, base_dir=log_base_dir)
     path_mtu = pmtud_result.get("path_mtu")
+    pmtud_info = {
+        "server_ip": pmtud_server_ip,
+        "udp_port": pmtud_udp_port,
+        "success": bool(pmtud_result.get("success")),
+        "path_mtu": path_mtu,
+        "path_mtu_source": pmtud_result.get("path_mtu_source", "pmtud"),
+        "fallback_used": pmtud_fallback_used,
+        "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
+        "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
+        "log_json": pmtud_json_path,
+        "log_text": pmtud_log_path,
+    }
     if not isinstance(path_mtu, int):
         log(f"fullbench PMTUD and ICMP reachability failed; local log: {pmtud_json_path}")
         raise PmtudError(pmtud_result.get("error") or "PMTUD did not determine a path MTU and ping failed")
@@ -278,6 +290,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             acceptable_loss_pct=(cfg.acceptable_loss_pct if spec["tune"] else None),
             max_duration_sec=cfg.udp_max_duration_sec,
             path_mtu=path_mtu,
+            pmtud_info=pmtud_info,
         )
 
         # Each individual test carries its own unique recorded_at timestamp.
@@ -301,6 +314,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "streams": spec["streams"],
             "procs": spec["procs"],
             "tuned": spec["tune"],
+            "path_mtu": path_mtu,
+            "pmtud": pmtud_info,
         }
 
         try:
@@ -328,8 +343,11 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         # Export per-test result (if configured).
         if cfg.export_url and record["result"] is not None:
             payload = dict(record)
-            payload["result"] = (_slim_result(record["result"]) if cfg.export_slim
-                                 else record["result"])
+            payload.pop("pmtud", None)
+            export_result_data = dict(record["result"])
+            export_result_data.pop("pmtud", None)
+            payload["result"] = (_slim_result(export_result_data) if cfg.export_slim
+                                 else export_result_data)
             res = export_result(cfg.export_url, payload, method=cfg.export_method,
                                 headers=cfg.export_headers, timeout_sec=cfg.export_timeout_sec)
             record["export"] = res
@@ -352,17 +370,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         "test_type": cfg.test_type,
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
-        "pmtud": {
-            "server_ip": pmtud_server_ip,
-            "udp_port": pmtud_udp_port,
-            "path_mtu": path_mtu,
-            "path_mtu_source": pmtud_result.get("path_mtu_source", "pmtud"),
-            "fallback_used": pmtud_fallback_used,
-            "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
-            "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
-            "log_json": pmtud_json_path,
-            "log_text": pmtud_log_path,
-        },
+        "pmtud": pmtud_info,
         "config": {
             "transports": cfg.transports,
             "directions": cfg.directions,

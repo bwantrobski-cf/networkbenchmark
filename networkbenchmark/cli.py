@@ -17,7 +17,7 @@ import sys
 import threading
 
 from .common import constants, privileges, logging_store
-from .client.engine import ThroughputClientConfig, run_throughput_test
+from .client.engine import ThroughputClientConfig, ThroughputError, run_throughput_test
 from .client import fullbench as fullbench_mod
 from .diagnostics.mtr import MtrRunner, MtrError
 from .diagnostics import connectivity, protocols
@@ -231,8 +231,12 @@ def cmd_throughput(args):
         print(f"Running throughput test: server={args.server_ip} transport={cfg.transport} "
               f"direction={cfg.direction} streams={cfg.streams} duration={cfg.duration_sec}s", flush=True)
 
-    summary = run_throughput_test(cfg, on_interval=on_interval, stop_requested=stop_requested,
-                                   log_base_dir=args.log_dir)
+    try:
+        summary = run_throughput_test(cfg, on_interval=on_interval, stop_requested=stop_requested,
+                                      log_base_dir=args.log_dir)
+    except ThroughputError as exc:
+        print(f"ERROR: throughput test could not start: {exc}", flush=True)
+        sys.exit(1)
     _print_throughput_summary(summary)
 
 
@@ -264,6 +268,8 @@ def _print_throughput_summary(summary):
     if tuning:
         _print_tuning_summary(tuning)
     print("\n=== Throughput Test Summary ===")
+    print(f"  path MTU: {summary.get('path_mtu')} bytes  "
+          f"source={summary.get('pmtud', {}).get('path_mtu_source', 'unknown')}")
     print(f"  send: {summary['send_mbps']:.2f} Mbps   recv: {summary['recv_mbps']:.2f} Mbps")
     print(f"  send: {summary.get('send_pps', 0):.1f} pps   recv: {summary.get('recv_pps', 0):.1f} pps")
     if summary.get("loss_pct") is not None:
@@ -350,6 +356,8 @@ def cmd_fullbench(args):
 def _print_fullbench_summary(manifest):
     print("\n=== Full Benchmark Summary ===")
     print(f"  benchmark_id: {manifest['benchmark_id']}")
+    pmtud = manifest.get("pmtud") or {}
+    print(f"  path MTU: {pmtud.get('path_mtu')} bytes  source={pmtud.get('path_mtu_source', 'unknown')}")
     print(f"  completed: {manifest['completed']}/{manifest['test_count']}")
     header = (f"  {'transport':<9} {'dir':<5} {'streams':>7} {'procs':>5} {'send Mbps':>11} "
               f"{'recv Mbps':>11} {'send pps':>11} {'recv pps':>11} {'loss %':>8}")
