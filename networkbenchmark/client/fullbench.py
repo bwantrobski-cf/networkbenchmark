@@ -169,7 +169,14 @@ def export_result(url, payload, method="POST", headers=None, timeout_sec=15.0):
             status = getattr(resp, "status", None) or resp.getcode()
             return {"ok": 200 <= int(status) < 300, "status": int(status), "error": None}
     except urllib.error.HTTPError as exc:
-        return {"ok": False, "status": exc.code, "error": f"HTTP {exc.code}: {exc.reason}"}
+        try:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+        except (OSError, UnicodeError):
+            detail = ""
+        error = f"HTTP {exc.code}: {exc.reason}"
+        if detail:
+            error += f"; response={detail}"
+        return {"ok": False, "status": exc.code, "error": error}
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return {"ok": False, "status": None, "error": str(exc)}
 
