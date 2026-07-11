@@ -98,7 +98,11 @@ sudo "$(which networkbenchmark)" webui           # with the venv activated
 ### Server
 
 Start the server on the host that will receive throughput connections. The
-installed console script and the direct launcher accept identical options.
+installed console script and the direct launcher accept identical options. The
+server attempts IPv4 and IPv6 listeners independently; IPv4 remains the
+client default, and an unavailable IPv6 address or socket capability is logged
+without preventing IPv4 startup.
+
 
 ```bash
 # Installed command
@@ -120,6 +124,10 @@ python NetBench.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
 # TCP upload, one stream, 10 seconds
 networkbenchmark throughput --server-ip 10.0.0.5 --tcp --time 10
 python NetBench.py throughput --server-ip 10.0.0.5 --tcp --time 10
+
+# IPv6 TCP upload (IPv4 remains the default when -v6 is omitted)
+networkbenchmark throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
+python NetBench.py throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
 
 # UDP download, four parallel streams, 30 seconds
 networkbenchmark throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
@@ -165,6 +173,13 @@ headers:
   calculate the maximum benchmark datagram size. A 1500-byte path MTU therefore
   produces a 1472-byte UDP datagram target, including the benchmark's internal
   framing within that datagram.
+- **IPv6:** the IPv6 base header is 40 bytes, so IPv6 UDP sizing subtracts 48
+  bytes for IPv6 plus UDP, and IPv6 TCP MSS subtracts 60 bytes for IPv6 plus TCP.
+  A 1500-byte IPv6 path MTU therefore produces a 1452-byte UDP datagram target
+  and a 1440-byte TCP MSS.
+
+The selected address family is recorded as `IPv4` or `IPv6` in local results,
+fullbench manifests, PMTUD metadata, and exported NetworkBenchmark payloads.
 
 For example, with `path_mtu=1500`, both transports use the same 1500-byte path
 limit, but TCP uses a 1460-byte MSS while UDP targets 1472-byte datagrams. The
@@ -240,7 +255,21 @@ networkbenchmark fullbench --server-ip 10.0.0.5 \
     --acceptable-loss 1.0 --udp-max-duration 30 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
+
+# The same fullbench matrix over IPv6
+networkbenchmark fullbench --server-ip 2001:db8::5 -v6 \
+    --streams 1,8,16,32 --procs 1,4,8,8 \
+    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --export-url https://viz.example.com/ingest \
+    --export-header "Authorization: Bearer $TOKEN" --export-slim
 python NetBench.py fullbench --server-ip 10.0.0.5 \
+    --streams 1,8,16,32 --procs 1,4,8,8 \
+    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --export-url https://viz.example.com/ingest \
+    --export-header "Authorization: Bearer $TOKEN" --export-slim
+
+# The same fullbench matrix over IPv6
+python NetBench.py fullbench --server-ip 2001:db8::5 -v6 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
     --acceptable-loss 1.0 --udp-max-duration 30 \
     --export-url https://viz.example.com/ingest \
@@ -344,9 +373,17 @@ python NetBench.py mtr 8.8.8.8 --protocol icmp --interval-ms 200 --count 20
 networkbenchmark mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
 python NetBench.py mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
 
+# IPv6 MTR
+networkbenchmark mtr example.com -v6 --protocol tcp --port 443 --max-hops 30 --count 10
+python NetBench.py mtr example.com -v6 --protocol tcp --port 443 --max-hops 30 --count 10
+
 # Check ICMP, UDP, and TCP reachability against the throughput server
 networkbenchmark connectivity --server-ip 10.0.0.5
 python NetBench.py connectivity --server-ip 10.0.0.5
+
+# IPv6 connectivity
+networkbenchmark connectivity --server-ip 2001:db8::5 -v6
+python NetBench.py connectivity --server-ip 2001:db8::5 -v6
 
 # Use custom diagnostic ports and save the result logs
 networkbenchmark connectivity --server-ip 10.0.0.5 --udp-port 20000 \
@@ -358,6 +395,10 @@ python NetBench.py connectivity --server-ip 10.0.0.5 --udp-port 20000 \
 networkbenchmark pmtud --server-ip 10.0.0.5
 python NetBench.py pmtud --server-ip 10.0.0.5
 
+# IPv6 PMTUD
+networkbenchmark pmtud --server-ip 2001:db8::5 -v6
+python NetBench.py pmtud --server-ip 2001:db8::5 -v6
+
 # Narrow the PMTUD search and use the server's configured UDP port
 networkbenchmark pmtud --server-ip 10.0.0.5 --udp-port 20000 \
     --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
@@ -367,6 +408,10 @@ python NetBench.py pmtud --server-ip 10.0.0.5 --udp-port 20000 \
 # Run the UDP/TCP/ICMP/ESP/NAT-T/GRE reachability matrix
 networkbenchmark protocols --server-ip 10.0.0.5
 python NetBench.py protocols --server-ip 10.0.0.5
+
+# IPv6 protocol reachability
+networkbenchmark protocols --server-ip 2001:db8::5 -v6
+python NetBench.py protocols --server-ip 2001:db8::5 -v6
 
 # Use custom ports and a longer timeout for protocol checks
 networkbenchmark protocols --server-ip 10.0.0.5 --udp-port 20000 \
@@ -407,6 +452,10 @@ Parallel streams (`-P N`) use sequential ports starting at the configured
 UDP/TCP base port (`base_port + stream_index`). All ports are configurable
 on the server via CLI flags / the Settings tab, and the client must be told
 the server's base port via `--start-port` (CLI) or the Settings tab (UI).
+
+The Web UI's **Use IPv6** selector applies to throughput and all diagnostics;
+IPv4 is selected by default. The selected `IPv4`/`IPv6` value is shown in the
+connectivity, throughput, and MTR results and is included in saved logs.
 
 ## Logs
 

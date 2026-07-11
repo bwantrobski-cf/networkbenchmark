@@ -28,6 +28,7 @@ IPPROTO_GRE = 47
 # 2 bytes are the Protocol Type, 0x0800 = IPv4. This 4-byte header precedes our
 # reachability payload so the probe looks like real GRE v0 on the wire.
 GRE_V0_PROTOCOL_TYPE_IPV4 = 0x0800
+GRE_V0_PROTOCOL_TYPE_IPV6 = 0x86DD
 GRE_V0_HEADER = b"\x00\x00" + GRE_V0_PROTOCOL_TYPE_IPV4.to_bytes(2, "big")
 GRE_V0_HEADER_LEN = len(GRE_V0_HEADER)
 

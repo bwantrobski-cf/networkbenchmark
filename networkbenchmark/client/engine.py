@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 
-from ..common import addr, constants, logging_store, tcp_info
+from ..common import addr, constants, logging_store, net, tcp_info
 from ..diagnostics import connectivity
 from ..diagnostics.pmtud import PmtudError, run_pmtud
 from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
@@ -21,19 +21,23 @@ from ..transport.control_connection import ControlChannel
 class ThroughputClientConfig:
     def __init__(self, server_ip, control_port=None, transport="tcp", direction="up",
                  streams=1, duration_sec=constants.DEFAULT_TEST_DURATION_SEC,
-                 start_port=None, bind="0.0.0.0", calibration_sec=constants.CALIBRATION_TIME_SEC,
+                 start_port=None, bind=None, calibration_sec=constants.CALIBRATION_TIME_SEC,
                  probe_interval_sec=constants.PROBE_INTERVAL_SEC, procs=1,
                  acceptable_loss_pct=None, max_duration_sec=None, path_mtu=None,
-                 pmtud_info=None):
+                 pmtud_info=None, ipv6=False):
         self.server_host = server_ip
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transport = transport
         self.direction = direction
+        self.ipv6 = bool(ipv6)
+        self.family = net.family_for_ipv6(self.ipv6)
+        self.ip_version = net.ip_version_label(family=self.family)
         self.streams = max(1, int(streams))
         self.duration_sec = duration_sec
         default_start_port = constants.DEFAULT_UDP_PORT if transport == "udp" else constants.DEFAULT_TCP_PORT
         self.start_port = start_port or default_start_port
-        self.bind = bind
+        self.bind = ("::" if self.ipv6 and bind in (None, "", "0.0.0.0")
+                     else ("0.0.0.0" if bind in (None, "") else bind))
         self.calibration_sec = calibration_sec
         self.probe_interval_sec = probe_interval_sec
         # Number of worker processes to spread streams across (1 = threaded,
@@ -69,11 +73,12 @@ class ThroughputError(Exception):
 def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir: str = None):
     pmtud_udp_port = cfg.start_port if cfg.transport == "udp" else constants.DEFAULT_UDP_PORT
     try:
-        pmtud_result = run_pmtud(server_ip, udp_port=pmtud_udp_port)
+        pmtud_result = run_pmtud(server_ip, udp_port=pmtud_udp_port, family=cfg.family)
     except (PmtudError, OSError, ValueError) as exc:
         pmtud_result = {
             "server_ip": server_ip,
             "udp_port": pmtud_udp_port,
+            "ip_version": cfg.ip_version,
             "success": False,
             "connectivity_confirmed": False,
             "path_mtu": None,
@@ -85,7 +90,7 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
 
     fallback_used = False
     if not pmtud_result.get("success") or not isinstance(pmtud_result.get("path_mtu"), int):
-        ping_result = connectivity.icmp_ping(server_ip)
+        ping_result = connectivity.icmp_ping(server_ip, family=cfg.family)
         pmtud_result["icmp_ping"] = ping_result
         if ping_result.get("success"):
             fallback_used = True
@@ -96,8 +101,9 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
         else:
             pmtud_result["path_mtu_source"] = "unavailable"
 
+    pmtud_result.setdefault("ip_version", cfg.ip_version)
     text_lines = [
-        f"PMTUD to {server_ip}:{pmtud_udp_port}",
+        f"PMTUD to {server_ip}:{pmtud_udp_port} ip_version={cfg.ip_version}",
         f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
         f"path_mtu={pmtud_result.get('path_mtu')} payload={pmtud_result.get('path_mtu_payload_bytes')}",
         f"path_mtu_source={pmtud_result.get('path_mtu_source', 'pmtud')} fallback_used={fallback_used}",
@@ -112,6 +118,7 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
     return path_mtu, {
         "server_ip": server_ip,
         "udp_port": pmtud_udp_port,
+        "ip_version": cfg.ip_version,
         "success": bool(pmtud_result.get("success")),
         "path_mtu": path_mtu,
         "path_mtu_source": pmtud_result.get("path_mtu_source", "pmtud"),
@@ -175,17 +182,17 @@ def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
     used_ports = set()
     for i, port in enumerate(ports):
         if cfg.transport == "tcp":
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind((cfg.bind, 0))
+            sock = socket.socket(cfg.family, socket.SOCK_STREAM)
+            sock.bind(net.sockaddr(cfg.bind, 0, cfg.family))
             stream_worker.configure_tcp_socket(sock, cfg.path_mtu)
             sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
-            sock.connect((cfg.server_host, port))
+            sock.connect(net.sockaddr(cfg.server_host, port, cfg.family))
             sock.sendall(stream_worker.build_preamble(run_id, i))
             streams[i] = (sock, None)
         else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind((cfg.bind, 0))
-            dest = (cfg.server_host, port)
+            sock = socket.socket(cfg.family, socket.SOCK_DGRAM)
+            sock.bind(net.sockaddr(cfg.bind, 0, cfg.family))
+            dest = net.sockaddr(cfg.server_host, port, cfg.family)
             sock.sendto(stream_worker.build_preamble(run_id, i), dest)
             streams[i] = (sock, dest)
 
@@ -273,17 +280,17 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
     try:
         for i, port in assignments:
             if conn["transport"] == "tcp":
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.bind((conn["bind"], 0))
+                s = socket.socket(conn["family"], socket.SOCK_STREAM)
+                s.bind(net.sockaddr(conn["bind"], 0, conn["family"]))
                 stream_worker.configure_tcp_socket(s, conn.get("path_mtu"))
                 s.settimeout(constants.SOCKET_TIMEOUT_SEC)
-                s.connect((conn["server_ip"], port))
+                s.connect(net.sockaddr(conn["server_ip"], port, conn["family"]))
                 s.sendall(stream_worker.build_preamble(run_id, i))
                 socks[i] = (s, None)
             else:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.bind((conn["bind"], 0))
-                dest = (conn["server_ip"], port)
+                s = socket.socket(conn["family"], socket.SOCK_DGRAM)
+                s.bind(net.sockaddr(conn["bind"], 0, conn["family"]))
+                dest = net.sockaddr(conn["server_ip"], port, conn["family"])
                 s.sendto(stream_worker.build_preamble(run_id, i), dest)
                 socks[i] = (s, dest)
             src_ports[i] = s.getsockname()[1]
@@ -326,7 +333,8 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
 
     role = "send" if cfg.direction == "up" else "recv"
     conn = {"server_ip": server_ip, "bind": cfg.bind, "transport": cfg.transport,
-            "duration_sec": cfg.sender_duration_sec, "path_mtu": cfg.path_mtu}
+            "duration_sec": cfg.sender_duration_sec, "path_mtu": cfg.path_mtu,
+            "family": cfg.family}
     start_flag = mp_ctx.Value("b", 0, lock=False)
     stop_flag = mp_ctx.Value("b", 0, lock=False)
     # Per-stream target send rate in bytes/sec (0 = unpaced); driven by the UDP
@@ -510,7 +518,8 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, apply_rate, on_interva
 
 def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requested: threading.Event = None,
                          log_base_dir: str = None) -> dict:
-    server_ip = addr.resolve_host(cfg.server_host)
+    server_ip = addr.resolve_host(cfg.server_host, family=cfg.family)
+    cfg.server_host = server_ip
     stop_requested = stop_requested or threading.Event()
 
     if cfg.path_mtu is None:
@@ -519,14 +528,15 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         cfg.pmtud_info = {
             "server_ip": server_ip,
             "udp_port": (cfg.start_port if cfg.transport == "udp" else constants.DEFAULT_UDP_PORT),
+            "ip_version": cfg.ip_version,
             "path_mtu": cfg.path_mtu,
             "path_mtu_source": "provided",
             "fallback_used": False,
         }
 
-    control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    control_sock = socket.socket(cfg.family, socket.SOCK_STREAM)
     control_sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
-    control_sock.connect((server_ip, cfg.control_port))
+    control_sock.connect(net.sockaddr(server_ip, cfg.control_port, cfg.family))
     control = ControlChannel(control_sock)
 
     run_id = str(uuid.uuid4())
@@ -539,17 +549,18 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         "duration_sec": cfg.sender_duration_sec,
         "procs": cfg.procs,
         "path_mtu": cfg.path_mtu,
+        "ip_version": cfg.ip_version,
     }
 
     _dur_desc = (f"max_duration={cfg.max_duration_sec}s acceptable_loss={cfg.acceptable_loss_pct}%"
                  if cfg.tune_udp else f"duration={cfg.duration_sec}s")
     text_log = [f"NetworkBenchmark throughput test  run_id={run_id}",
-                f"server={server_ip}:{cfg.control_port}  transport={cfg.transport} "
+                f"server={server_ip}:{cfg.control_port}  ip_version={cfg.ip_version} transport={cfg.transport} "
                 f"direction={cfg.direction} streams={cfg.streams} {_dur_desc}"]
     if cfg.path_mtu is not None:
         text_log.append(f"Path MTU: {cfg.path_mtu} bytes  TCP MSS: "
-                        f"{stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu)} bytes  "
-                        f"UDP datagram: {stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu)} bytes")
+                        f"{stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu, family=cfg.family)} bytes  "
+                        f"UDP datagram: {stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu, family=cfg.family)} bytes")
     if cfg.pmtud_info:
         text_log.append(f"PMTUD source: {cfg.pmtud_info.get('path_mtu_source', 'pmtud')}  "
                         f"log: {cfg.pmtud_info.get('log_json', 'n/a')}")
@@ -798,12 +809,13 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
                     else ((totals["bytes_received"] / duration) if duration else 0))
     bloat = metrics.compute_bufferbloat(receiver_bps, unloaded_rtt_ms, loaded_stats.get("avg"))
 
-    tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu)
-    udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu)
+    tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(cfg.path_mtu, family=cfg.family)
+    udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(cfg.path_mtu, family=cfg.family)
 
     summary = {
         "run_id": run_id,
         "server": cfg.server_host,
+        "ip_version": cfg.ip_version,
         "transport": cfg.transport,
         "direction": cfg.direction,
         "streams": cfg.streams,
@@ -830,6 +842,7 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
     }
 
     text_log.append("")
+    text_log.append(f"IP version: {cfg.ip_version}")
     text_log.append(f"Path MTU: {cfg.path_mtu} bytes")
     text_log.append(f"PMTUD source: {(cfg.pmtud_info or {}).get('path_mtu_source', 'unknown')}")
     text_log.append(f"Packet sizing: TCP MSS={tcp_mss_bytes} bytes  UDP datagram={udp_datagram_bytes} bytes")

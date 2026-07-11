@@ -62,35 +62,41 @@ def _padding(size: int) -> bytes:
     return secrets.token_bytes(size)
 
 
-def udp_packet_size_for_path_mtu(path_mtu):
+def _family_or_socket_family(family, sock=None):
+    return family if family is not None else getattr(sock, "family", socket.AF_INET)
+
+
+def udp_packet_size_for_path_mtu(path_mtu, family=socket.AF_INET):
     if path_mtu is None:
         return constants.UDP_PAYLOAD_SIZE
     try:
         mtu = int(path_mtu)
     except (TypeError, ValueError):
         return constants.UDP_PAYLOAD_SIZE
-    return max(UDP_HEADER_SIZE, mtu - 28)
+    overhead = 48 if family == socket.AF_INET6 else 28
+    return max(UDP_HEADER_SIZE, mtu - overhead)
 
 
-def tcp_mss_for_path_mtu(path_mtu):
+def tcp_mss_for_path_mtu(path_mtu, family=socket.AF_INET):
     if path_mtu is None:
         return None
     try:
         mtu = int(path_mtu)
     except (TypeError, ValueError):
         return None
-    return max(64, mtu - 40)
+    overhead = 60 if family == socket.AF_INET6 else 40
+    return max(64, mtu - overhead)
 
 
-def tcp_write_size_for_path_mtu(path_mtu):
-    mss = tcp_mss_for_path_mtu(path_mtu)
+def tcp_write_size_for_path_mtu(path_mtu, family=socket.AF_INET):
+    mss = tcp_mss_for_path_mtu(path_mtu, family=family)
     if mss is None:
         return constants.TCP_CHUNK_SIZE
     return min(constants.TCP_CHUNK_SIZE, max(mss, mss * 32))
 
 
-def configure_tcp_socket(sock: socket.socket, path_mtu=None):
-    mss = tcp_mss_for_path_mtu(path_mtu)
+def configure_tcp_socket(sock: socket.socket, path_mtu=None, family=None):
+    mss = tcp_mss_for_path_mtu(path_mtu, family=_family_or_socket_family(family, sock))
     option = getattr(socket, "TCP_MAXSEG", None)
     if mss is None or option is None:
         return
@@ -107,7 +113,7 @@ def configure_tcp_socket(sock: socket.socket, path_mtu=None):
 def tcp_sender_loop(sock: socket.socket, counters, stop_event: threading.Event,
                      duration_sec: float, start_time: float, path_mtu=None):
     """Send as fast as possible until stop_event is set or duration elapses."""
-    chunk = _padding(tcp_write_size_for_path_mtu(path_mtu))
+    chunk = _padding(tcp_write_size_for_path_mtu(path_mtu, family=sock.family))
     sock.settimeout(1.0)
     try:
         while not stop_event.is_set():
@@ -178,7 +184,7 @@ def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
     that many bytes/sec via a token bucket (used by the loss-target tuning
     ramp). A value of 0 means unpaced (send as fast as possible)."""
     seq = 0
-    udp_packet_size = udp_packet_size_for_path_mtu(path_mtu)
+    udp_packet_size = udp_packet_size_for_path_mtu(path_mtu, family=sock.family)
     payload = _padding(max(0, udp_packet_size - UDP_HEADER_SIZE))
     packet_size = UDP_HEADER_SIZE + len(payload)
     sock.settimeout(1.0)

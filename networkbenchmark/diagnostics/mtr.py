@@ -19,7 +19,7 @@ import struct
 import threading
 import time
 
-from ..common import addr, constants, netinfo, stats
+from ..common import addr, constants, net, netinfo, stats
 from . import packetutils as pkt
 
 
@@ -59,14 +59,18 @@ class MtrRunner:
     def __init__(self, target: str, protocol: str = "icmp", port: int = 33434,
                  interval_ms: int = constants.MTR_DEFAULT_INTERVAL_MS,
                  max_hops: int = constants.MTR_DEFAULT_MAX_HOPS,
-                 timeout_sec: float = constants.MTR_DEFAULT_TIMEOUT_SEC):
+                 timeout_sec: float = constants.MTR_DEFAULT_TIMEOUT_SEC,
+                 ipv6: bool = False):
         protocol = protocol.lower()
         if protocol not in constants.MTR_PROTOCOLS:
             raise ValueError(f"unsupported MTR protocol: {protocol}")
         interval_ms = max(constants.MTR_MIN_INTERVAL_MS, min(constants.MTR_MAX_INTERVAL_MS, interval_ms))
 
         self.target_host = target
-        self.target_ip = addr.resolve_host(target)
+        self.ipv6 = bool(ipv6)
+        self.family = net.family_for_ipv6(self.ipv6)
+        self.ip_version = net.ip_version_label(family=self.family)
+        self.target_ip = addr.resolve_host(target, family=self.family)
         self.protocol = protocol
         self.port = port
         self.interval_sec = interval_ms / 1000.0
@@ -83,7 +87,8 @@ class MtrRunner:
 
     def _open_icmp_socket(self):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            protocol = socket.IPPROTO_ICMPV6 if self.family == socket.AF_INET6 else socket.IPPROTO_ICMP
+            s = socket.socket(self.family, socket.SOCK_RAW, protocol)
         except (PermissionError, OSError) as exc:
             raise MtrError(f"unable to open raw ICMP socket (requires root/admin): {exc}")
         s.settimeout(0.05)
@@ -91,20 +96,20 @@ class MtrRunner:
 
     def _open_tcp_raw_socket(self):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            s = socket.socket(self.family, socket.SOCK_RAW, socket.IPPROTO_TCP)
         except (PermissionError, OSError) as exc:
             raise MtrError(f"unable to open raw TCP socket (requires root/admin): {exc}")
         s.settimeout(0.05)
         return s
 
     def _open_udp_send_socket(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return s
+        return socket.socket(self.family, socket.SOCK_DGRAM)
 
     def _open_tcp_send_socket(self, src_ip):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-            s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            s = socket.socket(self.family, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            if self.family == socket.AF_INET:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         except (PermissionError, OSError) as exc:
             raise MtrError(f"unable to open raw IP socket for TCP SYN (requires root/admin): {exc}")
         return s
@@ -118,7 +123,7 @@ class MtrRunner:
         """
         icmp_sock = self._open_icmp_socket()
         udp_sock = self._open_udp_send_socket() if self.protocol == "udp" else None
-        src_ip = pkt.get_default_source_ip(self.target_ip)
+        src_ip = pkt.get_default_source_ip(self.target_ip, family=self.family)
         tcp_raw_sock = None
         tcp_send_sock = None
         if self.protocol == "tcp":
@@ -168,18 +173,33 @@ class MtrRunner:
 
             try:
                 if self.protocol == "icmp":
-                    icmp_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
-                    packet = pkt.build_icmp_echo(self._icmp_id, ttl, b"networkbenchmark-mtr")
-                    icmp_sock.sendto(packet, (self.target_ip, 0))
+                    if self.family == socket.AF_INET6:
+                        icmp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
+                        packet = pkt.build_icmpv6_echo(src_ip, self.target_ip, self._icmp_id, ttl,
+                                                       b"networkbenchmark-mtr")
+                    else:
+                        icmp_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+                        packet = pkt.build_icmp_echo(self._icmp_id, ttl, b"networkbenchmark-mtr")
+                    icmp_sock.sendto(packet, net.sockaddr(self.target_ip, 0, self.family))
                 elif self.protocol == "udp":
-                    udp_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
-                    udp_sock.sendto(b"networkbenchmark-mtr", (self.target_ip, probe_port))
+                    if self.family == socket.AF_INET6:
+                        udp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
+                    else:
+                        udp_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
+                    udp_sock.sendto(b"networkbenchmark-mtr", net.sockaddr(self.target_ip, probe_port, self.family))
                 else:  # tcp
-                    ip_header = pkt.build_ip_header(src_ip, self.target_ip, socket.IPPROTO_TCP,
-                                                     20, ttl, ident=ttl + 1000)
-                    tcp_header = pkt.build_tcp_syn(src_ip, self.target_ip, self._tcp_src_port,
-                                                    self.port, seq_num=random.randint(0, 0xFFFFFFF))
-                    tcp_send_sock.sendto(ip_header + tcp_header, (self.target_ip, 0))
+                    tcp_header = (pkt.build_tcp_syn_ipv6(src_ip, self.target_ip, self._tcp_src_port,
+                                                         self.port, seq_num=random.randint(0, 0xFFFFFFF))
+                                  if self.family == socket.AF_INET6 else
+                                  pkt.build_tcp_syn(src_ip, self.target_ip, self._tcp_src_port,
+                                                    self.port, seq_num=random.randint(0, 0xFFFFFFF)))
+                    if self.family == socket.AF_INET6:
+                        tcp_send_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
+                        tcp_send_sock.sendto(tcp_header, net.sockaddr(self.target_ip, 0, self.family))
+                    else:
+                        ip_header = pkt.build_ip_header(src_ip, self.target_ip, socket.IPPROTO_TCP,
+                                                         20, ttl, ident=ttl + 1000)
+                        tcp_send_sock.sendto(ip_header + tcp_header, (self.target_ip, 0))
             except OSError:
                 hop.probes_lost += 1
                 continue
@@ -228,16 +248,18 @@ class MtrRunner:
             except OSError:
                 continue
 
-            parsed = pkt.parse_icmp_packet(raw)
+            parsed = pkt.parse_icmp_packet(raw, family=self.family)
             if not parsed:
                 continue
 
             rtt_ms = (time.time() - send_time) * 1000.0
 
             if self.protocol == "icmp":
-                if parsed["type"] == pkt.ICMP_ECHO_REPLY and parsed["id"] == self._icmp_id and parsed["seq"] == ttl:
+                echo_reply = (pkt.ICMPV6_ECHO_REPLY if self.family == socket.AF_INET6 else pkt.ICMP_ECHO_REPLY)
+                if parsed["type"] == echo_reply and parsed["id"] == self._icmp_id and parsed["seq"] == ttl:
                     return parsed["ip_src"], rtt_ms, (parsed["ip_src"] == self.target_ip)
-                if parsed["type"] == pkt.ICMP_TIME_EXCEEDED:
+                time_exceeded = (pkt.ICMPV6_TIME_EXCEEDED if self.family == socket.AF_INET6 else pkt.ICMP_TIME_EXCEEDED)
+                if parsed["type"] == time_exceeded:
                     embedded = parsed.get("embedded_payload", b"")
                     if len(embedded) >= 8:
                         e_id, e_seq = struct.unpack("!HH", embedded[4:8])
@@ -245,15 +267,20 @@ class MtrRunner:
                             return parsed["ip_src"], rtt_ms, False
 
             elif self.protocol == "udp":
-                if parsed["type"] == pkt.ICMP_TIME_EXCEEDED:
+                time_exceeded = (pkt.ICMPV6_TIME_EXCEEDED if self.family == socket.AF_INET6 else pkt.ICMP_TIME_EXCEEDED)
+                if parsed["type"] == time_exceeded:
                     embedded_ip = parsed.get("embedded_ip")
                     embedded = parsed.get("embedded_payload", b"")
                     if embedded_ip and embedded_ip["dst"] == self.target_ip and len(embedded) >= 4:
                         _sport, dport = struct.unpack("!HH", embedded[0:4])
                         if dport == probe_port:
                             return parsed["ip_src"], rtt_ms, False
-                if (parsed["type"] == pkt.ICMP_DEST_UNREACHABLE
-                        and parsed["code"] == pkt.ICMP_PORT_UNREACHABLE_CODE):
+                unreachable_type = (pkt.ICMPV6_DEST_UNREACHABLE if self.family == socket.AF_INET6
+                                    else pkt.ICMP_DEST_UNREACHABLE)
+                unreachable_code = (pkt.ICMPV6_PORT_UNREACHABLE_CODE if self.family == socket.AF_INET6
+                                    else pkt.ICMP_PORT_UNREACHABLE_CODE)
+                if (parsed["type"] == unreachable_type
+                        and parsed["code"] == unreachable_code):
                     embedded_ip = parsed.get("embedded_ip")
                     embedded = parsed.get("embedded_payload", b"")
                     if embedded_ip and embedded_ip["dst"] == self.target_ip and len(embedded) >= 4:
@@ -262,7 +289,8 @@ class MtrRunner:
                             return parsed["ip_src"], rtt_ms, True
 
             else:  # tcp: intermediate hops still show up as ICMP time-exceeded
-                if parsed["type"] == pkt.ICMP_TIME_EXCEEDED:
+                time_exceeded = (pkt.ICMPV6_TIME_EXCEEDED if self.family == socket.AF_INET6 else pkt.ICMP_TIME_EXCEEDED)
+                if parsed["type"] == time_exceeded:
                     embedded_ip = parsed.get("embedded_ip")
                     embedded = parsed.get("embedded_payload", b"")
                     if embedded_ip and embedded_ip["dst"] == self.target_ip and len(embedded) >= 4:

@@ -25,9 +25,9 @@ def is_admin() -> bool:
         return False
 
 
-def _try_raw_socket(proto: int) -> bool:
+def _try_raw_socket(proto: int, family=socket.AF_INET) -> bool:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
+        s = socket.socket(family, socket.SOCK_RAW, proto)
         s.close()
         return True
     except (PermissionError, OSError):
@@ -42,17 +42,25 @@ def probe_capabilities(force: bool = False) -> dict:
 
     admin = is_admin()
     icmp_raw = _try_raw_socket(socket.IPPROTO_ICMP)
+    icmpv6_raw = _try_raw_socket(getattr(socket, "IPPROTO_ICMPV6", 58), socket.AF_INET6)
     tcp_raw = _try_raw_socket(socket.IPPROTO_TCP)
+    tcpv6_raw = _try_raw_socket(socket.IPPROTO_TCP, socket.AF_INET6)
     esp_raw = _try_raw_socket(getattr(socket, "IPPROTO_ESP", 50))
+    espv6_raw = _try_raw_socket(getattr(socket, "IPPROTO_ESP", 50), socket.AF_INET6)
     gre_raw = _try_raw_socket(getattr(socket, "IPPROTO_GRE", 47))
+    grev6_raw = _try_raw_socket(getattr(socket, "IPPROTO_GRE", 47), socket.AF_INET6)
 
     caps = {
         "platform": platform.system(),
         "is_admin": admin,
         "icmp_raw": icmp_raw,
+        "icmpv6_raw": icmpv6_raw,
         "tcp_raw": tcp_raw,
+        "tcpv6_raw": tcpv6_raw,
         "esp_raw": esp_raw,
+        "espv6_raw": espv6_raw,
         "gre_raw": gre_raw,
+        "grev6_raw": grev6_raw,
         # Feature-level gates consumed by CLI/UI
         "mtr_icmp": icmp_raw,
         "mtr_udp": icmp_raw,
@@ -68,6 +76,12 @@ def probe_capabilities(force: bool = False) -> dict:
         "throughput_udp": True,
     }
     caps["mtr"] = caps["mtr_icmp"] or caps["mtr_udp"] or caps["mtr_tcp"]
+    caps["mtr_ipv6_icmp"] = icmpv6_raw
+    caps["mtr_ipv6_udp"] = icmpv6_raw
+    caps["mtr_ipv6_tcp"] = icmpv6_raw and tcpv6_raw
+    caps["pmtud_ipv6"] = icmpv6_raw
+    caps["protocol_esp_ipv6"] = espv6_raw
+    caps["protocol_gre_ipv6"] = grev6_raw
     _CAPS_CACHE = caps
     return caps
 

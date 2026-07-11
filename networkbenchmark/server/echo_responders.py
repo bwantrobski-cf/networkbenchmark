@@ -12,54 +12,64 @@
   client-side via capability probing).
 """
 
+import select
 import socket
 import threading
 
-from ..common import constants
+from ..common import constants, net
 from ..diagnostics import packetutils as pkt
 from ..transport import stream_worker
 
 
 def udp_base_listener(ctx):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((ctx.config.bind, ctx.config.udp_port))
-    sock.settimeout(0.5)
-    ctx.log(f"UDP echo/data listener on {ctx.config.bind}:{ctx.config.udp_port}")
+    sockets = net.open_server_sockets(ctx.config.bind, ctx.config.udp_port, socket.SOCK_DGRAM,
+                                      log=ctx.log, service="UDP base")
+    if not sockets:
+        ctx.log(f"UDP base: no IPv4 or IPv6 listener available on port {ctx.config.udp_port}")
+        return
+    ctx.log(f"UDP echo/data listener families={','.join(net.family_label(sock.family) for sock in sockets)} "
+            f"port={ctx.config.udp_port}")
 
     while not ctx.stop_event.is_set():
         try:
-            data, from_addr = sock.recvfrom(constants.BUFSZ)
-        except socket.timeout:
-            continue
-        except OSError as exc:
+            readable, _, _ = select.select(sockets, [], [], 0.5)
+        except (OSError, ValueError) as exc:
             ctx.log(f"udp_base_listener error: {exc}")
             break
-
-        if len(data) >= 16 and data[:8] == constants.CONNECTIVITY_MAGIC:
+        for sock in readable:
             try:
-                sock.sendto(data, from_addr)
-            except OSError:
-                pass
-            continue
+                data, from_addr = sock.recvfrom(constants.BUFSZ)
+            except OSError as exc:
+                ctx.log(f"UDP base {net.family_label(sock.family)} receive error: {exc}")
+                continue
 
-        if len(data) >= stream_worker.PREAMBLE_SIZE and data[:8] == constants.DATA_STREAM_MAGIC:
-            preamble = stream_worker.parse_preamble(data)
-            if preamble:
-                _, run_id, idx = preamble
-                session = ctx.get_session()
-                if session and session.run_id == run_id and idx == 0:
-                    session.attach_stream(0, sock, addr=from_addr, spawn_receiver=False)
-                    ctx.log(f"session {run_id[:8]}: udp stream 0 connected from {from_addr}")
-            continue
+            if len(data) >= 16 and data[:8] == constants.CONNECTIVITY_MAGIC:
+                try:
+                    sock.sendto(data, from_addr)
+                except OSError:
+                    pass
+                continue
 
-        # possible inline data frame for an established up-direction stream-0 flow
-        session = ctx.get_session()
-        if (session and session.params.get("transport") == "udp"
-                and session.stream_addrs.get(0) == from_addr):
-            stream_worker.feed_udp_data_frame(session.counters[0], data)
+            if len(data) >= stream_worker.PREAMBLE_SIZE and data[:8] == constants.DATA_STREAM_MAGIC:
+                preamble = stream_worker.parse_preamble(data)
+                if preamble:
+                    _, run_id, idx = preamble
+                    session = ctx.get_session()
+                    if session and session.run_id == run_id and idx == 0:
+                        session.attach_stream(0, sock, addr=from_addr, spawn_receiver=False)
+                        ctx.log(f"session {run_id[:8]}: udp stream 0 connected from {from_addr}")
+                continue
 
-    sock.close()
+            session = ctx.get_session()
+            if (session and session.params.get("transport") == "udp"
+                    and session.stream_addrs.get(0) == from_addr):
+                stream_worker.feed_udp_data_frame(session.counters[0], data)
+
+    for sock in sockets:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def _handle_tcp_base_connection(ctx, conn, addr):
@@ -92,87 +102,113 @@ def _handle_tcp_base_connection(ctx, conn, addr):
 
 
 def tcp_base_listener(ctx):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((ctx.config.bind, ctx.config.tcp_port))
-    sock.listen(64)
-    sock.settimeout(0.5)
-    ctx.log(f"TCP echo/data listener on {ctx.config.bind}:{ctx.config.tcp_port}")
+    sockets = net.open_server_sockets(ctx.config.bind, ctx.config.tcp_port, socket.SOCK_STREAM,
+                                      listener=True, log=ctx.log, service="TCP base")
+    if not sockets:
+        ctx.log(f"TCP base: no IPv4 or IPv6 listener available on port {ctx.config.tcp_port}")
+        return
+    ctx.log(f"TCP echo/data listener families={','.join(net.family_label(sock.family) for sock in sockets)} "
+            f"port={ctx.config.tcp_port}")
 
     while not ctx.stop_event.is_set():
         try:
-            conn, addr = sock.accept()
-        except socket.timeout:
-            continue
-        except OSError as exc:
+            readable, _, _ = select.select(sockets, [], [], 0.5)
+        except (OSError, ValueError) as exc:
             ctx.log(f"tcp_base_listener error: {exc}")
             break
-        threading.Thread(target=_handle_tcp_base_connection, args=(ctx, conn, addr), daemon=True).start()
+        for listener in readable:
+            try:
+                conn, addr = listener.accept()
+            except OSError as exc:
+                ctx.log(f"TCP base {net.family_label(listener.family)} accept error: {exc}")
+                continue
+            threading.Thread(target=_handle_tcp_base_connection, args=(ctx, conn, addr), daemon=True).start()
 
-    sock.close()
+    for sock in sockets:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def natt_udp_listener(ctx):
     """UDP/4500 echo for the IPSEC (UDP over ESP / NAT-T) protocol check."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((ctx.config.bind, constants.IPSEC_NATT_PORT))
-    except OSError as exc:
-        ctx.log(f"NAT-T UDP/4500 listener disabled (bind failed: {exc})")
+    sockets = net.open_server_sockets(ctx.config.bind, constants.IPSEC_NATT_PORT, socket.SOCK_DGRAM,
+                                      log=ctx.log, service="NAT-T")
+    if not sockets:
+        ctx.log("NAT-T UDP/4500 listener unavailable for both IPv4 and IPv6")
         return
-    sock.settimeout(0.5)
-    ctx.log(f"NAT-T (UDP/4500) echo listener on {ctx.config.bind}:{constants.IPSEC_NATT_PORT}")
+    ctx.log("NAT-T (UDP/4500) echo listener families=" +
+            ",".join(net.family_label(sock.family) for sock in sockets))
 
     while not ctx.stop_event.is_set():
         try:
-            data, from_addr = sock.recvfrom(constants.BUFSZ)
-        except socket.timeout:
-            continue
-        except OSError:
+            readable, _, _ = select.select(sockets, [], [], 0.5)
+        except (OSError, ValueError) as exc:
+            ctx.log(f"NAT-T listener error: {exc}")
             break
-        if len(data) >= 16 and data[:8] == constants.CONNECTIVITY_MAGIC:
+        for sock in readable:
             try:
-                sock.sendto(data, from_addr)
+                data, from_addr = sock.recvfrom(constants.BUFSZ)
             except OSError:
-                pass
+                continue
+            if len(data) >= 16 and data[:8] == constants.CONNECTIVITY_MAGIC:
+                try:
+                    sock.sendto(data, from_addr)
+                except OSError:
+                    pass
 
-    sock.close()
+    for sock in sockets:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def _raw_proto_echo_listener(ctx, proto: int, label: str, magic_offset: int = 0):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
-    except (PermissionError, OSError) as exc:
-        ctx.log(f"{label} responder disabled (raw socket unavailable: {exc})")
+    sockets = []
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            sock = socket.socket(family, socket.SOCK_RAW, proto)
+            sock.settimeout(0.5)
+            sockets.append(sock)
+        except (PermissionError, OSError) as exc:
+            ctx.log(f"{label} {net.family_label(family)} responder unavailable: {exc}")
+    if not sockets:
+        ctx.log(f"{label} responder disabled for IPv4 and IPv6")
         return
-    sock.settimeout(0.5)
-    ctx.log(f"{label} (protocol {proto}) raw echo responder active")
+    ctx.log(f"{label} (protocol {proto}) raw echo families=" +
+            ",".join(net.family_label(sock.family) for sock in sockets))
 
     magic = constants.CONNECTIVITY_MAGIC
     end = magic_offset + len(magic)
 
     while not ctx.stop_event.is_set():
         try:
-            raw, from_addr = sock.recvfrom(65535)
-        except socket.timeout:
-            continue
-        except OSError:
+            readable, _, _ = select.select(sockets, [], [], 0.5)
+        except (OSError, ValueError):
             break
-
-        ip = pkt.parse_ip_header(raw)
-        if not ip:
-            continue
-        body = raw[ip["ihl"]:]
-        # The magic may be preceded by a protocol header (e.g. GRE v0), so match
-        # it at the expected offset. Echo the entire body back verbatim.
-        if len(body) >= end + 8 and body[magic_offset:end] == magic:
+        for sock in readable:
             try:
-                sock.sendto(body, (ip["src"], 0))
+                raw, _from_addr = sock.recvfrom(65535)
             except OSError:
-                pass
+                continue
 
-    sock.close()
+            ip = pkt.parse_ip_header(raw, family=sock.family)
+            if not ip:
+                continue
+            body = raw[ip["header_len"]:]
+            if len(body) >= end + 8 and body[magic_offset:end] == magic:
+                try:
+                    sock.sendto(body, net.sockaddr(ip["src"], 0, sock.family))
+                except OSError:
+                    pass
+
+    for sock in sockets:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def esp_native_listener(ctx):

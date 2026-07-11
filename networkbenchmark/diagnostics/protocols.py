@@ -11,24 +11,27 @@ import secrets
 import socket
 import time
 
-from ..common import constants, privileges
+from ..common import constants, net, privileges
 from . import connectivity
 from . import packetutils as pkt
 
 
 def _raw_proto_echo_check(server_ip: str, proto: int, label: str,
                            timeout_sec: float = 2.0, attempts: int = 3,
-                           header: bytes = b"") -> dict:
+                           header: bytes = b"", family=socket.AF_INET, ipv6=False) -> dict:
+    if ipv6:
+        family = socket.AF_INET6
     marker = secrets.token_bytes(8)
     # `header` (e.g. a GRE v0 header) precedes the reachability magic so the
     # packet is a well-formed instance of the protocol on the wire. The server
     # echoes the whole body back verbatim, so the round-trip comparison holds.
     payload = header + constants.CONNECTIVITY_MAGIC + marker
 
-    result = {"success": False, "protocol": label, "target": server_ip, "rtt_ms": None, "error": None}
+    result = {"success": False, "protocol": label, "target": server_ip,
+              "ip_version": net.ip_version_label(family=family), "rtt_ms": None, "error": None}
 
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
+        sock = socket.socket(family, socket.SOCK_RAW, proto)
     except (PermissionError, OSError) as exc:
         result["error"] = f"requires root/administrator privileges: {exc}"
         return result
@@ -38,7 +41,7 @@ def _raw_proto_echo_check(server_ip: str, proto: int, label: str,
         for _ in range(attempts):
             send_time = time.time()
             try:
-                sock.sendto(payload, (server_ip, 0))
+                sock.sendto(payload, net.sockaddr(server_ip, 0, family))
             except OSError as exc:
                 result["error"] = str(exc)
                 continue
@@ -52,7 +55,7 @@ def _raw_proto_echo_check(server_ip: str, proto: int, label: str,
                 except OSError:
                     break
 
-                ip = pkt.parse_ip_header(raw)
+                ip = pkt.parse_ip_header(raw, family=family)
                 if not ip or ip["src"] != server_ip:
                     continue
                 body = raw[ip["ihl"]:]
@@ -71,44 +74,61 @@ def _raw_proto_echo_check(server_ip: str, proto: int, label: str,
     return result
 
 
-def esp_native_check(server_ip: str, timeout_sec: float = 2.0) -> dict:
-    return _raw_proto_echo_check(server_ip, constants.IPPROTO_ESP, "esp_native", timeout_sec)
+def esp_native_check(server_ip: str, timeout_sec: float = 2.0,
+                     family=socket.AF_INET, ipv6=False) -> dict:
+    return _raw_proto_echo_check(server_ip, constants.IPPROTO_ESP, "esp_native", timeout_sec,
+                                 family=family, ipv6=ipv6)
 
 
-def gre_check(server_ip: str, timeout_sec: float = 2.0) -> dict:
-    # Emit a standard GRE version-0 header (RFC 2784) ahead of the payload.
+def gre_check(server_ip: str, timeout_sec: float = 2.0,
+              family=socket.AF_INET, ipv6=False) -> dict:
+    header = constants.GRE_V0_HEADER
+    if ipv6:
+        header = constants.GRE_V0_HEADER[:2] + constants.GRE_V0_PROTOCOL_TYPE_IPV6.to_bytes(2, "big")
     return _raw_proto_echo_check(server_ip, constants.IPPROTO_GRE, "gre", timeout_sec,
-                                  header=constants.GRE_V0_HEADER)
+                                  header=header, family=family, ipv6=ipv6)
 
 
-def esp_udp_check(server_ip: str, timeout_sec: float = 2.0) -> dict:
-    r = connectivity.udp_check(server_ip, constants.IPSEC_NATT_PORT, timeout_sec=timeout_sec)
+def esp_udp_check(server_ip: str, timeout_sec: float = 2.0,
+                  family=socket.AF_INET, ipv6=False) -> dict:
+    r = connectivity.udp_check(server_ip, constants.IPSEC_NATT_PORT, timeout_sec=timeout_sec,
+                                family=family, ipv6=ipv6)
     r["protocol"] = "esp_udp"
     return r
 
 
-def run_all(server_ip: str, udp_port: int, tcp_port: int, timeout_sec: float = 2.0) -> dict:
+def run_all(server_ip: str, udp_port: int, tcp_port: int, timeout_sec: float = 2.0,
+            family=socket.AF_INET, ipv6=False) -> dict:
+    if ipv6:
+        family = socket.AF_INET6
     caps = privileges.probe_capabilities()
 
     results = {
         "server_ip": server_ip,
+        "ip_version": net.ip_version_label(family=family),
         "capabilities": caps,
-        "icmp": connectivity.icmp_ping(server_ip, timeout_sec=timeout_sec),
-        "udp": connectivity.udp_check(server_ip, udp_port, timeout_sec=timeout_sec),
-        "tcp": connectivity.tcp_check(server_ip, tcp_port, timeout_sec=timeout_sec),
-        "esp_udp": esp_udp_check(server_ip, timeout_sec=timeout_sec),
+        "icmp": connectivity.icmp_ping(server_ip, timeout_sec=timeout_sec, family=family),
+        "udp": connectivity.udp_check(server_ip, udp_port, timeout_sec=timeout_sec, family=family),
+        "tcp": connectivity.tcp_check(server_ip, tcp_port, timeout_sec=timeout_sec, family=family),
+        "esp_udp": esp_udp_check(server_ip, timeout_sec=timeout_sec, family=family),
     }
 
-    if caps.get("protocol_esp"):
-        results["esp_native"] = esp_native_check(server_ip, timeout_sec=timeout_sec)
+    if caps.get("protocol_esp") and family == socket.AF_INET:
+        results["esp_native"] = esp_native_check(server_ip, timeout_sec=timeout_sec, family=family)
+    elif caps.get("protocol_esp_ipv6") and family == socket.AF_INET6:
+        results["esp_native"] = esp_native_check(server_ip, timeout_sec=timeout_sec, family=family, ipv6=True)
     else:
+        capability = "protocol_esp_ipv6" if family == socket.AF_INET6 else "protocol_esp"
         results["esp_native"] = {"success": False, "skipped": True,
-                                  "error": privileges.capability_reason("protocol_esp", caps)}
+                                  "ip_version": net.ip_version_label(family=family),
+                                  "error": privileges.capability_reason(capability, caps)}
 
-    if caps.get("protocol_gre"):
-        results["gre"] = gre_check(server_ip, timeout_sec=timeout_sec)
+    if (caps.get("protocol_gre") and family == socket.AF_INET) or (caps.get("protocol_gre_ipv6") and family == socket.AF_INET6):
+        results["gre"] = gre_check(server_ip, timeout_sec=timeout_sec, family=family, ipv6=family == socket.AF_INET6)
     else:
+        capability = "protocol_gre_ipv6" if family == socket.AF_INET6 else "protocol_gre"
         results["gre"] = {"success": False, "skipped": True,
-                           "error": privileges.capability_reason("protocol_gre", caps)}
+                           "ip_version": net.ip_version_label(family=family),
+                           "error": privileges.capability_reason(capability, caps)}
 
     return results

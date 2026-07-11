@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tp = sub.add_parser("throughput", help="run a client throughput test")
     p_tp.add_argument("--server-ip", required=True, help="server hostname or IP")
+    p_tp.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_tp.add_argument("--control-port", type=int, default=constants.DEFAULT_CONTROL_PORT)
     proto_group = p_tp.add_mutually_exclusive_group()
     proto_group.add_argument("--tcp", action="store_const", dest="transport", const="tcp")
@@ -75,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run a matrix of throughput tests for scripting/automation. Stores each "
                     "test's result locally and can POST each result as JSON to an HTTP(S) endpoint.")
     p_fb.add_argument("--server-ip", required=True, help="server hostname or IP")
+    p_fb.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_fb.add_argument("--control-port", type=int, default=constants.DEFAULT_CONTROL_PORT)
     p_fb.add_argument("--transports", default="tcp,udp",
                        help="comma-separated transports to test: tcp, udp (default: tcp,udp)")
@@ -128,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_mtr = sub.add_parser("mtr", help="MTR diagnostic to any IP/FQDN")
     p_mtr.add_argument("target", help="target IP address or FQDN")
+    p_mtr.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_mtr.add_argument("--protocol", choices=constants.MTR_PROTOCOLS, default="icmp")
     p_mtr.add_argument("--port", type=int, default=33434, help="port for TCP protocol mode")
     p_mtr.add_argument("--interval-ms", type=int, default=constants.MTR_DEFAULT_INTERVAL_MS,
@@ -140,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_conn = sub.add_parser("connectivity", help="ICMP/UDP/TCP connectivity check")
     p_conn.add_argument("--server-ip", required=True)
+    p_conn.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_conn.add_argument("--udp-port", type=int, default=constants.DEFAULT_UDP_PORT)
     p_conn.add_argument("--tcp-port", type=int, default=constants.DEFAULT_TCP_PORT)
     p_conn.add_argument("--timeout", type=float, default=2.0)
@@ -148,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pmtud = sub.add_parser("pmtud", help="Path MTU Discovery test against the server")
     p_pmtud.add_argument("--server-ip", required=True)
+    p_pmtud.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_pmtud.add_argument("--udp-port", type=int, default=constants.DEFAULT_UDP_PORT)
     p_pmtud.add_argument("--min-size", type=int, default=68)
     p_pmtud.add_argument("--max-size", type=int, default=9000)
@@ -157,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_proto = sub.add_parser("protocols", help="UDP/TCP/ICMP/ESP/ESP-UDP/GRE reachability matrix")
     p_proto.add_argument("--server-ip", required=True)
+    p_proto.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_proto.add_argument("--udp-port", type=int, default=constants.DEFAULT_UDP_PORT)
     p_proto.add_argument("--tcp-port", type=int, default=constants.DEFAULT_TCP_PORT)
     p_proto.add_argument("--timeout", type=float, default=2.0)
@@ -201,6 +207,7 @@ def cmd_throughput(args):
         procs=args.procs,
         acceptable_loss_pct=args.acceptable_loss,
         max_duration_sec=max_dur,
+        ipv6=args.ipv6,
     )
 
     stop_requested = threading.Event()
@@ -225,11 +232,12 @@ def cmd_throughput(args):
 
     if cfg.tune_udp:
         print(f"Running UDP loss-target tuning: server={args.server_ip} "
-              f"direction={cfg.direction} streams={cfg.streams} "
+              f"ip_version={cfg.ip_version} direction={cfg.direction} streams={cfg.streams} "
               f"acceptable_loss={cfg.acceptable_loss_pct}% max_duration={cfg.max_duration_sec}s", flush=True)
     else:
-        print(f"Running throughput test: server={args.server_ip} transport={cfg.transport} "
-              f"direction={cfg.direction} streams={cfg.streams} duration={cfg.duration_sec}s", flush=True)
+        print(f"Running throughput test: server={args.server_ip} ip_version={cfg.ip_version} "
+              f"transport={cfg.transport} direction={cfg.direction} streams={cfg.streams} "
+              f"duration={cfg.duration_sec}s", flush=True)
 
     try:
         summary = run_throughput_test(cfg, on_interval=on_interval, stop_requested=stop_requested,
@@ -268,6 +276,7 @@ def _print_throughput_summary(summary):
     if tuning:
         _print_tuning_summary(tuning)
     print("\n=== Throughput Test Summary ===")
+    print(f"  IP version: {summary.get('ip_version', 'IPv4')}")
     print(f"  path MTU: {summary.get('path_mtu')} bytes  "
           f"source={summary.get('pmtud', {}).get('path_mtu_source', 'unknown')}")
     print(f"  packet sizing: TCP MSS={summary.get('tcp_mss_bytes')} bytes  "
@@ -315,14 +324,15 @@ def cmd_fullbench(args):
             environment=args.environment,
             tool_version=args.tool_version,
             test_type=args.test_type,
+            ipv6=args.ipv6,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}")
         sys.exit(2)
 
     plan = cfg.build_plan()
-    print(f"fullbench plan: {len(plan)} test(s) -> {cfg.server_ip}")
-    print(f"identity: run_id={cfg.run_id} vm_name={cfg.vm_name} cloud={cfg.cloud} "
+    print(f"fullbench plan: {len(plan)} test(s) -> {cfg.server_ip} ({cfg.ip_version})")
+    print(f"identity: ip_version={cfg.ip_version} run_id={cfg.run_id} vm_name={cfg.vm_name} cloud={cfg.cloud} "
           f"environment={cfg.environment} test_type={cfg.test_type}")
     for i, spec in enumerate(plan, start=1):
         mode = (f"tune<= {cfg.acceptable_loss_pct}% (<= {cfg.udp_max_duration_sec:.0f}s)"
@@ -358,6 +368,7 @@ def cmd_fullbench(args):
 def _print_fullbench_summary(manifest):
     print("\n=== Full Benchmark Summary ===")
     print(f"  benchmark_id: {manifest['benchmark_id']}")
+    print(f"  IP version: {(manifest.get('pmtud') or {}).get('ip_version', manifest.get('ip_version', 'IPv4'))}")
     pmtud = manifest.get("pmtud") or {}
     print(f"  path MTU: {pmtud.get('path_mtu')} bytes  source={pmtud.get('path_mtu_source', 'unknown')}")
     print(f"  packet sizing: TCP MSS={pmtud.get('tcp_mss_bytes')} bytes  "
@@ -385,20 +396,21 @@ def _print_fullbench_summary(manifest):
 
 def cmd_mtr(args):
     caps = privileges.probe_capabilities()
-    if not caps.get("mtr"):
-        print(f"ERROR: MTR is unavailable: {privileges.capability_reason('mtr', caps)}")
+    mtr_capability = "mtr_ipv6_icmp" if args.ipv6 else "mtr"
+    if not caps.get(mtr_capability):
+        print(f"ERROR: MTR is unavailable: {privileges.capability_reason(mtr_capability, caps)}")
         print("MTR requires root/administrator privileges (raw ICMP socket).")
         sys.exit(1)
 
     try:
         runner = MtrRunner(target=args.target, protocol=args.protocol, port=args.port,
                             interval_ms=args.interval_ms, max_hops=args.max_hops,
-                            timeout_sec=args.timeout)
+                            timeout_sec=args.timeout, ipv6=args.ipv6)
     except (ValueError, MtrError) as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
 
-    print(f"MTR to {args.target} ({runner.target_ip}) via {args.protocol}, "
+    print(f"MTR to {args.target} ({runner.target_ip}) via {args.protocol} {runner.ip_version}, "
           f"interval={args.interval_ms}ms  (Ctrl+C to stop)\n", flush=True)
 
     stop_event = threading.Event()
@@ -425,6 +437,7 @@ def cmd_mtr(args):
     data = {
         "target": args.target,
         "target_ip": runner.target_ip,
+        "ip_version": runner.ip_version,
         "protocol": args.protocol,
         "interval_ms": args.interval_ms,
         "hops": last_snapshot,
@@ -454,15 +467,17 @@ def _print_mtr_table(snapshot, round_num):
 
 
 def _format_mtr_text(data):
-    lines = [f"MTR to {data['target']} ({data['target_ip']}) via {data['protocol']}", ""]
+    lines = [f"MTR to {data['target']} ({data['target_ip']}) {data.get('ip_version', 'IPv4')} via {data['protocol']}", ""]
     for hop in data["hops"]:
         lines.append(str(hop))
     return lines
 
 
 def cmd_connectivity(args):
-    print(f"Checking connectivity to {args.server_ip} (udp={args.udp_port} tcp={args.tcp_port})...")
-    result = connectivity.run_all(args.server_ip, args.udp_port, args.tcp_port, timeout_sec=args.timeout)
+    print(f"Checking {('IPv6' if args.ipv6 else 'IPv4')} connectivity to {args.server_ip} "
+          f"(udp={args.udp_port} tcp={args.tcp_port})...")
+    result = connectivity.run_all(args.server_ip, args.udp_port, args.tcp_port, timeout_sec=args.timeout,
+                                  ipv6=args.ipv6)
 
     icmp = result["icmp"]
     print(f"  ICMP: {'OK' if icmp['success'] else 'FAIL'}"
@@ -482,14 +497,16 @@ def cmd_connectivity(args):
 
 def cmd_pmtud(args):
     caps = privileges.probe_capabilities()
-    if not caps.get("pmtud"):
-        print(f"ERROR: PMTUD is unavailable: {privileges.capability_reason('pmtud', caps)}")
+    pmtud_capability = "pmtud_ipv6" if args.ipv6 else "pmtud"
+    if not caps.get(pmtud_capability):
+        print(f"ERROR: PMTUD is unavailable: {privileges.capability_reason(pmtud_capability, caps)}")
         sys.exit(1)
 
-    print(f"Running PMTUD to {args.server_ip}:{args.udp_port}...")
+    print(f"Running PMTUD ({'IPv6' if args.ipv6 else 'IPv4'}) to {args.server_ip}:{args.udp_port}...")
     try:
         result = run_pmtud(args.server_ip, udp_port=args.udp_port, min_size=args.min_size,
-                            max_size=args.max_size, timeout_sec=args.timeout)
+                            max_size=args.max_size, timeout_sec=args.timeout,
+                            ipv6=args.ipv6)
     except PmtudError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
@@ -507,8 +524,9 @@ def cmd_pmtud(args):
 
 
 def cmd_protocols(args):
-    print(f"Checking protocol reachability to {args.server_ip}...")
-    result = protocols.run_all(args.server_ip, args.udp_port, args.tcp_port, timeout_sec=args.timeout)
+    print(f"Checking {('IPv6' if args.ipv6 else 'IPv4')} protocol reachability to {args.server_ip}...")
+    result = protocols.run_all(args.server_ip, args.udp_port, args.tcp_port, timeout_sec=args.timeout,
+                               ipv6=args.ipv6)
 
     for key in ("icmp", "udp", "tcp", "esp_udp", "esp_native", "gre"):
         r = result.get(key, {})

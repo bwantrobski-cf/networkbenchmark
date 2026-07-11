@@ -14,22 +14,29 @@ import socket
 import subprocess
 import time
 
-from ..common import constants
+from ..common import constants, net
 
 _TIME_RE = re.compile(r"time[=<]\s*([\d.]+)\s*ms", re.IGNORECASE)
 _LOSS_RE = re.compile(r"([\d.]+)%\s*(?:packet)?\s*loss", re.IGNORECASE)
 
 
-def icmp_ping(target_ip: str, count: int = 4, timeout_sec: float = 2.0) -> dict:
+def icmp_ping(target_ip: str, count: int = 4, timeout_sec: float = 2.0,
+              family=socket.AF_INET, ipv6=False) -> dict:
+    if ipv6:
+        family = socket.AF_INET6
     system = platform.system()
     if system == "Windows":
-        cmd = ["ping", "-n", str(count), "-w", str(int(timeout_sec * 1000)), target_ip]
+        cmd = ["ping", "-6" if family == socket.AF_INET6 else "-4", "-n", str(count),
+               "-w", str(int(timeout_sec * 1000)), target_ip]
+    elif family == socket.AF_INET6 and system == "Darwin":
+        cmd = ["ping6", "-c", str(count), target_ip]
     else:
-        cmd = ["ping", "-c", str(count), target_ip]
+        cmd = ["ping", "-6" if family == socket.AF_INET6 else "-4", "-c", str(count), target_ip]
 
     result = {
         "success": False,
         "target": target_ip,
+        "ip_version": net.ip_version_label(family=family),
         "samples_ms": [],
         "loss_pct": None,
         "error": None,
@@ -54,16 +61,20 @@ def icmp_ping(target_ip: str, count: int = 4, timeout_sec: float = 2.0) -> dict:
     return result
 
 
-def udp_check(server_ip: str, udp_port: int, timeout_sec: float = 2.0) -> dict:
+def udp_check(server_ip: str, udp_port: int, timeout_sec: float = 2.0,
+              family=socket.AF_INET, ipv6=False) -> dict:
     nonce = secrets.token_bytes(8)
     payload = constants.CONNECTIVITY_MAGIC + nonce
 
-    result = {"success": False, "target": f"{server_ip}:{udp_port}", "rtt_ms": None, "error": None}
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if ipv6:
+        family = socket.AF_INET6
+    result = {"success": False, "target": f"{server_ip}:{udp_port}",
+              "ip_version": net.ip_version_label(family=family), "rtt_ms": None, "error": None}
+    sock = socket.socket(family, socket.SOCK_DGRAM)
     sock.settimeout(timeout_sec)
     try:
         send_time = time.time()
-        sock.sendto(payload, (server_ip, udp_port))
+        sock.sendto(payload, net.sockaddr(server_ip, udp_port, family))
         data, _ = sock.recvfrom(constants.BUFSZ)
         if data == payload:
             result["success"] = True
@@ -80,16 +91,20 @@ def udp_check(server_ip: str, udp_port: int, timeout_sec: float = 2.0) -> dict:
     return result
 
 
-def tcp_check(server_ip: str, tcp_port: int, timeout_sec: float = 2.0) -> dict:
+def tcp_check(server_ip: str, tcp_port: int, timeout_sec: float = 2.0,
+              family=socket.AF_INET, ipv6=False) -> dict:
     nonce = secrets.token_bytes(8)
     payload = constants.CONNECTIVITY_MAGIC + nonce
 
-    result = {"success": False, "target": f"{server_ip}:{tcp_port}", "rtt_ms": None, "error": None}
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if ipv6:
+        family = socket.AF_INET6
+    result = {"success": False, "target": f"{server_ip}:{tcp_port}",
+              "ip_version": net.ip_version_label(family=family), "rtt_ms": None, "error": None}
+    sock = socket.socket(family, socket.SOCK_STREAM)
     sock.settimeout(timeout_sec)
     try:
         send_time = time.time()
-        sock.connect((server_ip, tcp_port))
+        sock.connect(net.sockaddr(server_ip, tcp_port, family))
         sock.sendall(payload)
         data = sock.recv(len(payload))
         if data == payload:
@@ -108,10 +123,13 @@ def tcp_check(server_ip: str, tcp_port: int, timeout_sec: float = 2.0) -> dict:
 
 
 def run_all(server_ip: str, udp_port: int, tcp_port: int, icmp_count: int = 4,
-            timeout_sec: float = 2.0) -> dict:
+            timeout_sec: float = 2.0, family=socket.AF_INET, ipv6=False) -> dict:
+    if ipv6:
+        family = socket.AF_INET6
     return {
         "server_ip": server_ip,
-        "icmp": icmp_ping(server_ip, count=icmp_count, timeout_sec=timeout_sec),
-        "udp": udp_check(server_ip, udp_port, timeout_sec=timeout_sec),
-        "tcp": tcp_check(server_ip, tcp_port, timeout_sec=timeout_sec),
+        "ip_version": net.ip_version_label(family=family),
+        "icmp": icmp_ping(server_ip, count=icmp_count, timeout_sec=timeout_sec, family=family),
+        "udp": udp_check(server_ip, udp_port, timeout_sec=timeout_sec, family=family),
+        "tcp": tcp_check(server_ip, tcp_port, timeout_sec=timeout_sec, family=family),
     }

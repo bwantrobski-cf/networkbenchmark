@@ -15,6 +15,12 @@ ICMP_DEST_UNREACHABLE = 3
 ICMP_TIME_EXCEEDED = 11
 ICMP_FRAG_NEEDED_CODE = 4
 ICMP_PORT_UNREACHABLE_CODE = 3
+ICMPV6_DEST_UNREACHABLE = 1
+ICMPV6_PACKET_TOO_BIG = 2
+ICMPV6_TIME_EXCEEDED = 3
+ICMPV6_ECHO_REQUEST = 128
+ICMPV6_ECHO_REPLY = 129
+ICMPV6_PORT_UNREACHABLE_CODE = 4
 
 
 def checksum(data: bytes) -> int:
@@ -36,7 +42,38 @@ def build_icmp_echo(identifier: int, seq: int, payload: bytes = b"") -> bytes:
     return header + payload
 
 
-def parse_ip_header(data: bytes):
+def build_icmpv6_echo(src_ip: str, dst_ip: str, identifier: int, seq: int, payload: bytes = b"") -> bytes:
+    header = struct.pack("!BBHHH", ICMPV6_ECHO_REQUEST, 0, 0, identifier & 0xFFFF, seq & 0xFFFF)
+    body = header + payload
+    pseudo = (socket.inet_pton(socket.AF_INET6, src_ip)
+              + socket.inet_pton(socket.AF_INET6, dst_ip)
+              + struct.pack("!I3xB", len(body), socket.IPPROTO_ICMPV6))
+    csum = checksum(pseudo + body)
+    return struct.pack("!BBHHH", ICMPV6_ECHO_REQUEST, 0, csum,
+                       identifier & 0xFFFF, seq & 0xFFFF) + payload
+
+
+def parse_ipv6_header(data: bytes):
+    if len(data) < 40 or (data[0] >> 4) != 6:
+        return None
+    payload_len, next_header, hop_limit = struct.unpack("!HBB", data[4:8])
+    return {
+        "version": 6,
+        "ihl": 40,
+        "header_len": 40,
+        "ttl": hop_limit,
+        "hop_limit": hop_limit,
+        "proto": next_header,
+        "src": socket.inet_ntop(socket.AF_INET6, data[8:24]),
+        "dst": socket.inet_ntop(socket.AF_INET6, data[24:40]),
+        "total_len": 40 + payload_len,
+        "payload_len": payload_len,
+    }
+
+
+def parse_ip_header(data: bytes, family=None):
+    if family == socket.AF_INET6 or (data and (data[0] >> 4) == 6):
+        return parse_ipv6_header(data)
     if len(data) < 20:
         return None
     ver_ihl = data[0]
@@ -47,7 +84,9 @@ def parse_ip_header(data: bytes):
     src = socket.inet_ntoa(data[12:16])
     dst = socket.inet_ntoa(data[16:20])
     return {
+        "version": 4,
         "ihl": ihl,
+        "header_len": ihl,
         "ttl": ttl,
         "proto": proto,
         "src": src,
@@ -57,17 +96,17 @@ def parse_ip_header(data: bytes):
     }
 
 
-def parse_icmp_packet(raw: bytes):
-    """Parse a raw IP packet carrying an ICMP message. Returns a dict or None."""
-    ip = parse_ip_header(raw)
+def parse_icmp_packet(raw: bytes, family=None):
+    """Parse a raw IPv4/IPv6 packet carrying ICMP or ICMPv6."""
+    ip = parse_ip_header(raw, family=family)
     if ip is None:
         return None
-    icmp_data = raw[ip["ihl"]:]
+    icmp_data = raw[ip["header_len"]:]
     if len(icmp_data) < 8:
         return None
 
     icmp_type, icmp_code, _icmp_csum, field1, field2 = struct.unpack("!BBHHH", icmp_data[:8])
-
+    is_v6 = ip.get("version") == 6
     result = {
         "ip_src": ip["src"],
         "ip_ttl": ip["ttl"],
@@ -77,17 +116,25 @@ def parse_icmp_packet(raw: bytes):
         "seq": field2,
     }
 
-    if icmp_type in (ICMP_DEST_UNREACHABLE, ICMP_TIME_EXCEEDED):
-        embedded = icmp_data[8:]
-        embedded_ip = parse_ip_header(embedded)
-        if embedded_ip:
-            result["embedded_ip"] = embedded_ip
-            payload_start = embedded_ip["ihl"]
-            result["embedded_payload"] = embedded[payload_start:payload_start + 8]
-        if icmp_type == ICMP_DEST_UNREACHABLE and icmp_code == ICMP_FRAG_NEEDED_CODE:
-            result["next_hop_mtu"] = field2
+    embedded = icmp_data[8:]
+    embedded_ip = parse_ip_header(embedded)
+    if embedded_ip:
+        result["embedded_ip"] = embedded_ip
+        payload_start = embedded_ip["header_len"]
+        result["embedded_payload"] = embedded[payload_start:payload_start + 8]
+    if ((not is_v6 and icmp_type == ICMP_DEST_UNREACHABLE and icmp_code == ICMP_FRAG_NEEDED_CODE)
+            or (is_v6 and icmp_type == ICMPV6_PACKET_TOO_BIG)):
+        result["next_hop_mtu"] = (struct.unpack("!I", icmp_data[4:8])[0]
+                                   if is_v6 else field2)
 
     return result
+
+
+def build_ipv6_header(src_ip: str, dst_ip: str, next_header: int, payload_len: int, hop_limit: int) -> bytes:
+    first_word = (6 << 28)
+    return struct.pack("!IHBB16s16s", first_word, payload_len, next_header, hop_limit,
+                       socket.inet_pton(socket.AF_INET6, src_ip),
+                       socket.inet_pton(socket.AF_INET6, dst_ip))
 
 
 def build_ip_header(src_ip: str, dst_ip: str, proto: int, payload_len: int, ttl: int, ident: int) -> bytes:
@@ -117,6 +164,19 @@ def build_tcp_syn(src_ip: str, dst_ip: str, src_port: int, dst_port: int, seq_nu
     header = struct.pack("!HHIIHHHH", src_port, dst_port, seq_num, 0,
                           offset_res_flags, window, csum, 0)
     return header
+
+
+def build_tcp_syn_ipv6(src_ip: str, dst_ip: str, src_port: int, dst_port: int, seq_num: int) -> bytes:
+    offset_res_flags = (5 << 12) | 0x02
+    window = 65535
+    header = struct.pack("!HHIIHHHH", src_port, dst_port, seq_num, 0,
+                         offset_res_flags, window, 0, 0)
+    pseudo_header = (socket.inet_pton(socket.AF_INET6, src_ip)
+                     + socket.inet_pton(socket.AF_INET6, dst_ip)
+                     + struct.pack("!I3xB", len(header), socket.IPPROTO_TCP))
+    csum = checksum(pseudo_header + header)
+    return struct.pack("!HHIIHHHH", src_port, dst_port, seq_num, 0,
+                       offset_res_flags, window, csum, 0)
 
 
 def parse_tcp_header(data: bytes):
@@ -150,11 +210,11 @@ def parse_tcp_header_from_ip(raw: bytes):
     return ip_info, tcp_info
 
 
-def get_default_source_ip(dst_ip: str) -> str:
+def get_default_source_ip(dst_ip: str, family=socket.AF_INET) -> str:
     """Determine the local source IP that would be used to reach dst_ip."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(family, socket.SOCK_DGRAM)
     try:
-        s.connect((dst_ip, 80))
+        s.connect((dst_ip, 80, 0, 0) if family == socket.AF_INET6 else (dst_ip, 80))
         return s.getsockname()[0]
     finally:
         s.close()

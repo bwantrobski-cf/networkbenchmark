@@ -9,7 +9,7 @@ import socket
 import threading
 import time
 
-from ..common import constants, tcp_info
+from ..common import constants, net, tcp_info
 from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
 from ..transport.control_connection import ControlChannel
 
@@ -103,12 +103,14 @@ class ThroughputSession:
 def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, port: int):
     """For stream indices 1..N-1 (dedicated, non-shared ports)."""
     transport = session.params["transport"]
+    family = session.params.get("family", socket.AF_INET)
 
     def _tcp_worker():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.socket(family, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((ctx.config.bind, port))
+            net.configure_ipv6_socket(sock)
+            sock.bind(net.bind_address(ctx.config.bind, port, family))
             sock.listen(1)
         except OSError as exc:
             ctx.log(f"session {session.run_id[:8]}: failed to bind tcp port {port}: {exc}")
@@ -131,10 +133,11 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
         session.attach_stream(index, conn, addr=addr, spawn_receiver=True)
 
     def _udp_worker():
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock = socket.socket(family, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            sock.bind((ctx.config.bind, port))
+            net.configure_ipv6_socket(sock)
+            sock.bind(net.bind_address(ctx.config.bind, port, family))
         except OSError as exc:
             ctx.log(f"session {session.run_id[:8]}: failed to bind udp port {port}: {exc}")
             return
@@ -155,7 +158,7 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
 
 def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec,
                         shared, start_flag, stop_flag, ready_q, rate_value=None,
-                        path_mtu=None):
+                        path_mtu=None, family=socket.AF_INET):
     """Worker process handling a subset of streams (indices >= 1).
 
     Runs in phases so the main process never races the client:
@@ -171,15 +174,17 @@ def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec
     for i, port in assignments:
         try:
             if transport == "tcp":
-                ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                ls = socket.socket(family, socket.SOCK_STREAM)
                 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                ls.bind((bind, port))
+                net.configure_ipv6_socket(ls)
+                ls.bind(net.bind_address(bind, port, family))
                 ls.listen(1)
                 ls.settimeout(30.0)
             else:
-                ls = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                ls = socket.socket(family, socket.SOCK_DGRAM)
                 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                ls.bind((bind, port))
+                net.configure_ipv6_socket(ls)
+                ls.bind(net.bind_address(bind, port, family))
             listeners[i] = ls
         except OSError as exc:
             ready_q.put(("error", i, str(exc)))
@@ -254,7 +259,7 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
             target=_server_worker_proc,
             args=(group, session.run_id, role, transport, ctx.config.bind, duration_sec,
                   session.shared, session.start_flag, session.stop_flag, session.worker_ready_q,
-                  session.rate_value, path_mtu),
+                  session.rate_value, path_mtu, params.get("family", socket.AF_INET)),
             daemon=True)
         p.start()
         session.worker_procs.append(p)
@@ -375,6 +380,8 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
 
         run_id = msg["run_id"]
         params = msg["params"]
+        params["family"] = sock.family
+        params["ip_version"] = net.ip_version_label(family=sock.family)
         n = max(1, int(params.get("streams", 1)))
         transport = params.get("transport", "tcp")
         params["streams"] = n

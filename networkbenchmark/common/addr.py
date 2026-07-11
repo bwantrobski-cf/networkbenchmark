@@ -3,21 +3,14 @@
 import ipaddress
 import socket
 
+from .net import resolve_host as resolve_host_for_family
+
 CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
-def resolve_host(host: str) -> str:
-    """Resolve a hostname or IP string to an IP address string."""
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        pass
-
-    try:
-        return socket.gethostbyname(host)
-    except socket.gaierror as exc:
-        raise ValueError(f"unable to resolve hostname '{host}': {exc}") from exc
+def resolve_host(host: str, family=socket.AF_INET) -> str:
+    """Resolve a hostname or IP string using the requested address family."""
+    return resolve_host_for_family(host, family=family)
 
 
 def is_rfc1918_or_cgnat(ip: str) -> bool:

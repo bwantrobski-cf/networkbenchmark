@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from ..common import addr, constants, logging_store
+from ..common import addr, constants, logging_store, net
 from ..diagnostics import connectivity
 from ..diagnostics.pmtud import PmtudError, run_pmtud
 from ..transport import stream_worker
@@ -93,8 +93,11 @@ class FullBenchConfig:
                  export_url=None, export_method="POST", export_headers=None,
                  export_slim=False, export_timeout_sec=15.0, label=None,
                  run_id=None, vm_name=None, cloud=None, environment=None,
-                 tool_version=1, test_type="networkbenchmark"):
+                 tool_version=1, test_type="networkbenchmark", ipv6=False):
         self.server_ip = server_ip
+        self.ipv6 = bool(ipv6)
+        self.family = net.family_for_ipv6(self.ipv6)
+        self.ip_version = net.ip_version_label(family=self.family)
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transports = list(transports)
         self.directions = list(directions)
@@ -213,13 +216,14 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     started_at = datetime.now(timezone.utc).isoformat()
     pmtud_udp_port = cfg.start_port or constants.DEFAULT_UDP_PORT
     try:
-        pmtud_server_ip = addr.resolve_host(cfg.server_ip)
-        pmtud_result = run_pmtud(pmtud_server_ip, udp_port=pmtud_udp_port)
+        pmtud_server_ip = addr.resolve_host(cfg.server_ip, family=cfg.family)
+        pmtud_result = run_pmtud(pmtud_server_ip, udp_port=pmtud_udp_port, family=cfg.family)
     except (PmtudError, OSError, ValueError) as exc:
         pmtud_server_ip = cfg.server_ip
         pmtud_result = {
             "server_ip": pmtud_server_ip,
             "udp_port": pmtud_udp_port,
+            "ip_version": cfg.ip_version,
             "success": False,
             "connectivity_confirmed": False,
             "path_mtu": None,
@@ -229,9 +233,10 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "error": str(exc),
         }
 
+    pmtud_result.setdefault("ip_version", cfg.ip_version)
     pmtud_fallback_used = False
     if not pmtud_result.get("success") or not isinstance(pmtud_result.get("path_mtu"), int):
-        ping_result = connectivity.icmp_ping(pmtud_server_ip)
+        ping_result = connectivity.icmp_ping(pmtud_server_ip, family=cfg.family)
         pmtud_result["icmp_ping"] = ping_result
         if ping_result.get("success"):
             pmtud_fallback_used = True
@@ -243,10 +248,10 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             pmtud_result["path_mtu_source"] = "unavailable"
 
     path_mtu = pmtud_result.get("path_mtu")
-    tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(path_mtu)
-    udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(path_mtu)
+    tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(path_mtu, family=cfg.family)
+    udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(path_mtu, family=cfg.family)
     pmtud_text_lines = [
-        f"PMTUD to {pmtud_server_ip}:{pmtud_udp_port}",
+        f"PMTUD to {pmtud_server_ip}:{pmtud_udp_port} ip_version={cfg.ip_version}",
         f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
         f"path_mtu={path_mtu} payload={pmtud_result.get('path_mtu_payload_bytes')}",
         f"path_mtu_source={pmtud_result.get('path_mtu_source', 'pmtud')} fallback_used={pmtud_fallback_used}",
@@ -258,6 +263,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     pmtud_info = {
         "server_ip": pmtud_server_ip,
         "udp_port": pmtud_udp_port,
+        "ip_version": cfg.ip_version,
         "success": bool(pmtud_result.get("success")),
         "path_mtu": path_mtu,
         "tcp_mss_bytes": tcp_mss_bytes,
@@ -304,6 +310,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             max_duration_sec=cfg.udp_max_duration_sec,
             path_mtu=path_mtu,
             pmtud_info=pmtud_info,
+            ipv6=cfg.ipv6,
         )
 
         # Each individual test carries its own unique recorded_at timestamp.
@@ -311,6 +318,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             # Ingestion / identity metadata (worker-results-api conventions).
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "test_type": cfg.test_type,
+            "ip_version": cfg.ip_version,
             "run_id": cfg.run_id,
             "vm_name": cfg.vm_name,
             "cloud": cfg.cloud,
@@ -379,6 +387,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
 
     manifest = {
         "benchmark_id": benchmark_id,
+        "ip_version": cfg.ip_version,
         "label": cfg.label,
         "server": cfg.server_ip,
         "run_id": cfg.run_id,
@@ -406,7 +415,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     }
 
     text_lines = [
-        f"fullbench {benchmark_id} -> {cfg.server_ip}",
+        f"fullbench {benchmark_id} -> {cfg.server_ip} ip_version={cfg.ip_version}",
         f"PMTUD path MTU: {path_mtu} bytes",
         f"Packet sizing: TCP MSS={tcp_mss_bytes} bytes  UDP datagram={udp_datagram_bytes} bytes",
         f"PMTUD local log: {pmtud_json_path}",

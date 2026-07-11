@@ -3,10 +3,11 @@ echo responders (connectivity, NAT-T, ESP/GRE), and dispatches accepted
 control connections to transport.throughput_session.
 """
 
+import select
 import socket
 import threading
 
-from ..common import privileges
+from ..common import net, privileges
 from . import echo_responders
 from .state import ServerConfig, ServerContext
 from .throughput_session import handle_control_connection
@@ -15,25 +16,34 @@ __all__ = ["ServerConfig", "run_server"]
 
 
 def _control_listener(ctx: ServerContext):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((ctx.config.bind, ctx.config.control_port))
-    sock.listen(32)
-    sock.settimeout(0.5)
-    ctx.log(f"control listener on {ctx.config.bind}:{ctx.config.control_port}")
+    sockets = net.open_server_sockets(ctx.config.bind, ctx.config.control_port, socket.SOCK_STREAM,
+                                      listener=True, log=ctx.log, service="control")
+    if not sockets:
+        ctx.log(f"control: no IPv4 or IPv6 listener available on port {ctx.config.control_port}")
+        return
+    ctx.log(f"control listener families={','.join(net.family_label(sock.family) for sock in sockets)} "
+            f"port={ctx.config.control_port}")
 
     while not ctx.stop_event.is_set():
         try:
-            conn, addr = sock.accept()
-        except socket.timeout:
-            continue
-        except OSError as exc:
+            readable, _, _ = select.select(sockets, [], [], 0.5)
+        except (OSError, ValueError) as exc:
             ctx.log(f"control listener error: {exc}")
             break
-        ctx.log(f"control connection from {addr}")
-        threading.Thread(target=handle_control_connection, args=(ctx, conn, addr), daemon=True).start()
+        for listener in readable:
+            try:
+                conn, addr = listener.accept()
+            except OSError as exc:
+                ctx.log(f"control {net.family_label(listener.family)} accept error: {exc}")
+                continue
+            ctx.log(f"control connection from {addr}")
+            threading.Thread(target=handle_control_connection, args=(ctx, conn, addr), daemon=True).start()
 
-    sock.close()
+    for sock in sockets:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def run_server(config: ServerConfig, stop_event: threading.Event = None, on_log=None, block: bool = True):
@@ -49,7 +59,9 @@ def run_server(config: ServerConfig, stop_event: threading.Event = None, on_log=
         ctx.stop_event = stop_event
 
     ctx.log(f"capabilities: is_admin={caps['is_admin']} icmp_raw={caps['icmp_raw']} "
-            f"esp_raw={caps['esp_raw']} gre_raw={caps['gre_raw']}")
+            f"icmpv6_raw={caps.get('icmpv6_raw', False)} esp_raw={caps['esp_raw']} "
+            f"espv6_raw={caps.get('espv6_raw', False)} gre_raw={caps['gre_raw']} "
+            f"grev6_raw={caps.get('grev6_raw', False)}")
 
     threads = [
         threading.Thread(target=_control_listener, args=(ctx,), daemon=True),
@@ -58,12 +70,12 @@ def run_server(config: ServerConfig, stop_event: threading.Event = None, on_log=
         threading.Thread(target=echo_responders.natt_udp_listener, args=(ctx,), daemon=True),
     ]
 
-    if caps.get("protocol_esp"):
+    if caps.get("protocol_esp") or caps.get("protocol_esp_ipv6"):
         threads.append(threading.Thread(target=echo_responders.esp_native_listener, args=(ctx,), daemon=True))
     else:
         ctx.log(f"ESP native responder disabled: {privileges.capability_reason('protocol_esp', caps)}")
 
-    if caps.get("protocol_gre"):
+    if caps.get("protocol_gre") or caps.get("protocol_gre_ipv6"):
         threads.append(threading.Thread(target=echo_responders.gre_listener, args=(ctx,), daemon=True))
     else:
         ctx.log(f"GRE responder disabled: {privileges.capability_reason('protocol_gre', caps)}")

@@ -15,7 +15,7 @@ import secrets
 import socket
 import time
 
-from ..common import constants
+from ..common import constants, net
 from . import packetutils as pkt
 
 MIN_PROBE_SIZE = 68
@@ -28,10 +28,22 @@ class PmtudError(Exception):
     pass
 
 
-def _set_dont_fragment(sock: socket.socket):
+def _set_dont_fragment(sock: socket.socket, family=socket.AF_INET):
     system = platform.system()
     try:
-        if system == "Linux":
+        if family == socket.AF_INET6:
+            if system == "Linux":
+                option = getattr(socket, " IPV6_MTU_DISCOVER".strip(), 23)
+                sock.setsockopt(socket.IPPROTO_IPV6, option, 2)
+            elif system == "Darwin":
+                option = getattr(socket, " IPV6_DONTFRAG".strip(), 62)
+                sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
+            elif system == "Windows":
+                option = getattr(socket, " IPV6_DONTFRAGMENT".strip(), 14)
+                sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
+            else:
+                raise PmtudError(f"don't-fragment option not implemented for platform {system}")
+        elif system == "Linux":
             IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
             IP_PMTUDISC_DO = 2
             sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
@@ -47,7 +59,7 @@ def _set_dont_fragment(sock: socket.socket):
         raise PmtudError(f"failed to set don't-fragment socket option: {exc}")
 
 
-def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec):
+def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec, family):
     """Return dict: {status: 'ok'|'too_big'|'timeout', rtt_ms, next_hop_mtu}."""
     header_len = len(constants.CONNECTIVITY_MAGIC) + 8
     pad_len = max(0, size - header_len)
@@ -55,7 +67,7 @@ def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec):
 
     send_time = time.time()
     try:
-        udp_sock.sendto(payload, (server_ip, udp_port))
+        udp_sock.sendto(payload, net.sockaddr(server_ip, udp_port, family))
     except OSError as exc:
         # EMSGSIZE (or similar) means the packet is too big for the local interface MTU
         return {"status": "too_big", "rtt_ms": None, "next_hop_mtu": None, "error": str(exc)}
@@ -78,10 +90,13 @@ def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec):
         except OSError:
             continue
 
-        parsed = pkt.parse_icmp_packet(raw)
+        parsed = pkt.parse_icmp_packet(raw, family=family)
         if not parsed:
             continue
-        if parsed["type"] == pkt.ICMP_DEST_UNREACHABLE and parsed["code"] == pkt.ICMP_FRAG_NEEDED_CODE:
+        too_big = ((family == socket.AF_INET and parsed["type"] == pkt.ICMP_DEST_UNREACHABLE
+                    and parsed["code"] == pkt.ICMP_FRAG_NEEDED_CODE)
+                   or (family == socket.AF_INET6 and parsed["type"] == pkt.ICMPV6_PACKET_TOO_BIG))
+        if too_big:
             embedded_ip = parsed.get("embedded_ip")
             if embedded_ip and embedded_ip["dst"] == server_ip:
                 return {"status": "too_big", "rtt_ms": None, "next_hop_mtu": parsed.get("next_hop_mtu") or None}
@@ -92,16 +107,21 @@ def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec):
 def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
               min_size: int = MIN_PROBE_SIZE, max_size: int = MAX_PROBE_SIZE,
               timeout_sec: float = DEFAULT_TIMEOUT_SEC,
-              attempts_per_size: int = DEFAULT_ATTEMPTS_PER_SIZE) -> dict:
+              attempts_per_size: int = DEFAULT_ATTEMPTS_PER_SIZE,
+              family=socket.AF_INET, ipv6=False) -> dict:
+    if ipv6:
+        family = socket.AF_INET6
+    server_ip = net.resolve_host(server_ip, family=family)
+    icmp_protocol = socket.IPPROTO_ICMPV6 if family == socket.AF_INET6 else socket.IPPROTO_ICMP
     try:
-        icmp_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        icmp_sock = socket.socket(family, socket.SOCK_RAW, icmp_protocol)
     except (PermissionError, OSError) as exc:
         raise PmtudError(f"unable to open raw ICMP socket (requires root/admin): {exc}")
     icmp_sock.settimeout(0.05)
 
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock = socket.socket(family, socket.SOCK_DGRAM)
     udp_sock.settimeout(0.05)
-    _set_dont_fragment(udp_sock)
+    _set_dont_fragment(udp_sock, family=family)
 
     trace = []
     connectivity_confirmed = False
@@ -111,7 +131,7 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
         nonlocal connectivity_confirmed, reported_mtu_hint
         last = None
         for _ in range(attempts_per_size):
-            last = _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec)
+            last = _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec, family)
             trace.append({"size": size, **last})
             if last["status"] in ("ok", "too_big"):
                 connectivity_confirmed = True
@@ -126,6 +146,7 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
             return {
                 "server_ip": server_ip,
                 "udp_port": udp_port,
+                "ip_version": net.ip_version_label(family=family),
                 "success": False,
                 "connectivity_confirmed": connectivity_confirmed,
                 "path_mtu": None,
@@ -150,9 +171,10 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
         return {
             "server_ip": server_ip,
             "udp_port": udp_port,
+            "ip_version": net.ip_version_label(family=family),
             "success": True,
             "connectivity_confirmed": connectivity_confirmed,
-            "path_mtu": low + 28,  # add back IP(20)+UDP(8) header bytes for a conventional MTU figure
+            "path_mtu": low + (48 if family == socket.AF_INET6 else 28),  # add back IP+UDP headers
             "path_mtu_payload_bytes": low,
             "reported_next_hop_mtu": reported_mtu_hint,
             "trace": trace,

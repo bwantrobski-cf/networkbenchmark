@@ -38,6 +38,7 @@ st.set_page_config(page_title="NetworkBenchmark", layout="wide")
 def _init_state():
     defaults = {
         "server_ip": "",
+        "ipv6": False,
         "udp_port": constants.DEFAULT_UDP_PORT,
         "tcp_port": constants.DEFAULT_TCP_PORT,
         "control_port": constants.DEFAULT_CONTROL_PORT,
@@ -54,6 +55,7 @@ def _init_state():
         "mtr_snapshot": [],
         "mtr_round": 0,
         "mtr_target_ip": None,
+        "mtr_ip_version": "IPv4",
         "mtr_error": None,
         "pmtud_result": None,
         "protocols_result": None,
@@ -83,16 +85,20 @@ def _cap_badge(name: str, label: str = None):
 def render_header():
     st.title("NetworkBenchmark")
 
-    col1, col2, col3 = st.columns([3, 1, 2])
+    col1, col2, col3, col4 = st.columns([3, 1, 1, 2])
     with col1:
         st.session_state.server_ip = st.text_input(
             "Server IP / hostname", value=st.session_state.server_ip,
             help="Independent of the MTR target below; persists across tabs.")
     with col2:
+        st.session_state.ipv6 = st.checkbox("Use IPv6", value=st.session_state.ipv6,
+                                            help="Use IPv6 for the selected client test instead of the default IPv4.")
+        st.caption(f"Selected IP version: {'IPv6' if st.session_state.ipv6 else 'IPv4'}")
+    with col3:
         st.write("")
         st.write("")
         check_clicked = st.button("Check Connectivity", use_container_width=True)
-    with col3:
+    with col4:
         st.write("")
         admin = CAPS["is_admin"]
         if admin:
@@ -106,7 +112,8 @@ def render_header():
         else:
             with st.spinner("Checking connectivity..."):
                 st.session_state.connectivity_result = connectivity.run_all(
-                    st.session_state.server_ip, st.session_state.udp_port, st.session_state.tcp_port)
+                    st.session_state.server_ip, st.session_state.udp_port, st.session_state.tcp_port,
+                    ipv6=st.session_state.ipv6)
 
     result = st.session_state.connectivity_result
     if result:
@@ -118,12 +125,13 @@ def render_header():
                    f"{udp['rtt_ms']:.2f} ms" if udp.get("rtt_ms") else udp.get("error"))
         c3.metric("TCP", "OK" if tcp["success"] else "FAIL",
                    f"{tcp['rtt_ms']:.2f} ms" if tcp.get("rtt_ms") else tcp.get("error"))
+        st.caption(f"Connectivity address family: {result.get('ip_version', 'IPv4')}")
 
     with st.expander("Capabilities"):
-        _cap_badge("mtr", "MTR (ICMP/UDP/TCP hop discovery)")
-        _cap_badge("pmtud", "PMTUD")
-        _cap_badge("protocol_esp", "IPSEC (native ESP)")
-        _cap_badge("protocol_gre", "GRE")
+        _cap_badge("mtr_ipv6_icmp" if st.session_state.ipv6 else "mtr", "MTR (ICMP/UDP/TCP hop discovery)")
+        _cap_badge("pmtud_ipv6" if st.session_state.ipv6 else "pmtud", "PMTUD")
+        _cap_badge("protocol_esp_ipv6" if st.session_state.ipv6 else "protocol_esp", "IPSEC (native ESP)")
+        _cap_badge("protocol_gre_ipv6" if st.session_state.ipv6 else "protocol_gre", "GRE")
         st.caption("Basic ICMP/UDP/TCP checks and IPSEC (UDP over ESP) do not require elevated privileges.")
 
     st.divider()
@@ -209,6 +217,7 @@ def render_throughput_tab():
             acceptable_loss_pct=(float(acceptable_loss)
                                  if (transport == "UDP" and tune_enabled) else None),
             max_duration_sec=float(duration),
+            ipv6=st.session_state.ipv6,
         )
         stop_event = threading.Event()
         live_list = []
@@ -269,6 +278,7 @@ def render_throughput_tab():
     summary = st.session_state.tp_summary
     if summary:
         st.success("Test complete")
+        st.caption(f"Address family: {summary.get('ip_version', 'IPv4')}")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Send", f"{summary['send_mbps']:.2f} Mbps")
         m2.metric("Recv", f"{summary['recv_mbps']:.2f} Mbps")
@@ -358,8 +368,9 @@ def _mtr_worker(runner, stop_event, state_holder):
 
 def render_mtr_section():
     st.markdown("#### MTR")
-    if not CAPS.get("mtr"):
-        st.warning(f"MTR unavailable: {privileges.capability_reason('mtr', CAPS)}. "
+    mtr_capability = "mtr_ipv6_icmp" if st.session_state.ipv6 else "mtr"
+    if not CAPS.get(mtr_capability):
+        st.warning(f"MTR unavailable: {privileges.capability_reason(mtr_capability, CAPS)}. "
                    "Run with elevated privileges (root/administrator) to enable.")
 
     running = st.session_state.mtr_running
@@ -377,13 +388,14 @@ def render_mtr_section():
                              value=constants.MTR_DEFAULT_INTERVAL_MS, step=50, disabled=running)
 
     bcol1, bcol2 = st.columns(2)
-    start_disabled = running or not CAPS.get("mtr") or not target
+    start_disabled = running or not CAPS.get(mtr_capability) or not target
     start_clicked = bcol1.button("Start MTR", type="primary", disabled=start_disabled, use_container_width=True)
     stop_clicked = bcol2.button("Stop MTR", disabled=not running, use_container_width=True)
 
     if start_clicked:
         try:
-            runner = MtrRunner(target=target, protocol=mtr_proto, port=int(mtr_port), interval_ms=int(interval_ms))
+            runner = MtrRunner(target=target, protocol=mtr_proto, port=int(mtr_port), interval_ms=int(interval_ms),
+                               ipv6=st.session_state.ipv6)
         except (ValueError, MtrError) as exc:
             st.error(str(exc))
             runner = None
@@ -397,6 +409,7 @@ def render_mtr_section():
             st.session_state.mtr_running = True
             st.session_state.mtr_target = target
             st.session_state.mtr_target_ip = runner.target_ip
+            st.session_state.mtr_ip_version = runner.ip_version
             st.session_state.mtr_error = None
             th.start()
             st.rerun()
@@ -422,7 +435,8 @@ def render_mtr_section():
         st.error(st.session_state.mtr_error)
 
     if st.session_state.mtr_snapshot:
-        st.caption(f"Target: {st.session_state.mtr_target_ip}   Round: {st.session_state.mtr_round}")
+        st.caption(f"Target: {st.session_state.mtr_target_ip}   IP version: {st.session_state.mtr_ip_version}   "
+                   f"Round: {st.session_state.mtr_round}")
         df = pd.DataFrame(st.session_state.mtr_snapshot)
         display_cols = ["ttl", "ip", "hostname", "asn", "asn_description", "whois_org",
                          "loss_pct", "best", "avg", "worst", "stddev", "jitter"]
@@ -431,8 +445,9 @@ def render_mtr_section():
 
         if not st.session_state.mtr_running and st.button("Save MTR log"):
             data = {"target": st.session_state.mtr_target, "target_ip": st.session_state.mtr_target_ip,
-                    "protocol": mtr_proto, "hops": st.session_state.mtr_snapshot}
-            text_lines = [f"MTR to {data['target']} ({data['target_ip']})"] + [str(h) for h in data["hops"]]
+                    "ip_version": st.session_state.mtr_ip_version, "protocol": mtr_proto,
+                    "hops": st.session_state.mtr_snapshot}
+            text_lines = [f"MTR to {data['target']} ({data['target_ip']}) {data['ip_version']}"] + [str(h) for h in data["hops"]]
             json_path, log_path = logging_store.save_result(constants.TEST_TYPE_MTR, data, text_lines)
             st.success(f"Saved: {json_path}")
 
@@ -443,17 +458,19 @@ def render_mtr_section():
 
 def render_pmtud_section():
     st.markdown("#### PMTUD")
-    if not CAPS.get("pmtud"):
-        st.warning(f"PMTUD unavailable: {privileges.capability_reason('pmtud', CAPS)}")
+    pmtud_capability = "pmtud_ipv6" if st.session_state.ipv6 else "pmtud"
+    if not CAPS.get(pmtud_capability):
+        st.warning(f"PMTUD unavailable: {privileges.capability_reason(pmtud_capability, CAPS)}")
     if not st.session_state.server_ip:
         st.info("Enter a Server IP above.")
         return
 
-    if st.button("Run PMTUD", disabled=not CAPS.get("pmtud")):
+    if st.button("Run PMTUD", disabled=not CAPS.get(pmtud_capability)):
         with st.spinner("Running PMTUD..."):
             try:
                 st.session_state.pmtud_result = run_pmtud(
-                    st.session_state.server_ip, udp_port=st.session_state.udp_port)
+                    st.session_state.server_ip, udp_port=st.session_state.udp_port,
+                    ipv6=st.session_state.ipv6)
             except PmtudError as exc:
                 st.session_state.pmtud_result = {"success": False, "error": str(exc)}
 
@@ -481,7 +498,8 @@ def render_protocols_section():
     if st.button("Run Protocol Checks"):
         with st.spinner("Testing protocols..."):
             st.session_state.protocols_result = protocols.run_all(
-                st.session_state.server_ip, st.session_state.udp_port, st.session_state.tcp_port)
+                st.session_state.server_ip, st.session_state.udp_port, st.session_state.tcp_port,
+                ipv6=st.session_state.ipv6)
 
     result = st.session_state.protocols_result
     if result:
