@@ -30,6 +30,8 @@ def icmp_ping(target_ip: str, count: int = 4, timeout_sec: float = 2.0,
                "-w", str(int(timeout_sec * 1000)), target_ip]
     elif family == socket.AF_INET6 and system == "Darwin":
         cmd = ["ping6", "-c", str(count), target_ip]
+    elif family == socket.AF_INET and system == "Darwin":
+        cmd = ["ping", "-c", str(count), target_ip]
     else:
         cmd = ["ping", "-6" if family == socket.AF_INET6 else "-4", "-c", str(count), target_ip]
 
@@ -57,6 +59,8 @@ def icmp_ping(target_ip: str, count: int = 4, timeout_sec: float = 2.0,
     except subprocess.TimeoutExpired:
         result["error"] = "ping timed out"
         result["loss_pct"] = 100.0
+    except OSError as exc:
+        result["error"] = str(exc)
 
     return result
 
@@ -70,9 +74,10 @@ def udp_check(server_ip: str, udp_port: int, timeout_sec: float = 2.0,
         family = socket.AF_INET6
     result = {"success": False, "target": f"{server_ip}:{udp_port}",
               "ip_version": net.ip_version_label(family=family), "rtt_ms": None, "error": None}
-    sock = socket.socket(family, socket.SOCK_DGRAM)
-    sock.settimeout(timeout_sec)
+    sock = None
     try:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.settimeout(timeout_sec)
         send_time = time.time()
         sock.sendto(payload, net.sockaddr(server_ip, udp_port, family))
         data, _ = sock.recvfrom(constants.BUFSZ)
@@ -86,7 +91,8 @@ def udp_check(server_ip: str, udp_port: int, timeout_sec: float = 2.0,
     except OSError as exc:
         result["error"] = str(exc)
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
 
     return result
 
@@ -100,9 +106,10 @@ def tcp_check(server_ip: str, tcp_port: int, timeout_sec: float = 2.0,
         family = socket.AF_INET6
     result = {"success": False, "target": f"{server_ip}:{tcp_port}",
               "ip_version": net.ip_version_label(family=family), "rtt_ms": None, "error": None}
-    sock = socket.socket(family, socket.SOCK_STREAM)
-    sock.settimeout(timeout_sec)
+    sock = None
     try:
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(timeout_sec)
         send_time = time.time()
         sock.connect(net.sockaddr(server_ip, tcp_port, family))
         sock.sendall(payload)
@@ -117,7 +124,8 @@ def tcp_check(server_ip: str, tcp_port: int, timeout_sec: float = 2.0,
     except OSError as exc:
         result["error"] = str(exc)
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
 
     return result
 

@@ -50,6 +50,7 @@ def _init_state():
         "tp_live": [],
         "tp_summary": None,
         "tp_error": None,
+        "tp_launch_spec": None,
         "fb_running": False,
         "fb_stop_event": None,
         "fb_thread": None,
@@ -208,6 +209,7 @@ def render_throughput_tab():
                                 key="tp_procs",
                                 help="Spread streams across CPU cores to reach higher rates. "
                                      "Requires more than one stream; the server mirrors this setting.")
+    st.caption(f"Ready to start: {int(streams)} stream(s), {int(procs)} worker process(es).")
 
     tune_enabled = False
     acceptable_loss = 1.0
@@ -233,6 +235,13 @@ def render_throughput_tab():
     stop_clicked = bcol2.button("Stop Test", disabled=not running, use_container_width=True)
 
     if start_clicked and not busy:
+        launch_spec = {
+            "transport": transport,
+            "direction": direction,
+            "streams": int(streams),
+            "procs": int(procs),
+            "start_port": int(start_port),
+        }
         cfg = ThroughputClientConfig(
             server_ip=st.session_state.server_ip,
             control_port=st.session_state.control_port,
@@ -258,6 +267,7 @@ def render_throughput_tab():
         st.session_state.tp_running = True
         st.session_state.tp_summary = None
         st.session_state.tp_error = None
+        st.session_state.tp_launch_spec = launch_spec
         th.start()
         st.rerun()
 
@@ -265,6 +275,10 @@ def render_throughput_tab():
         st.session_state.tp_stop_event.set()
 
     if st.session_state.tp_running:
+        launch_spec = st.session_state.get("tp_launch_spec") or {}
+        st.caption(f"Running: {launch_spec.get('transport')} {launch_spec.get('direction')} | "
+                   f"streams={launch_spec.get('streams')} | procs={launch_spec.get('procs')} | "
+                   f"base port={launch_spec.get('start_port')}")
         holder = st.session_state.get("tp_result_holder", {})
         # Snapshot the shared list: the background worker thread appends to it
         # concurrently, so build the DataFrame from a stable copy to avoid a
@@ -655,31 +669,50 @@ def render_pmtud_section():
 
 def render_protocols_section():
     st.markdown("#### Protocol Reachability")
+    if st.session_state.tp_running or st.session_state.fb_running:
+        st.info("Stop the active throughput test before running protocol checks.")
+        return
     if not st.session_state.server_ip:
         st.info("Enter a Server IP above.")
         return
 
     if st.button("Run Protocol Checks"):
         with st.spinner("Testing protocols..."):
-            st.session_state.protocols_result = protocols.run_all(
-                st.session_state.server_ip, st.session_state.udp_port, st.session_state.tcp_port,
-                ipv6=st.session_state.ipv6)
+            try:
+                st.session_state.protocols_result = protocols.run_all(
+                    st.session_state.server_ip, st.session_state.udp_port, st.session_state.tcp_port,
+                    ipv6=st.session_state.ipv6)
+            except Exception as exc:  # noqa: BLE001 - keep diagnostics visible if a probe escapes its guard
+                st.session_state.protocols_result = {
+                    "server_ip": st.session_state.server_ip,
+                    "success": False,
+                    "error": str(exc),
+                }
 
     result = st.session_state.protocols_result
     if result:
+        if result.get("error") and not any(key in result for key in ("icmp", "udp", "tcp")):
+            st.error(f"Protocol checks failed: {result['error']}")
         labels = {"icmp": "ICMP", "udp": "UDP", "tcp": "TCP", "esp_udp": "IPSEC (UDP over ESP)",
                   "esp_native": "IPSEC (native ESP)", "gre": "GRE"}
         rows = []
         for key, label in labels.items():
-            r = result.get(key, {})
+            r = result.get(key) or {}
             status = "OK" if r.get("success") else ("SKIPPED" if r.get("skipped") else "FAIL")
-            detail = r.get("error") or (f"{r['rtt_ms']:.2f} ms" if r.get("rtt_ms") else "")
+            error = r.get("error")
+            rtt_ms = r.get("rtt_ms")
+            detail = str(error) if error else (
+                f"{rtt_ms:.2f} ms" if isinstance(rtt_ms, (int, float)) else "")
             rows.append({"Protocol": label, "Status": status, "Detail": detail})
         st.table(pd.DataFrame(rows))
         if st.button("Save protocols log"):
-            text_lines = [f"Protocol check: {st.session_state.server_ip}", str(result)]
-            json_path, log_path = logging_store.save_result(constants.TEST_TYPE_PROTOCOLS, result, text_lines)
-            st.success(f"Saved: {json_path}")
+            try:
+                text_lines = [f"Protocol check: {st.session_state.server_ip}", str(result)]
+                json_path, log_path = logging_store.save_result(
+                    constants.TEST_TYPE_PROTOCOLS, result, text_lines)
+                st.success(f"Saved: {json_path}")
+            except Exception as exc:  # noqa: BLE001 - surface local log errors without crashing the UI
+                st.error(f"Could not save protocols log: {exc}")
 
 
 def render_diagnostics_tab():

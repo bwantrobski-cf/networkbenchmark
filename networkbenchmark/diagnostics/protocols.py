@@ -97,38 +97,69 @@ def esp_udp_check(server_ip: str, timeout_sec: float = 2.0,
     return r
 
 
+def _safe_check(label, check, family):
+    try:
+        result = check()
+    except Exception as exc:  # noqa: BLE001 - diagnostics must report, not abort, on probe failure
+        result = {"success": False, "protocol": label, "rtt_ms": None, "error": str(exc)}
+    result.setdefault("protocol", label)
+    result.setdefault("ip_version", net.ip_version_label(family=family))
+    result.setdefault("success", False)
+    result.setdefault("error", None)
+    return result
+
+
 def run_all(server_ip: str, udp_port: int, tcp_port: int, timeout_sec: float = 2.0,
             family=socket.AF_INET, ipv6=False) -> dict:
     if ipv6:
         family = socket.AF_INET6
-    caps = privileges.probe_capabilities()
+    try:
+        caps = privileges.probe_capabilities()
+    except Exception as exc:  # noqa: BLE001 - capability probing must not crash diagnostics
+        caps = {}
+        capability_error = str(exc)
+    else:
+        capability_error = None
 
     results = {
         "server_ip": server_ip,
         "ip_version": net.ip_version_label(family=family),
         "capabilities": caps,
-        "icmp": connectivity.icmp_ping(server_ip, timeout_sec=timeout_sec, family=family),
-        "udp": connectivity.udp_check(server_ip, udp_port, timeout_sec=timeout_sec, family=family),
-        "tcp": connectivity.tcp_check(server_ip, tcp_port, timeout_sec=timeout_sec, family=family),
-        "esp_udp": esp_udp_check(server_ip, timeout_sec=timeout_sec, family=family),
+        "icmp": _safe_check("icmp", lambda: connectivity.icmp_ping(
+            server_ip, timeout_sec=timeout_sec, family=family), family),
+        "udp": _safe_check("udp", lambda: connectivity.udp_check(
+            server_ip, udp_port, timeout_sec=timeout_sec, family=family), family),
+        "tcp": _safe_check("tcp", lambda: connectivity.tcp_check(
+            server_ip, tcp_port, timeout_sec=timeout_sec, family=family), family),
+        "esp_udp": _safe_check("esp_udp", lambda: esp_udp_check(
+            server_ip, timeout_sec=timeout_sec, family=family), family),
     }
+    if capability_error:
+        results["capabilities_error"] = capability_error
 
     if caps.get("protocol_esp") and family == socket.AF_INET:
-        results["esp_native"] = esp_native_check(server_ip, timeout_sec=timeout_sec, family=family)
+        results["esp_native"] = _safe_check("esp_native", lambda: esp_native_check(
+            server_ip, timeout_sec=timeout_sec, family=family), family)
     elif caps.get("protocol_esp_ipv6") and family == socket.AF_INET6:
-        results["esp_native"] = esp_native_check(server_ip, timeout_sec=timeout_sec, family=family, ipv6=True)
+        results["esp_native"] = _safe_check("esp_native", lambda: esp_native_check(
+            server_ip, timeout_sec=timeout_sec, family=family, ipv6=True), family)
     else:
         capability = "protocol_esp_ipv6" if family == socket.AF_INET6 else "protocol_esp"
+        error = (f"capability probing failed: {capability_error}" if capability_error
+                 else privileges.capability_reason(capability, caps))
         results["esp_native"] = {"success": False, "skipped": True,
                                   "ip_version": net.ip_version_label(family=family),
-                                  "error": privileges.capability_reason(capability, caps)}
+                                  "error": error}
 
     if (caps.get("protocol_gre") and family == socket.AF_INET) or (caps.get("protocol_gre_ipv6") and family == socket.AF_INET6):
-        results["gre"] = gre_check(server_ip, timeout_sec=timeout_sec, family=family, ipv6=family == socket.AF_INET6)
+        results["gre"] = _safe_check("gre", lambda: gre_check(
+            server_ip, timeout_sec=timeout_sec, family=family, ipv6=family == socket.AF_INET6), family)
     else:
         capability = "protocol_gre_ipv6" if family == socket.AF_INET6 else "protocol_gre"
+        error = (f"capability probing failed: {capability_error}" if capability_error
+                 else privileges.capability_reason(capability, caps))
         results["gre"] = {"success": False, "skipped": True,
                            "ip_version": net.ip_version_label(family=family),
-                           "error": privileges.capability_reason(capability, caps)}
+                           "error": error}
 
     return results
