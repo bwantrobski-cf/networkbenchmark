@@ -435,9 +435,10 @@ python NetBench.py webui --port 8502
 The web UI always acts as the **client**, testing against a server started
 separately via `networkbenchmark server` or `python NetBench.py server`. It has a persistent Server IP
 field (top of page) plus a "Check Connectivity" button, a default
-**NetworkBenchmark** tab for throughput tests, a **Diagnostics** tab
-(MTR / PMTUD / Protocol Checks), and a **Settings** tab for the UDP/TCP/
-control port configuration.
+**NetworkBenchmark** page for single throughput tests, a **Fullbench** page
+for running a TCP/UDP, upload/download, stream-count matrix, a
+**Diagnostics** page (MTR / PMTUD / Protocol Checks), and a **Settings** page
+for the UDP/TCP/control port configuration.
 
 ## Ports
 
@@ -449,9 +450,12 @@ control port configuration.
 | IPSEC UDP-over-ESP (NAT-T, fixed)           | 4500    |
 
 Parallel streams (`-P N`) use sequential ports starting at the configured
-UDP/TCP base port (`base_port + stream_index`). All ports are configurable
-on the server via CLI flags / the Settings tab, and the client must be told
-the server's base port via `--start-port` (CLI) or the Settings tab (UI).
+UDP/TCP base port (`base_port + stream_index`). Each stream is an independent
+concurrent data flow; `--procs` only controls how those streams are distributed
+across worker processes and does not replace the stream count. All ports are
+configurable on the server via CLI flags / the Settings tab, and the client
+must be told the server's base port via `--start-port` (CLI) or the Settings
+tab (UI).
 
 The Web UI's **Use IPv6** selector applies to throughput and all diagnostics;
 IPv4 is selected by default. The selected `IPv4`/`IPv6` value is shown in the

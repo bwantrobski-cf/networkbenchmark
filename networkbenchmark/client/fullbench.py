@@ -93,7 +93,8 @@ class FullBenchConfig:
                  export_url=None, export_method="POST", export_headers=None,
                  export_slim=False, export_timeout_sec=15.0, label=None,
                  run_id=None, vm_name=None, cloud=None, environment=None,
-                 tool_version=1, test_type="networkbenchmark", ipv6=False):
+                 tool_version=1, test_type="networkbenchmark", ipv6=False,
+                 udp_port=None, tcp_port=None):
         self.server_ip = server_ip
         self.ipv6 = bool(ipv6)
         self.family = net.family_for_ipv6(self.ipv6)
@@ -113,6 +114,8 @@ class FullBenchConfig:
         self.udp_max_duration_sec = float(udp_max_duration_sec)
         self.bind = bind
         self.start_port = start_port
+        self.udp_port = int(udp_port or start_port or constants.DEFAULT_UDP_PORT)
+        self.tcp_port = int(tcp_port or start_port or constants.DEFAULT_TCP_PORT)
         self.export_url = export_url
         self.export_method = (export_method or "POST").upper()
         self.export_headers = dict(export_headers or {})
@@ -214,7 +217,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     stop_requested = stop_requested or threading.Event()
     benchmark_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc).isoformat()
-    pmtud_udp_port = cfg.start_port or constants.DEFAULT_UDP_PORT
+    pmtud_udp_port = cfg.udp_port
     try:
         pmtud_server_ip = addr.resolve_host(cfg.server_ip, family=cfg.family)
         pmtud_result = run_pmtud(pmtud_server_ip, udp_port=pmtud_udp_port, family=cfg.family)
@@ -303,7 +306,7 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             direction=spec["direction"],
             streams=spec["streams"],
             duration_sec=cfg.duration_sec,
-            start_port=cfg.start_port,
+            start_port=(cfg.udp_port if spec["transport"] == "udp" else cfg.tcp_port),
             bind=cfg.bind,
             procs=spec["procs"],
             acceptable_loss_pct=(cfg.acceptable_loss_pct if spec["tune"] else None),
@@ -404,6 +407,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "directions": cfg.directions,
             "streams": cfg.streams,
             "procs": cfg.procs,
+            "udp_port": cfg.udp_port,
+            "tcp_port": cfg.tcp_port,
             "duration_sec": cfg.duration_sec,
             "acceptable_loss_pct": cfg.acceptable_loss_pct,
             "udp_max_duration_sec": cfg.udp_max_duration_sec,

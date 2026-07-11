@@ -23,6 +23,7 @@ import streamlit as st
 
 from networkbenchmark.common import constants, privileges, addr as addr_mod, logging_store
 from networkbenchmark.client.engine import ThroughputClientConfig, run_throughput_test
+from networkbenchmark.client.fullbench import FullBenchConfig, run_fullbench
 from networkbenchmark.diagnostics.mtr import MtrRunner, MtrError
 from networkbenchmark.diagnostics import connectivity, protocols
 from networkbenchmark.diagnostics.pmtud import run_pmtud, PmtudError
@@ -49,6 +50,13 @@ def _init_state():
         "tp_live": [],
         "tp_summary": None,
         "tp_error": None,
+        "fb_running": False,
+        "fb_stop_event": None,
+        "fb_thread": None,
+        "fb_progress": [],
+        "fb_result_holder": None,
+        "fb_manifest": None,
+        "fb_error": None,
         "mtr_running": False,
         "mtr_stop_event": None,
         "mtr_thread": None,
@@ -154,6 +162,16 @@ def _tp_worker(cfg, stop_event, live_list, result_holder):
         result_holder["done"] = True
 
 
+def _fb_worker(cfg, stop_event, progress, result_holder):
+    try:
+        result_holder["manifest"] = run_fullbench(
+            cfg, on_progress=progress.append, stop_requested=stop_event)
+    except Exception as exc:  # noqa: BLE001 - surface any error to the UI
+        result_holder["error"] = str(exc)
+    finally:
+        result_holder["done"] = True
+
+
 def render_throughput_tab():
     st.subheader("Throughput Test")
     if not st.session_state.server_ip:
@@ -161,24 +179,33 @@ def render_throughput_tab():
         return
 
     running = st.session_state.tp_running
+    busy = running or st.session_state.fb_running
+    if st.session_state.fb_running:
+        st.info("A fullbench matrix is running. Stop it from the Fullbench view before starting a single test.")
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        transport = st.radio("Transport", ["TCP", "UDP"], horizontal=True, disabled=running, key="tp_transport")
+        transport = st.radio("Transport", ["TCP", "UDP"], horizontal=True, disabled=busy, key="tp_transport")
     with col2:
-        direction = st.radio("Direction", ["Upload", "Download"], horizontal=True, disabled=running, key="tp_direction")
+        direction = st.radio("Direction", ["Upload", "Download"], horizontal=True, disabled=busy, key="tp_direction")
     with col3:
-        streams = st.number_input("Parallel streams (-P)", min_value=1, max_value=32, value=1, disabled=running)
+        streams = st.number_input("Parallel data streams (-P)", min_value=1, max_value=32, value=1,
+                                  disabled=busy, key="tp_streams",
+                                  help="One independent socket/data flow is created per stream. This is separate from worker processes.")
     with col4:
-        duration = st.number_input("Duration (sec)", min_value=1, max_value=3600, value=10, disabled=running)
+        duration = st.number_input("Duration (sec)", min_value=1, max_value=3600, value=10, disabled=busy,
+                                   key="tp_duration")
+    st.caption(f"This run will create {int(streams)} concurrent data stream(s).")
 
     default_start_port = st.session_state.udp_port if transport == "UDP" else st.session_state.tcp_port
     pcol1, pcol2 = st.columns(2)
     with pcol1:
         start_port = st.number_input("Server base port for this transport", min_value=1, max_value=65535,
-                                      value=default_start_port, disabled=running)
+                                      value=default_start_port, disabled=busy,
+                                      key=f"tp_start_port_{transport.lower()}")
     with pcol2:
         procs = st.number_input("Worker processes (--procs)", min_value=1, max_value=64, value=1,
-                                disabled=running,
+                                disabled=busy,
+                                key="tp_procs",
                                 help="Spread streams across CPU cores to reach higher rates. "
                                      "Requires more than one stream; the server mirrors this setting.")
 
@@ -188,23 +215,24 @@ def render_throughput_tab():
         tcol1, tcol2 = st.columns(2)
         with tcol1:
             tune_enabled = st.checkbox("Tune to acceptable loss (AIMD ramp)", value=False,
-                                       disabled=running,
+                                       disabled=busy,
                                        help="Ramp the UDP send rate to find the max rate whose loss "
                                             "stays under the target. The Duration above becomes the "
                                             "max time budget for the search.")
         with tcol2:
             acceptable_loss = st.number_input("Acceptable loss (%)", min_value=0.0, max_value=100.0,
                                               value=1.0, step=0.1,
-                                              disabled=running or not tune_enabled)
+                                              disabled=busy or not tune_enabled,
+                                              key="tp_acceptable_loss")
         if tune_enabled:
             st.caption(f"Tuning mode: 'Duration' ({int(duration)}s) is the max search budget; "
                        f"the result is the highest rate meeting <= {acceptable_loss:.2f}% loss.")
 
     bcol1, bcol2 = st.columns(2)
-    start_clicked = bcol1.button("Start Test", type="primary", disabled=running, use_container_width=True)
+    start_clicked = bcol1.button("Start Test", type="primary", disabled=busy, use_container_width=True)
     stop_clicked = bcol2.button("Stop Test", disabled=not running, use_container_width=True)
 
-    if start_clicked and not running:
+    if start_clicked and not busy:
         cfg = ThroughputClientConfig(
             server_ip=st.session_state.server_ip,
             control_port=st.session_state.control_port,
@@ -278,7 +306,10 @@ def render_throughput_tab():
     summary = st.session_state.tp_summary
     if summary:
         st.success("Test complete")
-        st.caption(f"Address family: {summary.get('ip_version', 'IPv4')}")
+        observed_streams = len(summary.get("per_stream") or [])
+        configured_streams = summary.get("streams", observed_streams)
+        st.caption(f"Address family: {summary.get('ip_version', 'IPv4')} | "
+                   f"parallel streams: {configured_streams} configured, {observed_streams} observed")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Send", f"{summary['send_mbps']:.2f} Mbps")
         m2.metric("Recv", f"{summary['recv_mbps']:.2f} Mbps")
@@ -347,6 +378,139 @@ def render_throughput_tab():
             st.dataframe(pd.DataFrame(summary["per_stream"]), use_container_width=True)
 
         st.caption(f"Log: {summary.get('log_json')}")
+
+
+def render_fullbench_tab():
+    st.subheader("Fullbench Matrix")
+    if not st.session_state.server_ip:
+        st.info("Enter a Server IP above to run a fullbench matrix.")
+        return
+
+    running = st.session_state.fb_running
+    busy = running or st.session_state.tp_running
+    if st.session_state.tp_running:
+        st.info("A single throughput test is running. Stop it before starting fullbench.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        transports = st.multiselect("Transports", ["TCP", "UDP"], default=["TCP", "UDP"],
+                                    disabled=busy, key="fb_transports")
+    with col2:
+        directions = st.multiselect("Directions", ["Upload", "Download"],
+                                    default=["Upload", "Download"], disabled=busy,
+                                    key="fb_directions")
+
+    streams = st.multiselect("Parallel data streams per test", [1, 8, 16, 32],
+                             default=[1, 8, 16, 32], disabled=busy, key="fb_streams",
+                             help="Each selected value is a separate test. Each test creates that many concurrent data flows.")
+    st.caption(f"Matrix size: {len(transports) * len(directions) * len(streams)} test(s).")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        duration = st.number_input("Fixed test duration (sec)", min_value=1, max_value=3600,
+                                   value=10, disabled=busy, key="fb_duration")
+    with col2:
+        procs = st.number_input("Worker processes per test", min_value=1, max_value=64, value=1,
+                                disabled=busy, key="fb_procs",
+                                help="This controls process distribution, not the number of data streams. Streams are concurrent even with one process.")
+
+    tune_enabled = False
+    acceptable_loss = 1.0
+    udp_max_duration = 30
+    if "UDP" in transports:
+        col1, col2 = st.columns(2)
+        with col1:
+            tune_enabled = st.checkbox("Tune UDP to acceptable loss", disabled=busy, key="fb_tune")
+        with col2:
+            acceptable_loss = st.number_input("Acceptable UDP loss (%)", min_value=0.0, max_value=100.0,
+                                              value=1.0, step=0.1,
+                                              disabled=busy or not tune_enabled,
+                                              key="fb_acceptable_loss")
+        udp_max_duration = st.number_input("UDP tuning max duration (sec)", min_value=1, max_value=3600,
+                                           value=30, disabled=busy or not tune_enabled,
+                                           key="fb_udp_max_duration")
+
+    col1, col2 = st.columns(2)
+    start_clicked = col1.button("Start Fullbench", type="primary", disabled=busy,
+                                use_container_width=True)
+    stop_clicked = col2.button("Stop Fullbench", disabled=not running, use_container_width=True)
+
+    if start_clicked and not busy:
+        if not transports or not directions or not streams:
+            st.error("Select at least one transport, direction, and stream count.")
+        else:
+            cfg = FullBenchConfig(
+                server_ip=st.session_state.server_ip,
+                control_port=st.session_state.control_port,
+                transports=[value.lower() for value in transports],
+                directions=[value.lower() for value in directions],
+                streams=[int(value) for value in streams],
+                procs=[int(procs)],
+                duration_sec=float(duration),
+                acceptable_loss_pct=(float(acceptable_loss) if tune_enabled else None),
+                udp_max_duration_sec=float(udp_max_duration),
+                udp_port=int(st.session_state.udp_port),
+                tcp_port=int(st.session_state.tcp_port),
+                ipv6=st.session_state.ipv6,
+            )
+            stop_event = threading.Event()
+            progress = []
+            result_holder = {"done": False, "manifest": None, "error": None}
+            th = threading.Thread(target=_fb_worker,
+                                  args=(cfg, stop_event, progress, result_holder), daemon=True)
+            st.session_state.fb_stop_event = stop_event
+            st.session_state.fb_progress = progress
+            st.session_state.fb_result_holder = result_holder
+            st.session_state.fb_thread = th
+            st.session_state.fb_running = True
+            st.session_state.fb_manifest = None
+            st.session_state.fb_error = None
+            th.start()
+            st.rerun()
+
+    if stop_clicked and st.session_state.fb_stop_event:
+        st.session_state.fb_stop_event.set()
+
+    if st.session_state.fb_running:
+        holder = st.session_state.get("fb_result_holder") or {}
+        progress = list(st.session_state.get("fb_progress") or [])
+        st.info("Fullbench is running sequentially through the selected matrix; each individual test uses its configured parallel streams.")
+        if progress:
+            st.code("\n".join(progress[-20:]), language="text")
+        if holder.get("done"):
+            st.session_state.fb_running = False
+            st.session_state.fb_manifest = holder.get("manifest")
+            st.session_state.fb_error = holder.get("error")
+            st.rerun()
+        else:
+            time.sleep(0.5)
+            st.rerun()
+
+    if st.session_state.fb_error:
+        st.error(st.session_state.fb_error)
+
+    manifest = st.session_state.fb_manifest
+    if manifest:
+        st.success(f"Fullbench complete: {manifest.get('completed', 0)}/{manifest.get('test_count', 0)} tests")
+        st.caption(f"Benchmark ID: {manifest.get('benchmark_id')} | IP version: {manifest.get('ip_version', 'IPv4')}")
+        rows = []
+        for test in manifest.get("tests", []):
+            row = {
+                "Transport": test.get("transport", "").upper(),
+                "Direction": test.get("direction", "").title(),
+                "Streams": test.get("streams"),
+                "Processes": test.get("procs"),
+                "Status": "OK" if test.get("ok") else "FAILED",
+                "Send Mbps": test.get("send_mbps"),
+                "Recv Mbps": test.get("recv_mbps"),
+                "Loss %": test.get("loss_pct"),
+            }
+            if not test.get("ok"):
+                row["Error"] = test.get("error")
+            rows.append(row)
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.caption(f"Manifest: {manifest.get('manifest_json')}")
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +725,7 @@ def main():
     # across the auto-reruns used for live test polling.
     page = st.radio(
         "View",
-        ["NetworkBenchmark", "Diagnostics", "Settings"],
+        ["NetworkBenchmark", "Fullbench", "Diagnostics", "Settings"],
         horizontal=True,
         key="active_page",
         label_visibility="collapsed",
@@ -569,6 +733,8 @@ def main():
     st.divider()
     if page == "NetworkBenchmark":
         render_throughput_tab()
+    elif page == "Fullbench":
+        render_fullbench_tab()
     elif page == "Diagnostics":
         render_diagnostics_tab()
     else:
