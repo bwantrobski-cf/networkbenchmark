@@ -21,7 +21,7 @@ from .client.engine import ThroughputClientConfig, ThroughputError, run_throughp
 from .client import fullbench as fullbench_mod
 from .diagnostics.mtr import MtrRunner, MtrError
 from .diagnostics import connectivity, protocols
-from .diagnostics.pmtud import run_pmtud, PmtudError
+from .diagnostics.pmtud import discover_path_mtu, PmtudError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -504,17 +504,18 @@ def cmd_pmtud(args):
 
     print(f"Running PMTUD ({'IPv6' if args.ipv6 else 'IPv4'}) to {args.server_ip}:{args.udp_port}...")
     try:
-        result = run_pmtud(args.server_ip, udp_port=args.udp_port, min_size=args.min_size,
-                            max_size=args.max_size, timeout_sec=args.timeout,
-                            ipv6=args.ipv6)
+        result = discover_path_mtu(args.server_ip, udp_port=args.udp_port, min_size=args.min_size,
+                                   max_size=args.max_size, timeout_sec=args.timeout,
+                                   ipv6=args.ipv6)
     except PmtudError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
 
     if result["success"]:
-        print(f"  Path MTU: {result['path_mtu']} bytes (payload {result['path_mtu_payload_bytes']} bytes)")
+        print(f"  Path MTU: {result['path_mtu']} bytes (payload {result.get('path_mtu_payload_bytes')} bytes)")
     else:
-        print(f"  FAILED: {result.get('error')}")
+        print(f"  Path MTU fallback: {result['path_mtu']} bytes")
+    print(f"  source: {result.get('path_mtu_source')}")
     print(f"  connectivity confirmed: {result.get('connectivity_confirmed')}")
 
     text_lines = [f"PMTUD to {args.server_ip}:{args.udp_port}", str(result)]

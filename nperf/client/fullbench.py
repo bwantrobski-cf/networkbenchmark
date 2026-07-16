@@ -20,9 +20,8 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from ..common import addr, constants, logging_store, net
-from ..diagnostics import connectivity
-from ..diagnostics.pmtud import PmtudError, run_pmtud
+from ..common import constants, logging_store, net
+from ..diagnostics.pmtud import PmtudError, discover_path_mtu
 from ..transport import stream_worker
 from .engine import ThroughputClientConfig, run_throughput_test
 
@@ -218,38 +217,15 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     benchmark_id = str(uuid.uuid4())
     started_at = datetime.now(timezone.utc).isoformat()
     pmtud_udp_port = cfg.udp_port
-    try:
-        pmtud_server_ip = addr.resolve_host(cfg.server_ip, family=cfg.family)
-        pmtud_result = run_pmtud(pmtud_server_ip, udp_port=pmtud_udp_port, family=cfg.family)
-    except (PmtudError, OSError, ValueError) as exc:
-        pmtud_server_ip = cfg.server_ip
-        pmtud_result = {
-            "server_ip": pmtud_server_ip,
-            "udp_port": pmtud_udp_port,
-            "ip_version": cfg.ip_version,
-            "success": False,
-            "connectivity_confirmed": False,
-            "path_mtu": None,
-            "path_mtu_payload_bytes": None,
-            "reported_next_hop_mtu": None,
-            "trace": [],
-            "error": str(exc),
-        }
-
+    pmtud_server_ip = cfg.server_ip
+    pmtud_result = discover_path_mtu(
+        pmtud_server_ip,
+        udp_port=pmtud_udp_port,
+        family=cfg.family,
+        ipv6=cfg.ipv6,
+    )
     pmtud_result.setdefault("ip_version", cfg.ip_version)
-    pmtud_fallback_used = False
-    if not pmtud_result.get("success") or not isinstance(pmtud_result.get("path_mtu"), int):
-        ping_result = connectivity.icmp_ping(pmtud_server_ip, family=cfg.family)
-        pmtud_result["icmp_ping"] = ping_result
-        if ping_result.get("success"):
-            pmtud_fallback_used = True
-            pmtud_result["path_mtu"] = constants.FALLBACK_PATH_MTU
-            pmtud_result["path_mtu_source"] = "icmp_reachability_fallback"
-            pmtud_result["discovery_blocked"] = True
-            pmtud_result["fallback_reason"] = "PMTUD discovery failed but ICMP ping succeeded"
-        else:
-            pmtud_result["path_mtu_source"] = "unavailable"
-
+    pmtud_fallback_used = bool(pmtud_result.get("fallback_used"))
     path_mtu = pmtud_result.get("path_mtu")
     tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(path_mtu, family=cfg.family)
     udp_datagram_bytes = stream_worker.udp_packet_size_for_path_mtu(path_mtu, family=cfg.family)
@@ -275,15 +251,17 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         "fallback_used": pmtud_fallback_used,
         "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
         "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
+        "fallback_reason": pmtud_result.get("fallback_reason"),
+        "icmp_pmtud": pmtud_result.get("icmp_pmtud"),
         "log_json": pmtud_json_path,
         "log_text": pmtud_log_path,
     }
     if not isinstance(path_mtu, int):
-        log(f"fullbench PMTUD and ICMP reachability failed; local log: {pmtud_json_path}")
-        raise PmtudError(pmtud_result.get("error") or "PMTUD did not determine a path MTU and ping failed")
+        log(f"fullbench PMTUD discovery chain failed; local log: {pmtud_json_path}")
+        raise PmtudError(pmtud_result.get("error") or "PMTUD discovery chain did not determine a path MTU")
 
     if pmtud_fallback_used:
-        log(f"fullbench PMTUD blocked; ICMP ping succeeded, continuing with fallback MTU={path_mtu} bytes; local log: {pmtud_json_path}")
+        log(f"fullbench PMTUD fallback source={pmtud_result.get('path_mtu_source')}; using MTU={path_mtu} bytes; local log: {pmtud_json_path}")
     else:
         log(f"fullbench PMTUD: path MTU={path_mtu} bytes; local log: {pmtud_json_path}")
     plan = cfg.build_plan()

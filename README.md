@@ -181,11 +181,17 @@ headers:
 The selected address family is recorded as `IPv4` or `IPv6` in local results,
 fullbench manifests, PMTUD metadata, and exported NPERF payloads.
 
+The PMTUD discovery chain first uses DF-marked UDP probes. If UDP PMTUD fails,
+NPERF sends DF-marked ICMP echo probes, starting at a 1450-byte packet and
+adjusting by 50 bytes until it brackets the limit, then binary-searching for
+the largest successful packet. If both discovery methods fail, NPERF continues
+with a fixed 1300-byte MTU and records `path_mtu_source=fixed_fallback` in the
+result metadata.
+
 For example, with `path_mtu=1500`, both transports use the same 1500-byte path
 limit, but TCP uses a 1460-byte MSS while UDP targets 1472-byte datagrams. The
 selected `path_mtu`, derived TCP MSS, and derived UDP datagram size are written
-to the throughput log for verification. If PMTUD is unavailable but ICMP
-reachability succeeds, the conservative fallback MTU is used for both.
+to the throughput log for verification.
 
 ### Scaling with multiple CPU cores (`--procs`)
 
@@ -301,11 +307,10 @@ python nperf.py fullbench --server-ip 10.0.0.5 --transports udp --directions dow
   `--udp-max-duration` as each search's budget; TCP tests still use `--time`.
 - Every test is saved individually to `logs/` (JSON + text), and a combined
   `fullbench` manifest is written summarizing the whole run.
-- Throughput and fullbench tests run PMTUD before sending traffic, use the
-  discovered path MTU for TCP/UDP sizing, and record `path_mtu`,
-  `tcp_mss_bytes`, and `udp_datagram_bytes` in local results and exported
-  fullbench payloads. If PMTUD discovery is blocked but ICMP reachability
-  succeeds, the test continues with the conservative fallback MTU.
+- Throughput and fullbench tests run the UDP/ICMP/fixed PMTUD discovery chain
+  before sending traffic, use the selected path MTU for TCP/UDP sizing, and
+  record `path_mtu`, `path_mtu_source`, `tcp_mss_bytes`, and `udp_datagram_bytes`
+  in local results and exported fullbench payloads.
 - `--export-url` POSTs each test's JSON result as it completes. Use
   `--export-method` (`POST`/`PUT`), repeatable `--export-header "Key: Value"`
   for auth, and `--export-slim` to drop the bulky `interval_series` /

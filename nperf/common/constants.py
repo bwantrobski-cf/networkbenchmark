@@ -54,7 +54,7 @@ DEFAULT_STREAMS = 1
 BUFSZ = 128 * 1024
 UDP_PAYLOAD_SIZE = 1200
 TCP_CHUNK_SIZE = 128 * 1024
-FALLBACK_PATH_MTU = 1280
+FALLBACK_PATH_MTU = 1300
 
 # ---------------------------------------------------------------------------
 # UDP loss-target tuning (AIMD rate ramp)

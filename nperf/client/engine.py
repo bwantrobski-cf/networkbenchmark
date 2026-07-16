@@ -12,8 +12,7 @@ import time
 import uuid
 
 from ..common import addr, constants, logging_store, net, tcp_info
-from ..diagnostics import connectivity
-from ..diagnostics.pmtud import PmtudError, run_pmtud
+from ..diagnostics.pmtud import discover_path_mtu
 from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
 from ..transport.control_connection import ControlChannel
 
@@ -153,36 +152,14 @@ def _udp_trial_metrics(direction, local_start, local_end, peer_start, peer_end,
 
 def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir: str = None):
     pmtud_udp_port = cfg.start_port if cfg.transport == "udp" else constants.DEFAULT_UDP_PORT
-    try:
-        pmtud_result = run_pmtud(server_ip, udp_port=pmtud_udp_port, family=cfg.family)
-    except (PmtudError, OSError, ValueError) as exc:
-        pmtud_result = {
-            "server_ip": server_ip,
-            "udp_port": pmtud_udp_port,
-            "ip_version": cfg.ip_version,
-            "success": False,
-            "connectivity_confirmed": False,
-            "path_mtu": None,
-            "path_mtu_payload_bytes": None,
-            "reported_next_hop_mtu": None,
-            "trace": [],
-            "error": str(exc),
-        }
-
-    fallback_used = False
-    if not pmtud_result.get("success") or not isinstance(pmtud_result.get("path_mtu"), int):
-        ping_result = connectivity.icmp_ping(server_ip, family=cfg.family)
-        pmtud_result["icmp_ping"] = ping_result
-        if ping_result.get("success"):
-            fallback_used = True
-            pmtud_result["path_mtu"] = constants.FALLBACK_PATH_MTU
-            pmtud_result["path_mtu_source"] = "icmp_reachability_fallback"
-            pmtud_result["discovery_blocked"] = True
-            pmtud_result["fallback_reason"] = "PMTUD discovery failed but ICMP ping succeeded"
-        else:
-            pmtud_result["path_mtu_source"] = "unavailable"
-
+    pmtud_result = discover_path_mtu(
+        server_ip,
+        udp_port=pmtud_udp_port,
+        family=cfg.family,
+        ipv6=cfg.ipv6,
+    )
     pmtud_result.setdefault("ip_version", cfg.ip_version)
+    fallback_used = bool(pmtud_result.get("fallback_used"))
     text_lines = [
         f"PMTUD to {server_ip}:{pmtud_udp_port} ip_version={cfg.ip_version}",
         f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
@@ -194,7 +171,7 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
         constants.TEST_TYPE_PMTUD, pmtud_result, text_lines, base_dir=log_base_dir)
     path_mtu = pmtud_result.get("path_mtu")
     if not isinstance(path_mtu, int):
-        raise ThroughputError(pmtud_result.get("error") or "PMTUD did not determine a path MTU and ping failed")
+        raise ThroughputError(pmtud_result.get("error") or "PMTUD discovery chain did not determine a path MTU")
 
     return path_mtu, {
         "server_ip": server_ip,
@@ -206,6 +183,8 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
         "fallback_used": fallback_used,
         "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
         "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
+        "fallback_reason": pmtud_result.get("fallback_reason"),
+        "icmp_pmtud": pmtud_result.get("icmp_pmtud"),
         "log_json": pmtud_json_path,
         "log_text": pmtud_log_path,
     }
