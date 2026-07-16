@@ -18,7 +18,7 @@ code, dependencies, and metadata needed to run and redistribute NPERF
 
 ```
 <project-root>/             <- self-contained project root (commit this)
-├── NetBench.py             <- compatibility launcher (python NetBench.py ...)
+├── nperf.py             <- directly-runnable launcher (python nperf.py ...)
 ├── pyproject.toml
 ├── requirements.txt
 ├── README.md
@@ -51,14 +51,14 @@ The examples below show both supported command forms:
 nperf <command> [options]
 
 # Direct launcher from this project folder (requires dependencies in `python`)
-python NetBench.py <command> [options]
+python nperf.py <command> [options]
 
 # A third equivalent form is also available after installation:
 python -m nperf <command> [options]
 ```
 
 Use the same subcommand and options with either `nperf` or
-`python NetBench.py`. The direct launcher does not require package activation,
+`python nperf.py`. The direct launcher does not require package activation,
 but its Python interpreter must have the dependencies installed.
 
 > Note: do not run package internals directly (for example,
@@ -67,7 +67,7 @@ but its Python interpreter must have the dependencies installed.
 
 **Install dependencies into the interpreter you launch with.** The
 dependencies (`streamlit`, `pandas`, `ipwhois`) must be installed for the same
-Python. With the virtualenv, activate it or use `.venv/bin/python NetBench.py`
+Python. With the virtualenv, activate it or use `.venv/bin/python nperf.py`
 explicitly. The `webui` command checks dependencies and reports the exact
 install command if they are missing.
 
@@ -85,8 +85,8 @@ Because the console script and dependencies live inside the virtualenv,
 root's `PATH`, not your venv). Invoke the venv's Python explicitly instead:
 
 ```bash
-sudo .venv/bin/python NetBench.py webui          # web UI, full diagnostics
-sudo .venv/bin/python NetBench.py server ...     # server, full diagnostics
+sudo .venv/bin/python nperf.py webui          # web UI, full diagnostics
+sudo .venv/bin/python nperf.py server ...     # server, full diagnostics
 
 # equivalent alternatives:
 sudo .venv/bin/python -m nperf webui
@@ -109,12 +109,12 @@ without preventing IPv4 startup.
 nperf server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
 
 # Direct launcher
-python NetBench.py server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
+python nperf.py server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
 
 # Custom ports and a dedicated log directory
 nperf server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
     --control-port 22000 --log-dir ./server-logs
-python NetBench.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
+python nperf.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
     --control-port 22000 --log-dir ./server-logs
 ```
 
@@ -123,30 +123,30 @@ python NetBench.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
 ```bash
 # TCP upload, one stream, 10 seconds
 nperf throughput --server-ip 10.0.0.5 --tcp --time 10
-python NetBench.py throughput --server-ip 10.0.0.5 --tcp --time 10
+python nperf.py throughput --server-ip 10.0.0.5 --tcp --time 10
 
 # IPv6 TCP upload (IPv4 remains the default when -v6 is omitted)
 nperf throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
-python NetBench.py throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
+python nperf.py throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
 
 # UDP download, four parallel streams, 30 seconds
 nperf throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
-python NetBench.py throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
+python nperf.py throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
 
 # High-rate UDP upload using eight streams across eight worker processes
 nperf throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
-python NetBench.py throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
+python nperf.py throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 
 # UDP loss-target tuning: find the highest rate at or below 1% loss
 nperf throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
-python NetBench.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+python nperf.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
 
 # Use non-default server ports and save local logs elsewhere
 nperf throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
     --control-port 22000 --log-dir ./client-logs --time 20
-python NetBench.py throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
+python nperf.py throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
     --control-port 22000 --log-dir ./client-logs --time 20
 ```
 
@@ -220,7 +220,7 @@ highest UDP rate that stays under it:
 # Find the max UDP upload rate with <= 1% loss, searching for up to 30s
 nperf throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
-python NetBench.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+python nperf.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
 ```
 
@@ -262,14 +262,14 @@ nperf fullbench --server-ip 2001:db8::5 -v6 \
     --acceptable-loss 1.0 --udp-max-duration 30 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
-python NetBench.py fullbench --server-ip 10.0.0.5 \
+python nperf.py fullbench --server-ip 10.0.0.5 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
     --acceptable-loss 1.0 --udp-max-duration 30 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
 
 # The same fullbench matrix over IPv6
-python NetBench.py fullbench --server-ip 2001:db8::5 -v6 \
+python nperf.py fullbench --server-ip 2001:db8::5 -v6 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
     --acceptable-loss 1.0 --udp-max-duration 30 \
     --export-url https://viz.example.com/ingest \
@@ -278,14 +278,14 @@ python NetBench.py fullbench --server-ip 2001:db8::5 -v6 \
 # Preview a small matrix without connecting to the server.
 nperf fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
     --streams 1,4 --procs 1,2 --time 15 --dry-run
-python NetBench.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
+python nperf.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
     --streams 1,4 --procs 1,2 --time 15 --dry-run
 
 # Run only UDP downloads and write the combined manifest to a custom log folder.
 nperf fullbench --server-ip 10.0.0.5 --transports udp --directions down \
     --streams 4,8 --procs 4,8 --acceptable-loss 0.5 --udp-max-duration 45 \
     --log-dir ./fullbench-logs
-python NetBench.py fullbench --server-ip 10.0.0.5 --transports udp --directions down \
+python nperf.py fullbench --server-ip 10.0.0.5 --transports udp --directions down \
     --streams 4,8 --procs 4,8 --acceptable-loss 0.5 --udp-max-duration 45 \
     --log-dir ./fullbench-logs
 ```
@@ -323,7 +323,7 @@ nperf fullbench --server-ip 10.0.0.5 --streams 1,8,16,32 \
     --export-url https://viz.example.com/nperf-results \
     --export-header "Authorization: Bearer $TOKEN"
 
-python NetBench.py fullbench --server-ip 10.0.0.5 --streams 1,8,16,32 \
+python nperf.py fullbench --server-ip 10.0.0.5 --streams 1,8,16,32 \
     --run-id 137 --vm-name web-01 --cloud aws --environment prod \
     --export-url https://viz.example.com/nperf-results \
     --export-header "Authorization: Bearer $TOKEN"
@@ -335,7 +335,7 @@ nperf fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
     --export-url https://viz.example.com/nperf-results \
     --export-method PUT --export-header "Authorization: Bearer $TOKEN" \
     --export-header "X-Job: nightly-mk3"
-python NetBench.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
+python nperf.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up \
     --streams 8 --label nightly-mk3 --run-id 138 --vm-name web-02 \
     --cloud gcp --environment staging --tool-version 2 --test-type nightly \
     --export-url https://viz.example.com/nperf-results \
@@ -367,56 +367,56 @@ Every diagnostic has both an installed-command form and a direct-launcher form.
 ```bash
 # MTR using ICMP, with a 200 ms interval and 20 rounds
 nperf mtr 8.8.8.8 --protocol icmp --interval-ms 200 --count 20
-python NetBench.py mtr 8.8.8.8 --protocol icmp --interval-ms 200 --count 20
+python nperf.py mtr 8.8.8.8 --protocol icmp --interval-ms 200 --count 20
 
 # MTR using TCP to an HTTPS service
 nperf mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
-python NetBench.py mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
+python nperf.py mtr example.com --protocol tcp --port 443 --max-hops 30 --count 10
 
 # IPv6 MTR
 nperf mtr example.com -v6 --protocol tcp --port 443 --max-hops 30 --count 10
-python NetBench.py mtr example.com -v6 --protocol tcp --port 443 --max-hops 30 --count 10
+python nperf.py mtr example.com -v6 --protocol tcp --port 443 --max-hops 30 --count 10
 
 # Check ICMP, UDP, and TCP reachability against the throughput server
 nperf connectivity --server-ip 10.0.0.5
-python NetBench.py connectivity --server-ip 10.0.0.5
+python nperf.py connectivity --server-ip 10.0.0.5
 
 # IPv6 connectivity
 nperf connectivity --server-ip 2001:db8::5 -v6
-python NetBench.py connectivity --server-ip 2001:db8::5 -v6
+python nperf.py connectivity --server-ip 2001:db8::5 -v6
 
 # Use custom diagnostic ports and save the result logs
 nperf connectivity --server-ip 10.0.0.5 --udp-port 20000 \
     --tcp-port 21000 --timeout 5 --log-dir ./diagnostic-logs
-python NetBench.py connectivity --server-ip 10.0.0.5 --udp-port 20000 \
+python nperf.py connectivity --server-ip 10.0.0.5 --udp-port 20000 \
     --tcp-port 21000 --timeout 5 --log-dir ./diagnostic-logs
 
 # Discover the largest path MTU using DF-marked probes
 nperf pmtud --server-ip 10.0.0.5
-python NetBench.py pmtud --server-ip 10.0.0.5
+python nperf.py pmtud --server-ip 10.0.0.5
 
 # IPv6 PMTUD
 nperf pmtud --server-ip 2001:db8::5 -v6
-python NetBench.py pmtud --server-ip 2001:db8::5 -v6
+python nperf.py pmtud --server-ip 2001:db8::5 -v6
 
 # Narrow the PMTUD search and use the server's configured UDP port
 nperf pmtud --server-ip 10.0.0.5 --udp-port 20000 \
     --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
-python NetBench.py pmtud --server-ip 10.0.0.5 --udp-port 20000 \
+python nperf.py pmtud --server-ip 10.0.0.5 --udp-port 20000 \
     --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
 
 # Run the UDP/TCP/ICMP/ESP/NAT-T/GRE reachability matrix
 nperf protocols --server-ip 10.0.0.5
-python NetBench.py protocols --server-ip 10.0.0.5
+python nperf.py protocols --server-ip 10.0.0.5
 
 # IPv6 protocol reachability
 nperf protocols --server-ip 2001:db8::5 -v6
-python NetBench.py protocols --server-ip 2001:db8::5 -v6
+python nperf.py protocols --server-ip 2001:db8::5 -v6
 
 # Use custom ports and a longer timeout for protocol checks
 nperf protocols --server-ip 10.0.0.5 --udp-port 20000 \
     --tcp-port 21000 --timeout 5 --log-dir ./protocol-logs
-python NetBench.py protocols --server-ip 10.0.0.5 --udp-port 20000 \
+python nperf.py protocols --server-ip 10.0.0.5 --udp-port 20000 \
     --tcp-port 21000 --timeout 5 --log-dir ./protocol-logs
 ```
 
@@ -425,15 +425,15 @@ python NetBench.py protocols --server-ip 10.0.0.5 --udp-port 20000 \
 ```bash
 # Launch on Streamlit's default port
 nperf webui
-python NetBench.py webui
+python nperf.py webui
 
 # Launch on a custom port
 nperf webui --port 8502
-python NetBench.py webui --port 8502
+python nperf.py webui --port 8502
 ```
 
 The web UI always acts as the **client**, testing against a server started
-separately via `nperf server` or `python NetBench.py server`. It has a persistent Server IP
+separately via `nperf server` or `python nperf.py server`. It has a persistent Server IP
 field (top of page) plus a "Check Connectivity" button, a default
 **NPERF** page for single throughput tests, a **Fullbench** page
 for running a TCP/UDP, upload/download, stream-count matrix, a
