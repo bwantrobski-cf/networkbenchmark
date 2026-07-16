@@ -60,7 +60,7 @@ class IPv6SupportTests(unittest.TestCase):
         fullbench_args = parser.parse_args(["fullbench", "--server-ip", "198.51.100.5"])
         self.assertEqual(fullbench_args.test_type, "nperf")
         for command, argv in (
-            ("throughput", ["throughput", "--server-ip", "2001:db8::5", "-v6"]),
+            ("tput", ["tput", "--server-ip", "2001:db8::5", "-v6"]),
             ("fullbench", ["fullbench", "--server-ip", "2001:db8::5", "--ipv6"]),
             ("connectivity", ["connectivity", "--server-ip", "2001:db8::5", "-v6"]),
             ("pmtud", ["pmtud", "--server-ip", "2001:db8::5", "--ipv6"]),

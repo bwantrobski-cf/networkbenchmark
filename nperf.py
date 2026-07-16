@@ -5,7 +5,7 @@ Lets you start the program from a plain script with arguments, e.g.:
 
     python nperf.py webui
     python nperf.py server --bind 0.0.0.0
-    python nperf.py throughput --server-ip 10.0.0.5 --time 10
+    python nperf.py tput --server-ip 10.0.0.5 --time 10
     sudo .venv/bin/python nperf.py webui     # for raw-socket diagnostics
 
 This works (unlike running a module inside the package directly) because the

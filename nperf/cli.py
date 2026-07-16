@@ -2,7 +2,7 @@
 
 Subcommands:
     server        run as a server (throughput + diagnostics responders)
-    throughput    run a client throughput test (iperf3+bbperf style)
+    tput          run a client throughput test (iperf3+bbperf style)
     fullbench     run a full matrix of throughput tests (scripting/automation)
     mtr           run an MTR (ICMP/UDP/TCP) diagnostic
     connectivity  quick ICMP/UDP/TCP connectivity check against a server
@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_server.add_argument("--log-dir", default=None)
     p_server.set_defaults(func=cmd_server)
 
-    p_tp = sub.add_parser("throughput", help="run a client throughput test")
+    p_tp = sub.add_parser("tput", help="run a client throughput test")
     p_tp.add_argument("--server-ip", required=True, help="server hostname or IP")
     p_tp.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_tp.add_argument("--control-port", type=int, default=constants.DEFAULT_CONTROL_PORT)

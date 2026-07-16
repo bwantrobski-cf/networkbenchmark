@@ -122,31 +122,31 @@ python nperf.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
 
 ```bash
 # TCP upload, one stream, 10 seconds
-nperf throughput --server-ip 10.0.0.5 --tcp --time 10
-python nperf.py throughput --server-ip 10.0.0.5 --tcp --time 10
+nperf tput --server-ip 10.0.0.5 --tcp --time 10
+python nperf.py tput --server-ip 10.0.0.5 --tcp --time 10
 
 # IPv6 TCP upload (IPv4 remains the default when -v6 is omitted)
-nperf throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
-python nperf.py throughput --server-ip 2001:db8::5 -v6 --tcp --time 10
+nperf tput --server-ip 2001:db8::5 -v6 --tcp --time 10
+python nperf.py tput --server-ip 2001:db8::5 -v6 --tcp --time 10
 
 # UDP download, four parallel streams, 30 seconds
-nperf throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
-python nperf.py throughput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
+nperf tput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
+python nperf.py tput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
 
 # High-rate UDP upload using eight streams across eight worker processes
-nperf throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
-python nperf.py throughput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
+nperf tput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
+python nperf.py tput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 
 # UDP loss-target tuning: find the highest rate at or below 1% loss
-nperf throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+nperf tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
-python nperf.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+python nperf.py tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
 
 # Use non-default server ports and save local logs elsewhere
-nperf throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
+nperf tput --server-ip 10.0.0.5 --udp --start-port 20000 \
     --control-port 22000 --log-dir ./client-logs --time 20
-python nperf.py throughput --server-ip 10.0.0.5 --udp --start-port 20000 \
+python nperf.py tput --server-ip 10.0.0.5 --udp --start-port 20000 \
     --control-port 22000 --log-dir ./client-logs --time 20
 ```
 
@@ -218,9 +218,9 @@ highest UDP rate that stays under it:
 
 ```bash
 # Find the max UDP upload rate with <= 1% loss, searching for up to 30s
-nperf throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+nperf tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
-python nperf.py throughput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
+python nperf.py tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
 ```
 
