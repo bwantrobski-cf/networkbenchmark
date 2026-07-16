@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Directly-runnable launcher for NetworkBenchmark.
+"""Directly-runnable launcher for NPERF.
 
 Lets you start the program from a plain script with arguments, e.g.:
 
@@ -9,7 +9,7 @@ Lets you start the program from a plain script with arguments, e.g.:
     sudo .venv/bin/python NetBench.py webui     # for raw-socket diagnostics
 
 This works (unlike running a module inside the package directly) because the
-launcher sits beside the `networkbenchmark` package and uses an absolute
+launcher sits beside the `nperf` package and uses an absolute
 import instead of a package-relative one.
 """
 
@@ -18,7 +18,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from networkbenchmark.cli import main
+from nperf.cli import main
 
 if __name__ == "__main__":
     main()

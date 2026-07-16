@@ -1,6 +1,6 @@
-"""Shared constants / defaults for NetworkBenchmark."""
+"""Shared constants / defaults for NPERF."""
 
-APP_NAME = "networkbenchmark"
+APP_NAME = "nperf"
 
 # ---------------------------------------------------------------------------
 # Ports

@@ -47,7 +47,7 @@ def _control_listener(ctx: ServerContext):
 
 
 def run_server(config: ServerConfig, stop_event: threading.Event = None, on_log=None, block: bool = True):
-    """Start the NetworkBenchmark server. If block=True (CLI usage), this
+    """Start the NPERF server. If block=True (CLI usage), this
     call blocks until stop_event is set (e.g. via Ctrl+C handling by the
     caller) or KeyboardInterrupt. If block=False (e.g. webui background
     thread), threads are started and this function returns immediately;

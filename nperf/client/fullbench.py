@@ -93,7 +93,7 @@ class FullBenchConfig:
                  export_url=None, export_method="POST", export_headers=None,
                  export_slim=False, export_timeout_sec=15.0, label=None,
                  run_id=None, vm_name=None, cloud=None, environment=None,
-                 tool_version=1, test_type="networkbenchmark", ipv6=False,
+                 tool_version=1, test_type="nperf", ipv6=False,
                  udp_port=None, tcp_port=None):
         self.server_ip = server_ip
         self.ipv6 = bool(ipv6)

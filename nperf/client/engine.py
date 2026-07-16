@@ -664,7 +664,7 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
 
     _dur_desc = (f"max_duration={cfg.max_duration_sec}s acceptable_loss={cfg.acceptable_loss_pct}%"
                  if cfg.tune_udp else f"duration={cfg.duration_sec}s")
-    text_log = [f"NetworkBenchmark throughput test  run_id={run_id}",
+    text_log = [f"NPERF throughput test  run_id={run_id}",
                 f"server={server_ip}:{cfg.control_port}  ip_version={cfg.ip_version} transport={cfg.transport} "
                 f"direction={cfg.direction} streams={cfg.streams} {_dur_desc}"]
     if cfg.path_mtu is not None:

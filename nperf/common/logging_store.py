@@ -15,10 +15,10 @@ from . import constants
 
 def _default_base_dir() -> str:
     """Project root that ships with the package (the directory containing the
-    `networkbenchmark` package), so logs land in `<project>/logs/` regardless
+    `nperf` package), so logs land in `<project>/logs/` regardless
     of the current working directory."""
-    common_dir = os.path.dirname(os.path.abspath(__file__))       # .../networkbenchmark/common
-    package_dir = os.path.dirname(common_dir)                     # .../networkbenchmark (package)
+    common_dir = os.path.dirname(os.path.abspath(__file__))       # .../nperf/common
+    package_dir = os.path.dirname(common_dir)                     # .../nperf (package)
     return os.path.dirname(package_dir)                           # .../ (project root)
 
 

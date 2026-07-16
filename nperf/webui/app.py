@@ -1,10 +1,10 @@
-"""NetworkBenchmark Streamlit web UI (client-side test runner).
+"""NPERF Streamlit web UI (client-side test runner).
 
-Launch via: `networkbenchmark webui` (wraps `streamlit run app.py`).
+Launch via: `nperf webui` (wraps `streamlit run app.py`).
 
 The web UI always acts as the *client*: it drives throughput tests and
-diagnostics against a remote NetworkBenchmark server (started separately
-via `networkbenchmark server` on the target host).
+diagnostics against a remote NPERF server (started separately
+via `nperf server` on the target host).
 """
 
 import os
@@ -21,15 +21,15 @@ if _PROJECT_ROOT not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from networkbenchmark.common import constants, privileges, addr as addr_mod, logging_store
-from networkbenchmark.client.engine import ThroughputClientConfig, run_throughput_test
-from networkbenchmark.client.fullbench import FullBenchConfig, run_fullbench
-from networkbenchmark.diagnostics.mtr import MtrRunner, MtrError
-from networkbenchmark.diagnostics import connectivity, protocols
-from networkbenchmark.diagnostics.pmtud import run_pmtud, PmtudError
+from nperf.common import constants, privileges, addr as addr_mod, logging_store
+from nperf.client.engine import ThroughputClientConfig, run_throughput_test
+from nperf.client.fullbench import FullBenchConfig, run_fullbench
+from nperf.diagnostics.mtr import MtrRunner, MtrError
+from nperf.diagnostics import connectivity, protocols
+from nperf.diagnostics.pmtud import run_pmtud, PmtudError
 
 
-st.set_page_config(page_title="NetworkBenchmark", layout="wide")
+st.set_page_config(page_title="NPERF", layout="wide")
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +92,7 @@ def _cap_badge(name: str, label: str = None):
 # ---------------------------------------------------------------------------
 
 def render_header():
-    st.title("NetworkBenchmark")
+    st.title("NPERF")
 
     col1, col2, col3, col4 = st.columns([3, 1, 1, 2])
     with col1:
@@ -147,7 +147,7 @@ def render_header():
 
 
 # ---------------------------------------------------------------------------
-# NetworkBenchmark tab (throughput)
+# NPERF tab (throughput)
 # ---------------------------------------------------------------------------
 
 def _tp_worker(cfg, stop_event, live_list, result_holder):
@@ -743,7 +743,7 @@ def render_settings_tab():
         "Control port (throughput test orchestration)",
         min_value=1, max_value=65535, value=st.session_state.control_port)
     st.caption("These must match the ports the server was started with, e.g.: "
-               "`networkbenchmark server --udp-port ... --tcp-port ... --control-port ...`")
+               "`nperf server --udp-port ... --tcp-port ... --control-port ...`")
 
 
 # ---------------------------------------------------------------------------
@@ -758,13 +758,13 @@ def main():
     # across the auto-reruns used for live test polling.
     page = st.radio(
         "View",
-        ["NetworkBenchmark", "Fullbench", "Diagnostics", "Settings"],
+        ["NPERF", "Fullbench", "Diagnostics", "Settings"],
         horizontal=True,
         key="active_page",
         label_visibility="collapsed",
     )
     st.divider()
-    if page == "NetworkBenchmark":
+    if page == "NPERF":
         render_throughput_tab()
     elif page == "Fullbench":
         render_fullbench_tab()

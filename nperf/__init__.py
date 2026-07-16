@@ -1,4 +1,4 @@
-"""NetworkBenchmark: a cross-platform network throughput and diagnostics tool.
+"""NPERF: a cross-platform network throughput and diagnostics tool.
 
 Provides a single executable that can run as a client or server, driven
 either by a Streamlit web UI or a headless CLI. Combines iperf3-style

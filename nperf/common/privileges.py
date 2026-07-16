@@ -1,6 +1,6 @@
 """Privilege / raw-socket capability detection.
 
-NetworkBenchmark tries to use raw sockets (via scapy) for MTR, PMTUD, and
+NPERF tries to use raw sockets (via scapy) for MTR, PMTUD, and
 ESP/GRE protocol checks. Those features require root/admin on most
 platforms. Rather than failing outright, we probe capabilities at startup
 and expose them so the CLI/UI can gracefully disable (grey out) whatever

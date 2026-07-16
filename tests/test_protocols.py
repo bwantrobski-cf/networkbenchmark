@@ -2,7 +2,7 @@ import socket
 import unittest
 from unittest.mock import patch
 
-from networkbenchmark.diagnostics import connectivity, protocols
+from nperf.diagnostics import connectivity, protocols
 
 
 class ProtocolChecksTests(unittest.TestCase):

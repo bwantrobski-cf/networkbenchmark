@@ -1,11 +1,11 @@
 import socket
 import unittest
 
-from networkbenchmark.cli import build_parser
-from networkbenchmark.client.engine import ThroughputClientConfig
-from networkbenchmark.common import net
-from networkbenchmark.diagnostics import packetutils
-from networkbenchmark.transport import stream_worker
+from nperf.cli import build_parser
+from nperf.client.engine import ThroughputClientConfig
+from nperf.common import net
+from nperf.diagnostics import packetutils
+from nperf.transport import stream_worker
 
 
 class IPv6SupportTests(unittest.TestCase):
@@ -56,6 +56,9 @@ class IPv6SupportTests(unittest.TestCase):
         self.assertEqual(ipv6_config.ip_version, "IPv6")
 
         parser = build_parser()
+        self.assertEqual(parser.prog, "nperf")
+        fullbench_args = parser.parse_args(["fullbench", "--server-ip", "198.51.100.5"])
+        self.assertEqual(fullbench_args.test_type, "nperf")
         for command, argv in (
             ("throughput", ["throughput", "--server-ip", "2001:db8::5", "-v6"]),
             ("fullbench", ["fullbench", "--server-ip", "2001:db8::5", "--ipv6"]),

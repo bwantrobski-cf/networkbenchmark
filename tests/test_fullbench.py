@@ -1,7 +1,7 @@
 import unittest
 
-from networkbenchmark.client.fullbench import FullBenchConfig
-from networkbenchmark.client.engine import ThroughputClientConfig, _should_use_multiprocess
+from nperf.client.fullbench import FullBenchConfig
+from nperf.client.engine import ThroughputClientConfig, _should_use_multiprocess
 
 
 class FullbenchTests(unittest.TestCase):

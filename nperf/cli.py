@@ -1,4 +1,4 @@
-"""Headless CLI for NetworkBenchmark.
+"""Headless CLI for NPERF.
 
 Subcommands:
     server        run as a server (throughput + diagnostics responders)
@@ -27,7 +27,7 @@ from .diagnostics.pmtud import run_pmtud, PmtudError
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=constants.APP_NAME,
-        description="NetworkBenchmark: throughput + diagnostics tool (client/server, CLI/Web UI)")
+        description="NPERF: throughput + diagnostics tool (client/server, CLI/Web UI)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_server = sub.add_parser("server", help="run as a server")
@@ -111,8 +111,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb.add_argument("--environment", default=None, help="environment label recorded with every test")
     p_fb.add_argument("--tool-version", type=int, default=1,
                        help="tool_version integer recorded with every test (default: 1)")
-    p_fb.add_argument("--test-type", default="networkbenchmark",
-                       help="test_type recorded with every test (default: networkbenchmark)")
+    p_fb.add_argument("--test-type", default="nperf",
+                       help="test_type recorded with every test (default: nperf)")
     p_fb.add_argument("--export-url", default=None,
                        help="HTTP(S) endpoint to POST each test's JSON result to")
     p_fb.add_argument("--export-method", default="POST", choices=["POST", "PUT"],
@@ -184,7 +184,7 @@ def cmd_server(args):
     from .server.engine import ServerConfig, run_server
     config = ServerConfig(bind=args.bind, control_port=args.control_port,
                            udp_port=args.udp_port, tcp_port=args.tcp_port, log_dir=args.log_dir)
-    print(f"NetworkBenchmark server starting on {args.bind} "
+    print(f"NPERF server starting on {args.bind} "
           f"(control={args.control_port} udp={args.udp_port} tcp={args.tcp_port})", flush=True)
     run_server(config, block=True)
 

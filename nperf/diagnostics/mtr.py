@@ -176,17 +176,17 @@ class MtrRunner:
                     if self.family == socket.AF_INET6:
                         icmp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
                         packet = pkt.build_icmpv6_echo(src_ip, self.target_ip, self._icmp_id, ttl,
-                                                       b"networkbenchmark-mtr")
+                                                       b"nperf-mtr")
                     else:
                         icmp_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
-                        packet = pkt.build_icmp_echo(self._icmp_id, ttl, b"networkbenchmark-mtr")
+                        packet = pkt.build_icmp_echo(self._icmp_id, ttl, b"nperf-mtr")
                     icmp_sock.sendto(packet, net.sockaddr(self.target_ip, 0, self.family))
                 elif self.protocol == "udp":
                     if self.family == socket.AF_INET6:
                         udp_sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, ttl)
                     else:
                         udp_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, ttl)
-                    udp_sock.sendto(b"networkbenchmark-mtr", net.sockaddr(self.target_ip, probe_port, self.family))
+                    udp_sock.sendto(b"nperf-mtr", net.sockaddr(self.target_ip, probe_port, self.family))
                 else:  # tcp
                     tcp_header = (pkt.build_tcp_syn_ipv6(src_ip, self.target_ip, self._tcp_src_port,
                                                          self.port, seq_num=random.randint(0, 0xFFFFFFF))

@@ -1,6 +1,6 @@
 import unittest
 
-from networkbenchmark.client.engine import _PeerStatsTracker, _udp_trial_metrics
+from nperf.client.engine import _PeerStatsTracker, _udp_trial_metrics
 
 
 class UdpTuningMetricsTests(unittest.TestCase):

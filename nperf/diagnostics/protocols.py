@@ -1,7 +1,7 @@
 """Protocol reachability matrix: basic UDP/TCP/ICMP plus IPSEC (native ESP),
 IPSEC (UDP-encapsulated ESP / NAT-T), and GRE.
 
-Native ESP and GRE require the NetworkBenchmark server (run with elevated
+Native ESP and GRE require the NPERF server (run with elevated
 privileges) to be listening with a matching raw-socket echo responder
 (see server.engine). UDP-over-ESP just needs the server's fixed NAT-T UDP
 echo listener on port 4500 (no elevated privileges required on either end).
