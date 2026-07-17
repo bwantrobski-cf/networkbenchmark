@@ -313,9 +313,9 @@ python nperf.py fullbench --server-ip 10.0.0.5 --transports udp --directions dow
   in local results and exported fullbench payloads.
 - `--export-url` POSTs each test's JSON result as it completes. Use
   `--export-method` (`POST`/`PUT`), repeatable `--export-header "Key: Value"`
-  for auth, and `--export-slim` to drop the bulky `interval_series` /
-  `per_stream` arrays for lighter payloads. A failed export is logged but does
-  not abort the run.
+  for auth, and `--export-slim` to drop the bulky `interval_series`,
+  `per_stream`, and `source_ports` fields for lighter payloads. A failed export
+  is logged but does not abort the run.
 - `--dry-run` prints the planned matrix without executing.
 
 **Identity / ingestion metadata.** For storing results in a database (e.g. a
@@ -356,14 +356,147 @@ python nperf.py fullbench --server-ip 10.0.0.5 --transports tcp --directions up 
 - Each individual test gets its own unique `recorded_at` timestamp, plus a
   per-test UUID (`nb_run_id`) and a shared `benchmark_id` for the whole run.
 
-Each exported payload uses the results-API conventions at the top level
-(`recorded_at`, `test_type`, `run_id`, `vm_name`, `cloud`, `environment`,
-`tool_version`) plus benchmark grouping (`benchmark_id`, `test_index`, `label`,
-`nb_run_id`, `transport`, `direction`, `streams`, `procs`, `tuned`) and the full
-`result` object (throughput, loss, latency-under-load, bufferbloat, per-stream
-counters, per-second `interval_series`, and — for tuned UDP — the per-trial
-rate-vs-loss series and best sustainable rate). Ingestion endpoints should read
-`result.*` for the metrics and can persist the whole body for full fidelity.
+Each configured export sends **one JSON object per completed fullbench test**
+to `--export-url`. There is no outer array and no separate fullbench envelope in
+the HTTP request. The request uses `Content-Type: application/json`; the method
+is `POST` by default or `PUT` when selected with `--export-method`.
+
+The top-level exported object has this structure:
+
+```json
+{
+  "recorded_at": "2026-07-16T17:02:31.123456+00:00",
+  "test_type": "nperf",
+  "ip_version": "IPv4",
+  "run_id": 137,
+  "vm_name": "web-01",
+  "cloud": "aws",
+  "environment": "prod",
+  "tool_version": 1,
+  "benchmark_id": "uuid-for-the-fullbench-run",
+  "test_index": 1,
+  "test_count": 8,
+  "label": "nightly-mk3",
+  "crypto_setting": "nightly-mk3",
+  "transport": "tcp",
+  "direction": "up",
+  "streams": 8,
+  "procs": 2,
+  "tuned": false,
+  "path_mtu": 1500,
+  "path_mtu_source": "udp_pmtud",
+  "pmtud_fallback_used": false,
+  "pmtud_fallback_reason": null,
+  "reported_next_hop_mtu": null,
+  "tcp_mss_bytes": 1460,
+  "udp_datagram_bytes": 1472,
+  "nb_run_id": "uuid-for-this-test",
+  "ok": true,
+  "error": null,
+  "send_mbps": 940.2,
+  "recv_mbps": 938.7,
+  "send_pps": 80400.0,
+  "recv_pps": 80270.0,
+  "loss_pct": null,
+  "log_json": "logs/throughput.json",
+  "result": {
+    "run_id": "uuid-for-this-test",
+    "server": "10.0.0.5",
+    "ip_version": "IPv4",
+    "transport": "tcp",
+    "direction": "up",
+    "streams": 8,
+    "procs": 2,
+    "duration_sec": 10,
+    "path_mtu": 1500,
+    "tcp_mss_bytes": 1460,
+    "udp_datagram_bytes": 1472,
+    "totals": {
+      "bytes_sent": 1175250000,
+      "packets_sent": 900000,
+      "bytes_received": 0,
+      "packets_received": 0,
+      "packets_lost": 0,
+      "retransmits": 12
+    },
+    "send_mbps": 940.2,
+    "recv_mbps": 938.7,
+    "send_pps": 80400.0,
+    "recv_pps": 80270.0,
+    "loss_pct": null,
+    "retransmits": 12,
+    "unloaded_rtt_ms": 12.4,
+    "loaded_rtt": {
+      "count": 100,
+      "avg": 18.1,
+      "best": 12.2,
+      "worst": 31.7,
+      "stddev": 3.4,
+      "jitter": 2.1
+    },
+    "bufferbloat": {
+      "bdp_bytes": 1462500,
+      "buffered_bytes": 1068750,
+      "bloat_factor": 0.73
+    },
+    "per_stream": [],
+    "interval_series": [],
+    "source_ports": {},
+    "tuning": null,
+    "log_json": "logs/throughput.json",
+    "log_text": "logs/throughput.txt"
+  }
+}
+```
+
+**Top-level fields.** `recorded_at` is the per-test UTC timestamp. `run_id`,
+`vm_name`, `cloud`, `environment`, `tool_version`, and `test_type` are the
+orchestration/ingestion fields. `benchmark_id` groups all tests from one
+fullbench run; `test_index` and `test_count` identify the test's position in
+that matrix. `nb_run_id` is the unique throughput-test UUID. `ok` and `error`
+report execution status. The duplicated rate, loss, MTU, and packet-sizing
+fields are convenient ingestion columns; the complete metrics remain under
+`result`.
+
+**`result` fields.** The result contains the test identity (`run_id`, `server`,
+`ip_version`, `transport`, `direction`, `streams`, `procs`, `duration_sec`),
+packet sizing (`path_mtu`, `tcp_mss_bytes`, `udp_datagram_bytes`), aggregate
+counters (`totals.bytes_sent`, `packets_sent`, `bytes_received`,
+`packets_received`, `packets_lost`, `retransmits`), rates (`send_mbps`,
+`recv_mbps`, `send_pps`, `recv_pps`), `loss_pct`, TCP `retransmits`,
+`unloaded_rtt_ms`, the `loaded_rtt` statistics object (`count`, `avg`, `best`,
+`worst`, `stddev`, `jitter`), `bufferbloat`, and the local `log_json`/`log_text`
+paths. `interval_series` contains per-interval measurements, `per_stream`
+contains stream counter snapshots including `index`, byte/packet counters,
+loss, retransmits, and source port, and `source_ports` maps stream indexes to
+local source ports. These three fields may be omitted by `--export-slim`.
+
+For tuned UDP tests, `tuning` is an object with `acceptable_loss_pct`,
+`max_duration_sec`, `probe`, `trials`, `best`, and `best_effort`. Trial objects
+contain the target rate, offered/goodput Mbps and packets/sec, loss percentage,
+and local/peer interval durations. `best` is the highest-goodput trial meeting
+the loss target; `best_effort` is the highest-goodput trial when no trial meets
+it. For non-tuned tests, `tuning` is `null`.
+
+**PMTUD fields.** `path_mtu_source` is `udp_pmtud`, `icmp_pmtud`, or
+`fixed_fallback`. `pmtud_fallback_used` indicates whether UDP PMTUD was not the
+selected method. When the fixed fallback is used, `path_mtu` is 1300 and
+`pmtud_fallback_reason` explains why discovery failed. The nested `pmtud`
+diagnostic object is used in local results and manifests but is intentionally
+removed from the HTTP payload; the promoted PMTUD fields above preserve the
+important ingestion metadata.
+
+**Slim exports.** `--export-slim` removes only `result.interval_series`,
+`result.per_stream`, and `result.source_ports`. All top-level identity fields,
+aggregate metrics, tuning data, PMTUD metadata, and the remaining result fields
+are still sent.
+
+The local fullbench manifest is separate from the HTTP payload. It contains the
+shared run metadata, fullbench configuration, PMTUD information, and a `tests`
+array of all per-test records. The exporter sends each successful test record
+individually; it does not send that manifest as one request. Ingestion endpoints
+should read `result.*` for metrics and can persist the whole request body for
+full fidelity.
 
 ### Diagnostics
 
