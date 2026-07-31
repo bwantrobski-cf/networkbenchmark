@@ -2,7 +2,7 @@ import socket
 import unittest
 from unittest.mock import patch
 
-from nperf.common import constants
+from nperf.common import constants, net
 from nperf.diagnostics import pmtud
 
 
@@ -26,6 +26,37 @@ class PmtudTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["packet_bytes"], 1510)
         self.assertEqual([entry["size"] for entry in result["trace"][:4]], [1450, 1500, 1550, 1525])
+
+    def test_dont_fragment_configuration_uses_linux_ipv4_option(self):
+        calls = []
+
+        class FakeSocket:
+            family = socket.AF_INET
+
+            def setsockopt(self, level, option, value):
+                calls.append((level, option, value))
+
+        with patch.object(net.platform, "system", return_value="Linux"), \
+             patch.object(net.socket, "IP_MTU_DISCOVER", 10, create=True):
+            net.configure_dont_fragment(FakeSocket())
+
+        self.assertEqual(calls, [(socket.IPPROTO_IP, 10, 2)])
+
+    def test_udp_pmtud_success_is_bidirectionally_validated(self):
+        udp_result = {
+            "success": True,
+            "path_mtu": 1446,
+            "path_mtu_payload_bytes": 1418,
+            "bidirectional_validated": True,
+            "bidirectional_validation": "udp_df_echo",
+            "trace": [],
+        }
+        with patch.object(pmtud, "run_pmtud", return_value=udp_result):
+            result = pmtud.discover_path_mtu("198.51.100.10", family=socket.AF_INET)
+
+        self.assertEqual(result["path_mtu"], 1446)
+        self.assertTrue(result["bidirectional_validated"])
+        self.assertEqual(result["bidirectional_validation"], "udp_df_echo")
 
     def test_discovery_uses_icmp_after_udp_failure(self):
         udp_result = {"success": False, "path_mtu": None, "trace": []}

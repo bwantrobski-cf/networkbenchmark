@@ -6,6 +6,7 @@ bufferbloat measurement (see transport.metrics.compute_bufferbloat).
 """
 
 import multiprocessing
+import queue
 import socket
 import threading
 import time
@@ -139,8 +140,9 @@ def _udp_trial_metrics(direction, local_start, local_end, peer_start, peer_end,
     sent_packets = delta(offered_end, offered_start, "packets_sent")
     received_bytes = delta(received_end, received_start, "bytes_received")
     received_packets = delta(received_end, received_start, "packets_received")
-    lost_packets = delta(received_end, received_start, "packets_lost")
-    expected = received_packets + lost_packets
+    observed_lost_packets = delta(received_end, received_start, "packets_lost")
+    expected = sent_packets
+    lost_packets = max(observed_lost_packets, expected - received_packets)
     return {
         "offered_mbps": sent_bytes * 8 / offered_dt / 1e6,
         "goodput_mbps": received_bytes * 8 / received_dt / 1e6,
@@ -192,7 +194,8 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
 
 def _client_dispatch_loop(control: ControlChannel, phase: run_mode.RunPhase,
                            rtt_tracker: metrics.RttTracker, counters: dict,
-                           done_event: threading.Event, peer_stats=None):
+                           done_event: threading.Event, peer_stats=None,
+                           final_stats_event: threading.Event = None):
     while not phase.is_stopped():
         try:
             msg = control.recv(timeout=1.0)
@@ -222,9 +225,22 @@ def _client_dispatch_loop(control: ControlChannel, phase: run_mode.RunPhase,
                     counters[idx].merge_peer_snapshot(snap)
             if peer_stats is not None:
                 peer_stats.update(msg.get("streams", []))
+            if final_stats_event is not None:
+                final_stats_event.set()
         elif mtype == "done":
             done_event.set()
             break
+
+
+def _wait_for_final_stats(done_event: threading.Event, final_stats_event: threading.Event,
+                          timeout_sec: float) -> bool:
+    deadline = time.monotonic() + timeout_sec
+    while not final_stats_event.is_set() and not done_event.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        final_stats_event.wait(timeout=min(0.1, remaining))
+    return final_stats_event.is_set()
 
 
 def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
@@ -256,6 +272,7 @@ def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
         else:
             sock = socket.socket(cfg.family, socket.SOCK_DGRAM)
             sock.bind(net.sockaddr(cfg.bind, 0, cfg.family))
+            net.configure_dont_fragment(sock)
             dest = net.sockaddr(cfg.server_host, port, cfg.family)
             sock.sendto(stream_worker.build_preamble(run_id, i), dest)
             streams[i] = (sock, dest)
@@ -354,6 +371,7 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
             else:
                 s = socket.socket(conn["family"], socket.SOCK_DGRAM)
                 s.bind(net.sockaddr(conn["bind"], 0, conn["family"]))
+                net.configure_dont_fragment(s)
                 dest = net.sockaddr(conn["server_ip"], port, conn["family"])
                 s.sendto(stream_worker.build_preamble(run_id, i), dest)
                 socks[i] = (s, dest)
@@ -417,10 +435,19 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
 
     source_ports = {}
     for _ in range(len(active_groups)):
-        status, payload = connected_q.get(timeout=60)
+        try:
+            status, payload = connected_q.get(timeout=60)
+        except queue.Empty as exc:
+            for p in procs:
+                p.terminate()
+            for p in procs:
+                p.join(timeout=2)
+            raise ThroughputError("stream worker connection timed out") from exc
         if status != "ok":
             for p in procs:
                 p.terminate()
+            for p in procs:
+                p.join(timeout=2)
             raise ThroughputError(f"stream worker failed to connect: {payload}")
         source_ports.update(payload)
 
@@ -605,8 +632,9 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
     }
 
 
-def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requested: threading.Event = None,
-                         log_base_dir: str = None) -> dict:
+def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
+                              stop_requested: threading.Event = None,
+                              log_base_dir: str = None) -> dict:
     server_ip = addr.resolve_host(cfg.server_host, family=cfg.family)
     cfg.server_host = server_ip
     stop_requested = stop_requested or threading.Event()
@@ -623,10 +651,15 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
             "fallback_used": False,
         }
 
+    control = None
     control_sock = socket.socket(cfg.family, socket.SOCK_STREAM)
-    control_sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
-    control_sock.connect(net.sockaddr(server_ip, cfg.control_port, cfg.family))
-    control = ControlChannel(control_sock)
+    try:
+        control_sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
+        control_sock.connect(net.sockaddr(server_ip, cfg.control_port, cfg.family))
+        control = ControlChannel(control_sock)
+    except Exception:
+        control_sock.close()
+        raise
 
     run_id = str(uuid.uuid4())
     params = {
@@ -707,9 +740,11 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         rtt_tracker = metrics.RttTracker()
         peer_stats = _PeerStatsTracker()
         done_event = threading.Event()
+        final_stats_event = threading.Event()
 
         dispatch_thread = threading.Thread(target=_client_dispatch_loop,
-                                            args=(control, phase, rtt_tracker, counters, done_event, peer_stats),
+                                            args=(control, phase, rtt_tracker, counters, done_event, peer_stats,
+                                                  final_stats_event),
                                             daemon=True)
         dispatch_thread.start()
 
@@ -805,17 +840,28 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         else:
             for ev in stream_stop_events.values():
                 ev.set()
+            for thread in stream_threads:
+                thread.join(timeout=2)
             # capture final local TCP retransmit counts before closing sockets
-            if cfg.transport == "tcp":
+            if cfg.transport == "tcp" and cfg.direction == "up":
                 for i, (sock, _dest) in streams.items():
                     retrans = tcp_info.get_tcp_retransmits(sock)
                     if retrans is not None:
                         counters[i].set_retransmits(retrans)
 
-        done_event.wait(timeout=5)
+        final_stats_received = _wait_for_final_stats(
+            done_event, final_stats_event, constants.FINAL_STATS_TIMEOUT_SEC)
+        if final_stats_received:
+            done_event.wait(timeout=2)
         prober_stop.set()
         phase.stop()
         dispatch_thread.join(timeout=2)
+
+        if not final_stats_received:
+            if done_event.is_set():
+                raise ThroughputError("server closed the test without final peer statistics")
+            raise ThroughputError(
+                f"timed out after {constants.FINAL_STATS_TIMEOUT_SEC}s waiting for final peer statistics")
 
         if not use_mp:
             for sock, _dest in streams.values():
@@ -826,6 +872,11 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
 
         summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log,
                                  source_ports, tuning=tuning)
+        if cfg.transport == "udp":
+            totals = summary.get("totals") or {}
+            if totals.get("packets_sent", 0) > 0 and totals.get("packets_received", 0) == 0:
+                raise ThroughputError(
+                    f"UDP data-plane failure: sent {totals['packets_sent']} packets but received none")
         json_path, log_path = logging_store.save_result(
             constants.TEST_TYPE_THROUGHPUT, summary, text_log, base_dir=log_base_dir)
         summary["log_json"] = json_path
@@ -833,7 +884,45 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None, stop_requ
         return summary
 
     finally:
-        control.close()
+        if 'preamble_resend_stop' in locals() and preamble_resend_stop is not None:
+            preamble_resend_stop.set()
+        if 'mp_state' in locals() and mp_state is not None:
+            mp_state["stop_flag"].value = 1
+            for process in mp_state["procs"]:
+                process.join(timeout=2)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=2)
+        if 'streams' in locals() and streams:
+            for sock, _dest in streams.values():
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        if control is not None:
+            control.close()
+
+
+def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None,
+                         stop_requested: threading.Event = None,
+                         log_base_dir: str = None) -> dict:
+    stop_requested = stop_requested or threading.Event()
+    attempts = constants.UDP_RETRY_ATTEMPTS if cfg.transport == "udp" else 1
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return _run_throughput_test_once(
+                cfg,
+                on_interval=on_interval,
+                stop_requested=stop_requested,
+                log_base_dir=log_base_dir,
+            )
+        except (ThroughputError, OSError, EOFError, TimeoutError) as exc:
+            last_error = exc
+            if attempt + 1 >= attempts or stop_requested.is_set():
+                raise
+            time.sleep(constants.UDP_RETRY_BACKOFF_SEC * (2 ** attempt))
+    raise last_error
 
 
 def _aggregate_totals(counters: dict) -> dict:
@@ -869,8 +958,9 @@ def _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log, sourc
 
     loss_pct = None
     if cfg.transport == "udp":
-        expected = totals["packets_received"] + totals["packets_lost"]
-        loss_pct = (totals["packets_lost"] / expected * 100.0) if expected else 0.0
+        expected = totals["packets_sent"]
+        lost_packets = max(totals["packets_lost"], expected - totals["packets_received"])
+        loss_pct = (lost_packets / expected * 100.0) if expected else 0.0
 
     # For a tuning run the cumulative totals span every probed rate, so they are
     # not a meaningful "throughput". Report the best sustainable trial. When no

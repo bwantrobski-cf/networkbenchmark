@@ -1,4 +1,5 @@
 import ipaddress
+import platform
 import socket
 
 
@@ -90,6 +91,35 @@ def configure_ipv6_socket(sock):
     option = getattr(socket, "IPV6_V6ONLY", None)
     if option is not None:
         sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
+
+
+def configure_dont_fragment(sock):
+    family = sock.family
+    system = platform.system()
+    if family == socket.AF_INET6:
+        if system == "Linux":
+            option = getattr(socket, "IPV6_MTU_DISCOVER", 23)
+            sock.setsockopt(socket.IPPROTO_IPV6, option, 2)
+        elif system == "Darwin":
+            option = getattr(socket, "IPV6_DONTFRAG", 62)
+            sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
+        elif system == "Windows":
+            option = getattr(socket, "IPV6_DONTFRAGMENT", 14)
+            sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
+        else:
+            raise OSError(f"don't-fragment option not implemented for platform {system}")
+        return
+    if system == "Linux":
+        option = getattr(socket, "IP_MTU_DISCOVER", 10)
+        sock.setsockopt(socket.IPPROTO_IP, option, 2)
+    elif system == "Darwin":
+        option = getattr(socket, "IP_DONTFRAG", 28)
+        sock.setsockopt(socket.IPPROTO_IP, option, 1)
+    elif system == "Windows":
+        option = getattr(socket, "IP_DONTFRAGMENT", 14)
+        sock.setsockopt(socket.IPPROTO_IP, option, 1)
+    else:
+        raise OSError(f"don't-fragment option not implemented for platform {system}")
 
 
 def open_server_sockets(bind, port, socktype, listener=False, log=None, service="socket"):

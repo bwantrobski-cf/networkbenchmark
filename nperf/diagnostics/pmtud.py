@@ -9,7 +9,6 @@ when both probe methods fail.
 Requires a raw ICMP socket (root/administrator).
 """
 
-import platform
 import secrets
 import socket
 import struct
@@ -33,32 +32,8 @@ class PmtudError(Exception):
 
 
 def _set_dont_fragment(sock: socket.socket, family=socket.AF_INET):
-    system = platform.system()
     try:
-        if family == socket.AF_INET6:
-            if system == "Linux":
-                option = getattr(socket, " IPV6_MTU_DISCOVER".strip(), 23)
-                sock.setsockopt(socket.IPPROTO_IPV6, option, 2)
-            elif system == "Darwin":
-                option = getattr(socket, " IPV6_DONTFRAG".strip(), 62)
-                sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
-            elif system == "Windows":
-                option = getattr(socket, " IPV6_DONTFRAGMENT".strip(), 14)
-                sock.setsockopt(socket.IPPROTO_IPV6, option, 1)
-            else:
-                raise PmtudError(f"don't-fragment option not implemented for platform {system}")
-        elif system == "Linux":
-            IP_MTU_DISCOVER = getattr(socket, "IP_MTU_DISCOVER", 10)
-            IP_PMTUDISC_DO = 2
-            sock.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
-        elif system == "Darwin":
-            IP_DONTFRAG = getattr(socket, "IP_DONTFRAG", 28)
-            sock.setsockopt(socket.IPPROTO_IP, IP_DONTFRAG, 1)
-        elif system == "Windows":
-            IP_DONTFRAGMENT = getattr(socket, "IP_DONTFRAGMENT", 14)
-            sock.setsockopt(socket.IPPROTO_IP, IP_DONTFRAGMENT, 1)
-        else:
-            raise PmtudError(f"don't-fragment option not implemented for platform {system}")
+        net.configure_dont_fragment(sock)
     except OSError as exc:
         raise PmtudError(f"failed to set don't-fragment socket option: {exc}")
 
@@ -296,6 +271,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "path_mtu": None,
             "path_mtu_payload_bytes": None,
             "reported_next_hop_mtu": None,
+            "bidirectional_validated": False,
+            "bidirectional_validation": "unavailable",
             "trace": [],
             "error": str(exc),
         }
@@ -322,6 +299,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "path_mtu": None,
             "path_mtu_payload_bytes": None,
             "reported_next_hop_mtu": None,
+            "bidirectional_validated": False,
+            "bidirectional_validation": "unavailable",
             "trace": [],
             "error": str(exc),
         }
@@ -334,6 +313,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "path_mtu": icmp_result["path_mtu"],
             "path_mtu_payload_bytes": icmp_result.get("path_mtu_payload_bytes"),
             "reported_next_hop_mtu": icmp_result.get("reported_next_hop_mtu"),
+            "bidirectional_validated": False,
+            "bidirectional_validation": "icmp_echo_only",
             "path_mtu_source": "icmp_pmtud",
             "fallback_used": True,
             "fallback_reason": "UDP PMTUD failed; ICMP echo DF PMTUD succeeded",
@@ -345,6 +326,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
         "path_mtu_source": "fixed_fallback",
         "fallback_used": True,
         "fallback_reason": "UDP and ICMP PMTUD failed; using fixed fallback MTU",
+        "bidirectional_validated": False,
+        "bidirectional_validation": "fixed_fallback",
         "path_mtu_payload_bytes": None,
     })
     return primary
@@ -397,6 +380,8 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
                 "connectivity_confirmed": connectivity_confirmed,
                 "path_mtu": None,
                 "reported_next_hop_mtu": reported_mtu_hint,
+                "bidirectional_validated": False,
+                "bidirectional_validation": "udp_df_echo",
                 "trace": trace,
                 "error": "server did not respond even at the minimum probe size; check connectivity first",
             }
@@ -423,6 +408,8 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
             "path_mtu": low + (48 if family == socket.AF_INET6 else 28),  # add back IP+UDP headers
             "path_mtu_payload_bytes": low,
             "reported_next_hop_mtu": reported_mtu_hint,
+            "bidirectional_validated": True,
+            "bidirectional_validation": "udp_df_echo",
             "trace": trace,
             "error": None,
         }

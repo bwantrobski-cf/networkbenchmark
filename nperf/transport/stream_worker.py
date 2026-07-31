@@ -152,12 +152,7 @@ def tcp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
                 break
             counters.add_received(len(data))
     finally:
-        try:
-            retrans = tcp_info.get_tcp_retransmits(sock)
-            if retrans is not None:
-                counters.set_retransmits(retrans)
-        except Exception:
-            pass
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +271,9 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
                 continue
 
             _stream_index, seq, _send_ts, flag = struct.unpack(UDP_HEADER_FMT, data[:UDP_HEADER_SIZE])
-            counters.add_received(len(data), seq=seq)
             if flag == UDP_FLAG_STOP:
                 break
+            counters.add_received(len(data), seq=seq)
     finally:
         pass
 
@@ -355,7 +350,7 @@ def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict
     for th in threads:
         th.join()
 
-    if transport == "tcp":
+    if transport == "tcp" and role == "send":
         for i, (sock, _dest) in socks.items():
             retrans = tcp_info.get_tcp_retransmits(sock)
             if retrans is not None:
@@ -372,5 +367,7 @@ def feed_udp_data_frame(counters, data: bytes) -> bool:
     if len(data) < UDP_HEADER_SIZE:
         return False
     _stream_index, seq, _send_ts, flag = struct.unpack(UDP_HEADER_FMT, data[:UDP_HEADER_SIZE])
+    if flag == UDP_FLAG_STOP:
+        return True
     counters.add_received(len(data), seq=seq)
     return True

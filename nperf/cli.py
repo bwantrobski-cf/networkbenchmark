@@ -278,7 +278,9 @@ def _print_throughput_summary(summary):
     print("\n=== Throughput Test Summary ===")
     print(f"  IP version: {summary.get('ip_version', 'IPv4')}")
     print(f"  path MTU: {summary.get('path_mtu')} bytes  "
-          f"source={summary.get('pmtud', {}).get('path_mtu_source', 'unknown')}")
+          f"source={summary.get('pmtud', {}).get('path_mtu_source', 'unknown')}  "
+          f"bidirectional={summary.get('pmtud', {}).get('bidirectional_validated')} "
+          f"method={summary.get('pmtud', {}).get('bidirectional_validation', 'unknown')}")
     print(f"  packet sizing: TCP MSS={summary.get('tcp_mss_bytes')} bytes  "
           f"UDP datagram={summary.get('udp_datagram_bytes')} bytes")
     print(f"  send: {summary['send_mbps']:.2f} Mbps   recv: {summary['recv_mbps']:.2f} Mbps")
@@ -370,27 +372,33 @@ def _print_fullbench_summary(manifest):
     print(f"  benchmark_id: {manifest['benchmark_id']}")
     print(f"  IP version: {(manifest.get('pmtud') or {}).get('ip_version', manifest.get('ip_version', 'IPv4'))}")
     pmtud = manifest.get("pmtud") or {}
-    print(f"  path MTU: {pmtud.get('path_mtu')} bytes  source={pmtud.get('path_mtu_source', 'unknown')}")
+    print(f"  path MTU: {pmtud.get('path_mtu')} bytes  source={pmtud.get('path_mtu_source', 'unknown')}  "
+          f"bidirectional={pmtud.get('bidirectional_validated')} "
+          f"method={pmtud.get('bidirectional_validation', 'unknown')}")
     print(f"  packet sizing: TCP MSS={pmtud.get('tcp_mss_bytes')} bytes  "
           f"UDP datagram={pmtud.get('udp_datagram_bytes')} bytes")
     print(f"  completed: {manifest['completed']}/{manifest['test_count']}")
     header = (f"  {'transport':<9} {'dir':<5} {'streams':>7} {'procs':>5} {'send Mbps':>11} "
-              f"{'recv Mbps':>11} {'send pps':>11} {'recv pps':>11} {'loss %':>8}")
+              f"{'recv Mbps':>11} {'send pps':>11} {'recv pps':>11} {'TCP retx/UDP loss':>17}")
     print(header)
     for t in manifest["tests"]:
         if not t.get("ok"):
             print(f"  {t['transport']:<9} {t['direction']:<5} {t['streams']:>7} {t['procs']:>5}"
                   f"  FAILED: {t.get('error')}")
             continue
-        loss = t.get("loss_pct")
-        loss_str = f"{loss:.3f}" if isinstance(loss, (int, float)) else "-"
+        if t.get("transport") == "tcp":
+            retransmits = t.get("retransmits")
+            metric_str = str(int(retransmits)) if isinstance(retransmits, (int, float)) else "-"
+        else:
+            loss = t.get("loss_pct")
+            metric_str = f"{loss:.3f}%" if isinstance(loss, (int, float)) else "-"
         exp = t.get("export")
         exp_str = ""
         if exp is not None:
             exp_str = f"  export={'ok' if exp['ok'] else 'FAIL(' + str(exp.get('error')) + ')'}"
         print(f"  {t['transport']:<9} {t['direction']:<5} {t['streams']:>7} {t['procs']:>5} "
               f"{t.get('send_mbps', 0):>11.1f} {t.get('recv_mbps', 0):>11.1f} "
-              f"{t.get('send_pps', 0):>11.0f} {t.get('recv_pps', 0):>11.0f} {loss_str:>8}{exp_str}")
+              f"{t.get('send_pps', 0):>11.0f} {t.get('recv_pps', 0):>11.0f} {metric_str:>17}{exp_str}")
     print(f"  manifest: {manifest.get('manifest_json')}")
 
 

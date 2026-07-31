@@ -27,6 +27,15 @@ def udp_base_listener(ctx):
     if not sockets:
         ctx.log(f"UDP base: no IPv4 or IPv6 listener available on port {ctx.config.udp_port}")
         return
+    df_enabled = {}
+    for sock in sockets:
+        try:
+            net.configure_dont_fragment(sock)
+            df_enabled[sock] = True
+            ctx.log(f"UDP PMTUD echo {net.family_label(sock.family)} DF enabled")
+        except OSError as exc:
+            df_enabled[sock] = False
+            ctx.log(f"UDP PMTUD echo {net.family_label(sock.family)} DF unavailable: {exc}")
     ctx.log(f"UDP echo/data listener families={','.join(net.family_label(sock.family) for sock in sockets)} "
             f"port={ctx.config.udp_port}")
 
@@ -44,10 +53,13 @@ def udp_base_listener(ctx):
                 continue
 
             if len(data) >= 16 and data[:8] == constants.CONNECTIVITY_MAGIC:
+                if not df_enabled.get(sock, False):
+                    continue
                 try:
                     sock.sendto(data, from_addr)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    ctx.log(f"UDP PMTUD reverse echo failed family={net.family_label(sock.family)} "
+                            f"payload={len(data)} destination={from_addr}: {exc}")
                 continue
 
             if len(data) >= stream_worker.PREAMBLE_SIZE and data[:8] == constants.DATA_STREAM_MAGIC:

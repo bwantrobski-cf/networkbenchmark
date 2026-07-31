@@ -234,6 +234,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
         f"path_mtu={path_mtu} payload={pmtud_result.get('path_mtu_payload_bytes')}",
         f"path_mtu_source={pmtud_result.get('path_mtu_source', 'pmtud')} fallback_used={pmtud_fallback_used}",
+        f"bidirectional_validated={pmtud_result.get('bidirectional_validated')} "
+        f"validation={pmtud_result.get('bidirectional_validation', 'unknown')}",
         f"tcp_mss_bytes={tcp_mss_bytes} udp_datagram_bytes={udp_datagram_bytes}",
         str(pmtud_result),
     ]
@@ -252,6 +254,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
         "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
         "fallback_reason": pmtud_result.get("fallback_reason"),
+        "bidirectional_validated": pmtud_result.get("bidirectional_validated"),
+        "bidirectional_validation": pmtud_result.get("bidirectional_validation"),
         "icmp_pmtud": pmtud_result.get("icmp_pmtud"),
         "log_json": pmtud_json_path,
         "log_text": pmtud_log_path,
@@ -260,10 +264,14 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         log(f"fullbench PMTUD discovery chain failed; local log: {pmtud_json_path}")
         raise PmtudError(pmtud_result.get("error") or "PMTUD discovery chain did not determine a path MTU")
 
+    validation = pmtud_result.get("bidirectional_validation", "unknown")
+    validated = pmtud_result.get("bidirectional_validated")
     if pmtud_fallback_used:
-        log(f"fullbench PMTUD fallback source={pmtud_result.get('path_mtu_source')}; using MTU={path_mtu} bytes; local log: {pmtud_json_path}")
+        log(f"fullbench PMTUD fallback source={pmtud_result.get('path_mtu_source')}; using MTU={path_mtu} bytes; "
+            f"bidirectional_validated={validated} validation={validation}; local log: {pmtud_json_path}")
     else:
-        log(f"fullbench PMTUD: path MTU={path_mtu} bytes; local log: {pmtud_json_path}")
+        log(f"fullbench PMTUD: path MTU={path_mtu} bytes; bidirectional_validated={validated} "
+            f"validation={validation}; local log: {pmtud_json_path}")
     plan = cfg.build_plan()
     total = len(plan)
     log(f"fullbench {benchmark_id}: {total} test(s) queued -> {cfg.server_ip}")
@@ -321,6 +329,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "pmtud_fallback_used": pmtud_info.get("fallback_used"),
             "pmtud_fallback_reason": pmtud_info.get("fallback_reason"),
             "reported_next_hop_mtu": pmtud_info.get("reported_next_hop_mtu"),
+            "bidirectional_validated": pmtud_info.get("bidirectional_validated"),
+            "bidirectional_validation": pmtud_info.get("bidirectional_validation"),
             "tcp_mss_bytes": tcp_mss_bytes,
             "udp_datagram_bytes": udp_datagram_bytes,
             "pmtud": pmtud_info,
@@ -338,14 +348,18 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             record["send_pps"] = summary.get("send_pps")
             record["recv_pps"] = summary.get("recv_pps")
             record["loss_pct"] = summary.get("loss_pct")
+            record["retransmits"] = summary.get("retransmits")
             record["path_mtu"] = summary.get("path_mtu")
             record["tcp_mss_bytes"] = summary.get("tcp_mss_bytes")
             record["udp_datagram_bytes"] = summary.get("udp_datagram_bytes")
             record["log_json"] = summary.get("log_json")
+            metric = (f"retransmits={summary.get('retransmits')}"
+                      if spec["transport"] == "tcp"
+                      else f"loss={summary.get('loss_pct')}")
             log(f"[{idx}/{total}] {label}: send={summary.get('send_mbps', 0):.1f} Mbps "
-                f"recv={summary.get('recv_mbps', 0):.1f} Mbps "
-                f"loss={summary.get('loss_pct')} mtu={summary.get('path_mtu')} "
-                f"tcp_mss={summary.get('tcp_mss_bytes')} udp_datagram={summary.get('udp_datagram_bytes')}")
+                f"recv={summary.get('recv_mbps', 0):.1f} Mbps {metric} "
+                f"mtu={summary.get('path_mtu')} tcp_mss={summary.get('tcp_mss_bytes')} "
+                f"udp_datagram={summary.get('udp_datagram_bytes')}")
         except Exception as exc:  # noqa: BLE001 -- one test failing must not kill the run
             record["ok"] = False
             record["error"] = str(exc)
@@ -410,8 +424,11 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     ]
     for t in tests:
         if t["ok"]:
+            metric = (f"retransmits={t.get('retransmits')}"
+                      if t.get("transport") == "tcp"
+                      else f"loss={t.get('loss_pct')}")
             text_lines.append(f"{t['label']}: send={t.get('send_mbps')} Mbps "
-                              f"recv={t.get('recv_mbps')} Mbps loss={t.get('loss_pct')} "
+                              f"recv={t.get('recv_mbps')} Mbps {metric} "
                               f"mtu={t.get('path_mtu')} tcp_mss={t.get('tcp_mss_bytes')} "
                               f"udp_datagram={t.get('udp_datagram_bytes')}")
         else:

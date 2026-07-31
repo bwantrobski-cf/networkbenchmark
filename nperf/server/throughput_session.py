@@ -9,7 +9,7 @@ import socket
 import threading
 import time
 
-from ..common import constants, net, tcp_info
+from ..common import constants, net
 from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
 from ..transport.control_connection import ControlChannel
 
@@ -137,9 +137,11 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             net.configure_ipv6_socket(sock)
+            net.configure_dont_fragment(sock)
             sock.bind(net.bind_address(ctx.config.bind, port, family))
         except OSError as exc:
-            ctx.log(f"session {session.run_id[:8]}: failed to bind udp port {port}: {exc}")
+            ctx.log(f"session {session.run_id[:8]}: failed to configure udp port {port}: {exc}")
+            sock.close()
             return
         session.listener_sockets.append(sock)
         result = stream_worker.read_udp_preamble(sock, timeout_sec=30.0)
@@ -184,6 +186,7 @@ def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec
                 ls = socket.socket(family, socket.SOCK_DGRAM)
                 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 net.configure_ipv6_socket(ls)
+                net.configure_dont_fragment(ls)
                 ls.bind(net.bind_address(bind, port, family))
             listeners[i] = ls
         except OSError as exc:
@@ -424,22 +427,16 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
         while not session.stop_received_event.is_set():
             time.sleep(constants.SAMPLE_INTERVAL_SEC)
             streams_payload = []
-            for i, counters in session.counters.items():
-                snap = counters.snapshot()
-                if session.params["transport"] == "tcp" and session.params["direction"] == "down":
-                    sock_i = session.stream_sockets.get(i)
-                    if sock_i is not None:
-                        retrans = tcp_info.get_tcp_retransmits(sock_i)
-                        if retrans is not None:
-                            counters.set_retransmits(retrans)
-                            snap["retransmits"] = retrans
-                streams_payload.append(snap)
+            for counters in session.counters.values():
+                streams_payload.append(counters.snapshot())
             try:
                 control.send("peer_stats", t=time.time(), streams=streams_payload)
             except OSError:
                 break
 
         session.stop_all_streams()
+        for thread in session.threads:
+            thread.join(timeout=2)
         dispatch_thread.join(timeout=2)
 
         final_streams = [c.snapshot() for c in session.counters.values()]

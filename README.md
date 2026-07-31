@@ -157,6 +157,13 @@ packets/sec is estimated from throughput assuming a standard 1448-byte MSS.
 Live rates are averaged over a short trailing window so the reading stays
 steady rather than flickering as stats arrive.
 
+UDP setup or data-plane attempts that send packets but receive none are retried
+up to three total attempts with 0.5-second and 1.0-second exponential-backoff
+delays. The CLI fullbench table displays TCP retransmitted segments for TCP
+rows and UDP loss percentage for UDP rows. TCP retransmits are sampled from the
+application-data sending endpoint: Linux uses `TCP_INFO.tcpi_total_retrans`
+and macOS uses `TCP_CONNECTION_INFO.tcpi_txretransmitpackets`.
+
 ### PMTUD sizing for TCP and UDP
 
 Throughput and `fullbench` run Path MTU Discovery before the throughput tests.
@@ -398,6 +405,7 @@ The top-level exported object has this structure:
   "send_pps": 80400.0,
   "recv_pps": 80270.0,
   "loss_pct": null,
+  "retransmits": 12,
   "log_json": "logs/throughput.json",
   "result": {
     "run_id": "uuid-for-this-test",
@@ -454,9 +462,9 @@ The top-level exported object has this structure:
 orchestration/ingestion fields. `benchmark_id` groups all tests from one
 fullbench run; `test_index` and `test_count` identify the test's position in
 that matrix. `nb_run_id` is the unique throughput-test UUID. `ok` and `error`
-report execution status. The duplicated rate, loss, MTU, and packet-sizing
-fields are convenient ingestion columns; the complete metrics remain under
-`result`.
+report execution status. The duplicated rate, loss, retransmit, MTU, and
+packet-sizing fields are convenient ingestion columns; the complete metrics
+remain under `result`.
 
 **`result` fields.** The result contains the test identity (`run_id`, `server`,
 `ip_version`, `transport`, `direction`, `streams`, `procs`, `duration_sec`),
