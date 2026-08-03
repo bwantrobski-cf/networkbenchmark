@@ -1,7 +1,10 @@
+import threading
 import unittest
+from unittest.mock import patch
 
+from nperf.client import fullbench
 from nperf.client.fullbench import FullBenchConfig
-from nperf.client.engine import ThroughputClientConfig, _should_use_multiprocess
+from nperf.client.engine import ThroughputClientConfig, ThroughputError, _should_use_multiprocess
 
 
 class FullbenchTests(unittest.TestCase):
@@ -30,6 +33,40 @@ class FullbenchTests(unittest.TestCase):
         self.assertFalse(_should_use_multiprocess(config))
         self.assertEqual(config.streams, 8)
         self.assertEqual(config.procs, 1)
+
+    def test_failed_test_is_exported_as_failure_result(self):
+        config = FullBenchConfig(
+            "198.51.100.10",
+            transports=["tcp"],
+            directions=["up"],
+            streams=[1],
+            procs=[1],
+            export_url="https://example.test/nperf-results",
+        )
+        exported_payloads = []
+
+        def capture_export(_url, payload, **_kwargs):
+            exported_payloads.append(payload)
+            return {"ok": True, "status": 200, "error": None}
+
+        with patch.object(fullbench, "discover_path_mtu", return_value={
+                "success": True,
+                "path_mtu": 1400,
+                "path_mtu_source": "test",
+                "fallback_used": False,
+            }), patch.object(fullbench.logging_store, "save_result", return_value=("result.json", "result.log")), \
+             patch.object(fullbench, "run_throughput_test", side_effect=ThroughputError("data plane failed")), \
+             patch.object(fullbench, "export_result", side_effect=capture_export):
+            manifest = fullbench.run_fullbench(
+                config, stop_requested=threading.Event(), log_base_dir="/tmp")
+
+        self.assertFalse(manifest["tests"][0]["ok"])
+        self.assertEqual(manifest["tests"][0]["error"], "data plane failed")
+        self.assertTrue(manifest["tests"][0]["export"]["ok"])
+        self.assertEqual(len(exported_payloads), 1)
+        self.assertFalse(exported_payloads[0]["ok"])
+        self.assertEqual(exported_payloads[0]["error"], "data plane failed")
+        self.assertIsNone(exported_payloads[0]["result"])
 
 
 if __name__ == "__main__":

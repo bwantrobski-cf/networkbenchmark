@@ -36,6 +36,7 @@ GRE_V0_HEADER_LEN = len(GRE_V0_HEADER)
 # Throughput test timing
 # ---------------------------------------------------------------------------
 SAMPLE_INTERVAL_SEC = 0.1
+PEER_STATS_INTERVAL_SEC = 0.5
 UDP_RETRY_ATTEMPTS = 3
 UDP_RETRY_BACKOFF_SEC = 0.5
 # Reported send/recv rates are averaged over a trailing window rather than a
@@ -48,6 +49,7 @@ CALIBRATION_TIME_SEC = 2.0
 STDOUT_INTERVAL_SEC = 1.0
 SOCKET_TIMEOUT_SEC = 30
 FINAL_STATS_TIMEOUT_SEC = 60
+WORKER_DRAIN_TIMEOUT_SEC = 10
 CONTROL_RECV_POLL_SEC = 0.05
 PROBE_INTERVAL_SEC = 0.1
 MAX_RUN_TIME_FAILSAFE_SEC = 3600

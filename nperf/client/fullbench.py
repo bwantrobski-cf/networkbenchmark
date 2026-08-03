@@ -367,18 +367,20 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             log(f"[{idx}/{total}] {label}: FAILED: {exc}")
 
         # Export per-test result (if configured).
-        if cfg.export_url and record["result"] is not None:
+        if cfg.export_url:
             payload = dict(record)
             payload.pop("pmtud", None)
-            export_result_data = dict(record["result"])
-            export_result_data.pop("pmtud", None)
-            payload["result"] = (_slim_result(export_result_data) if cfg.export_slim
-                                 else export_result_data)
+            if record["result"] is not None:
+                export_result_data = dict(record["result"])
+                export_result_data.pop("pmtud", None)
+                payload["result"] = (_slim_result(export_result_data) if cfg.export_slim
+                                     else export_result_data)
             res = export_result(cfg.export_url, payload, method=cfg.export_method,
                                 headers=cfg.export_headers, timeout_sec=cfg.export_timeout_sec)
             record["export"] = res
             if res["ok"]:
-                log(f"[{idx}/{total}] {label}: exported (HTTP {res['status']})")
+                result_status = "FAILURE result" if record["ok"] is False else "result"
+                log(f"[{idx}/{total}] {label}: exported {result_status} (HTTP {res['status']})")
             else:
                 log(f"[{idx}/{total}] {label}: export FAILED: {res['error']}")
 

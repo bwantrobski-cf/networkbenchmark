@@ -67,7 +67,8 @@ def udp_base_listener(ctx):
                 if preamble:
                     _, run_id, idx = preamble
                     session = ctx.get_session()
-                    if session and session.run_id == run_id and idx == 0:
+                    if (session and session.run_id == run_id and idx == 0
+                            and not session.stream_ready[0].is_set()):
                         session.attach_stream(0, sock, addr=from_addr, spawn_receiver=False)
                         ctx.log(f"session {run_id[:8]}: udp stream 0 connected from {from_addr}")
                 continue

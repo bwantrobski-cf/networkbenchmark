@@ -113,3 +113,5 @@ class SharedCounterView:
             self._arr[base + _F_MAX_SEQ] = peer["max_seq_seen"]
         if peer.get("retransmits", 0) > self._arr[base + _F_RETRANS]:
             self._arr[base + _F_RETRANS] = peer["retransmits"]
+        if peer.get("error"):
+            self._arr[base + _F_ERROR] = 1

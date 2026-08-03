@@ -365,6 +365,10 @@ def cmd_fullbench(args):
         print(f"ERROR: fullbench PMTUD failed: {exc}")
         sys.exit(1)
     _print_fullbench_summary(manifest)
+    failed_tests = [test for test in manifest["tests"] if not test.get("ok")]
+    if failed_tests:
+        print(f"ERROR: {len(failed_tests)} fullbench test(s) failed")
+        sys.exit(1)
 
 
 def _print_fullbench_summary(manifest):

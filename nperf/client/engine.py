@@ -10,6 +10,7 @@ import queue
 import socket
 import threading
 import time
+import traceback
 import uuid
 
 from ..common import addr, constants, logging_store, net, tcp_info
@@ -195,7 +196,7 @@ def _discover_path_mtu(cfg: ThroughputClientConfig, server_ip: str, log_base_dir
 def _client_dispatch_loop(control: ControlChannel, phase: run_mode.RunPhase,
                            rtt_tracker: metrics.RttTracker, counters: dict,
                            done_event: threading.Event, peer_stats=None,
-                           final_stats_event: threading.Event = None):
+                           final_stats_event: threading.Event = None, server_errors=None):
     while not phase.is_stopped():
         try:
             msg = control.recv(timeout=1.0)
@@ -227,6 +228,15 @@ def _client_dispatch_loop(control: ControlChannel, phase: run_mode.RunPhase,
                 peer_stats.update(msg.get("streams", []))
             if final_stats_event is not None:
                 final_stats_event.set()
+            try:
+                control.send("final_stats_ack")
+            except OSError:
+                pass
+        elif mtype == "error":
+            if server_errors is not None:
+                server_errors.append(str(msg.get("error") or "server reported an unspecified error"))
+            done_event.set()
+            break
         elif mtype == "done":
             done_event.set()
             break
@@ -348,8 +358,8 @@ def _start_preamble_resender_thread(streams: dict, run_id: str) -> threading.Eve
     return stop
 
 
-def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
-                         shared, start_flag, stop_flag, connected_q, rate_value=None):
+def _client_worker_proc_inner(conn: dict, run_id: str, assignments: list, role: str,
+                               shared, start_flag, stop_flag, connected_q, rate_value=None):
     """Worker process: owns a subset of streams end-to-end (its own sockets),
     so per-stream UDP loss tracking stays entirely within one process.
 
@@ -394,12 +404,58 @@ def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
                                     rate_value=rate_value,
                                     on_wait_tick=on_wait_tick,
                                     path_mtu=conn.get("path_mtu"))
-
     for s, _dest in socks.values():
         try:
             s.close()
         except OSError:
             pass
+
+
+def _client_worker_proc(conn: dict, run_id: str, assignments: list, role: str,
+                         shared, start_flag, stop_flag, connected_q, worker_status_q,
+                         rate_value=None):
+    try:
+        _client_worker_proc_inner(
+            conn, run_id, assignments, role, shared, start_flag, stop_flag,
+            connected_q, rate_value)
+    except BaseException as exc:
+        process = multiprocessing.current_process()
+        worker_status_q.put({
+            "name": process.name,
+            "pid": process.pid,
+            "assignments": [index for index, _port in assignments],
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        })
+        raise
+
+
+def _drain_worker_errors(status_q) -> list[dict]:
+    errors = []
+    while True:
+        try:
+            errors.append(status_q.get_nowait())
+        except queue.Empty:
+            return errors
+
+
+def _worker_process_failure(procs: list, status_q, require_stopped: bool = False,
+                            expect_running: bool = False):
+    errors = _drain_worker_errors(status_q)
+    details = [
+        f"{error.get('name')} pid={error.get('pid')} streams={error.get('assignments')}: "
+        f"{error.get('error')}\n{error.get('traceback', '').rstrip()}"
+        for error in errors
+    ]
+    reported_pids = {error.get("pid") for error in errors}
+    for process in procs:
+        if process.exitcode not in (None, 0) and process.pid not in reported_pids:
+            details.append(f"{process.name} pid={process.pid} exited with code {process.exitcode}")
+        elif expect_running and process.exitcode == 0:
+            details.append(f"{process.name} pid={process.pid} exited before the test stopped")
+        if require_stopped and process.is_alive():
+            details.append(f"{process.name} pid={process.pid} did not stop")
+    return "\n".join(details) or None
 
 
 def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: str,
@@ -423,26 +479,34 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
     # tuning ramp. Shared lock-free so the controller can update it live.
     rate_value = mp_ctx.Value("d", 0.0, lock=False)
     connected_q = mp_ctx.Queue()
+    worker_status_q = mp_ctx.Queue()
 
     procs = []
     for g in active_groups:
         p = mp_ctx.Process(target=_client_worker_proc,
                            args=(conn, run_id, g, role, shared, start_flag, stop_flag,
-                                 connected_q, rate_value),
+                                 connected_q, worker_status_q, rate_value),
                            daemon=True)
         p.start()
         procs.append(p)
 
     source_ports = {}
+    deadline = time.monotonic() + 60
     for _ in range(len(active_groups)):
-        try:
-            status, payload = connected_q.get(timeout=60)
-        except queue.Empty as exc:
-            for p in procs:
-                p.terminate()
-            for p in procs:
-                p.join(timeout=2)
-            raise ThroughputError("stream worker connection timed out") from exc
+        while True:
+            try:
+                status, payload = connected_q.get(timeout=1)
+                break
+            except queue.Empty as exc:
+                failure = _worker_process_failure(procs, worker_status_q)
+                if failure or time.monotonic() >= deadline:
+                    for p in procs:
+                        p.terminate()
+                    for p in procs:
+                        p.join(timeout=2)
+                    if failure:
+                        raise ThroughputError(f"stream worker crashed during connection:\n{failure}") from exc
+                    raise ThroughputError("stream worker connection timed out") from exc
         if status != "ok":
             for p in procs:
                 p.terminate()
@@ -453,11 +517,11 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
 
     return {"procs": procs, "start_flag": start_flag, "stop_flag": stop_flag,
             "rate_value": rate_value, "source_ports": source_ports,
-            "nproc": len(active_groups)}
+            "worker_status_q": worker_status_q, "nproc": len(active_groups)}
 
 
 def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate,
-                    on_interval, stop_requested, tune_start, text_log):
+                    on_interval, stop_requested, tune_start, text_log, check_workers=None):
     """AIMD (iperf-style) ramp: find the highest UDP send rate whose measured
     loss stays at or below cfg.acceptable_loss_pct, within the max-duration
     budget. Rates are per-stream bytes/sec; apply_rate() pushes the new rate to
@@ -473,6 +537,8 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
         end = time.time() + seconds
         while time.time() < end and not stop_requested.is_set():
             time.sleep(constants.SAMPLE_INTERVAL_SEC)
+            if check_workers is not None:
+                check_workers()
             totals = _aggregate_totals(counters)
             loaded = rtt_tracker.loaded_stats()
             entry = recorder.record(time.time(), totals, rtt_ms=loaded.get("avg"), phase="tuning")
@@ -489,7 +555,7 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
         peer_before = peer_stats.snapshot()
         if peer_before is not None:
             peer_a = peer_stats.wait_for_update(
-                peer_before["generation"], constants.SAMPLE_INTERVAL_SEC * 2)
+                peer_before["generation"], constants.PEER_STATS_INTERVAL_SEC * 2)
         else:
             peer_a = None
         a = _aggregate_totals(counters)
@@ -498,7 +564,7 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
         peer_before_end = peer_stats.snapshot()
         if peer_before_end is not None:
             peer_b = peer_stats.wait_for_update(
-                peer_before_end["generation"], constants.SAMPLE_INTERVAL_SEC * 2)
+                peer_before_end["generation"], constants.PEER_STATS_INTERVAL_SEC * 2)
         else:
             peer_b = None
         b = _aggregate_totals(counters)
@@ -741,10 +807,11 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         peer_stats = _PeerStatsTracker()
         done_event = threading.Event()
         final_stats_event = threading.Event()
+        server_errors = []
 
         dispatch_thread = threading.Thread(target=_client_dispatch_loop,
                                             args=(control, phase, rtt_tracker, counters, done_event, peer_stats,
-                                                  final_stats_event),
+                                                  final_stats_event, server_errors),
                                             daemon=True)
         dispatch_thread.start()
 
@@ -807,6 +874,18 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         recorder = metrics.IntervalRecorder(transport=cfg.transport)
         tuning = None
 
+        worker_deadline = start_time + cfg.sender_duration_sec
+
+        def check_client_workers():
+            if not use_mp:
+                return
+            expect_running = time.time() < worker_deadline - 0.5
+            failure = _worker_process_failure(
+                mp_state["procs"], mp_state["worker_status_q"],
+                expect_running=expect_running)
+            if failure:
+                raise ThroughputError(f"client worker process failed:\n{failure}")
+
         if cfg.tune_udp:
             # apply_rate pushes a new per-stream rate (bytes/sec) to whichever
             # side is sending: locally for upload, or to the server (which
@@ -820,34 +899,46 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
                         control.send("set_rate", per_stream_bps=ps_bps)
                     except OSError:
                         pass
-            tuning = _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate,
-                                     on_interval, stop_requested, start_time, text_log)
+            tuning = _run_udp_tuning(
+                cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate,
+                on_interval, stop_requested, start_time, text_log,
+                check_workers=check_client_workers)
         else:
             run_deadline = start_time + cfg.duration_sec
             while time.time() < run_deadline and not stop_requested.is_set():
                 time.sleep(constants.SAMPLE_INTERVAL_SEC)
+                check_client_workers()
                 totals = _aggregate_totals(counters)
                 loaded = rtt_tracker.loaded_stats()
                 entry = recorder.record(time.time(), totals, rtt_ms=loaded.get("avg"), phase="running")
                 if on_interval:
                     on_interval(entry)
 
+        prober_stop.set()
         control.send("stop")
+        client_worker_failure = None
         if use_mp:
-            mp_state["stop_flag"].value = 1
+            if cfg.transport != "tcp" or cfg.direction == "up":
+                mp_state["stop_flag"].value = 1
             for p in mp_state["procs"]:
-                p.join(timeout=10)
+                p.join(timeout=constants.WORKER_DRAIN_TIMEOUT_SEC)
+            client_worker_failure = _worker_process_failure(
+                mp_state["procs"], mp_state["worker_status_q"], require_stopped=True)
         else:
-            for ev in stream_stop_events.values():
-                ev.set()
+            if cfg.transport != "tcp" or cfg.direction == "up":
+                for ev in stream_stop_events.values():
+                    ev.set()
             for thread in stream_threads:
-                thread.join(timeout=2)
-            # capture final local TCP retransmit counts before closing sockets
+                thread.join(timeout=constants.WORKER_DRAIN_TIMEOUT_SEC)
             if cfg.transport == "tcp" and cfg.direction == "up":
                 for i, (sock, _dest) in streams.items():
                     retrans = tcp_info.get_tcp_retransmits(sock)
                     if retrans is not None:
                         counters[i].set_retransmits(retrans)
+                    try:
+                        sock.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
 
         final_stats_received = _wait_for_final_stats(
             done_event, final_stats_event, constants.FINAL_STATS_TIMEOUT_SEC)
@@ -858,10 +949,14 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         dispatch_thread.join(timeout=2)
 
         if not final_stats_received:
+            if server_errors:
+                raise ThroughputError(f"server failed the test: {server_errors[0]}")
             if done_event.is_set():
                 raise ThroughputError("server closed the test without final peer statistics")
             raise ThroughputError(
                 f"timed out after {constants.FINAL_STATS_TIMEOUT_SEC}s waiting for final peer statistics")
+        if client_worker_failure:
+            raise ThroughputError(f"client worker process failed:\n{client_worker_failure}")
 
         if not use_mp:
             for sock, _dest in streams.values():
@@ -872,15 +967,21 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
 
         summary = _build_summary(cfg, run_id, counters, rtt_tracker, recorder, text_log,
                                  source_ports, tuning=tuning)
-        if cfg.transport == "udp":
-            totals = summary.get("totals") or {}
-            if totals.get("packets_sent", 0) > 0 and totals.get("packets_received", 0) == 0:
-                raise ThroughputError(
-                    f"UDP data-plane failure: sent {totals['packets_sent']} packets but received none")
         json_path, log_path = logging_store.save_result(
             constants.TEST_TYPE_THROUGHPUT, summary, text_log, base_dir=log_base_dir)
         summary["log_json"] = json_path
         summary["log_text"] = log_path
+        try:
+            _validate_stream_results(cfg, counters)
+            _validate_summary_throughput(summary)
+            _validate_udp_tuning_summary(cfg, summary)
+            if cfg.transport == "udp":
+                totals = summary.get("totals") or {}
+                if totals.get("packets_sent", 0) > 0 and totals.get("packets_received", 0) == 0:
+                    raise ThroughputError(
+                        f"UDP data-plane failure: sent {totals['packets_sent']} packets but received none")
+        except ThroughputError as exc:
+            raise ThroughputError(f"{exc}; diagnostic log: {json_path}") from exc
         return summary
 
     finally:
@@ -923,6 +1024,40 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None,
                 raise
             time.sleep(constants.UDP_RETRY_BACKOFF_SEC * (2 ** attempt))
     raise last_error
+
+
+def _validate_udp_tuning_summary(cfg: ThroughputClientConfig, summary: dict) -> None:
+    if cfg.tune_udp and summary.get("loss_pct", 100.0) > cfg.acceptable_loss_pct:
+        raise ThroughputError(
+            f"no UDP rate met the {cfg.acceptable_loss_pct:.2f}% loss target; "
+            f"best effort was {summary.get('recv_mbps', 0):.2f} Mbps at "
+            f"{summary.get('loss_pct', 100.0):.3f}% loss")
+
+
+def _validate_summary_throughput(summary: dict) -> None:
+    send_mbps = summary.get("send_mbps", 0)
+    recv_mbps = summary.get("recv_mbps", 0)
+    if send_mbps <= 0 or recv_mbps <= 0:
+        raise ThroughputError(
+            f"invalid throughput result: send={send_mbps:.2f} Mbps recv={recv_mbps:.2f} Mbps")
+
+
+def _validate_stream_results(cfg: ThroughputClientConfig, counters: dict) -> None:
+    missing = [index for index in range(cfg.streams) if index not in counters]
+    inactive = []
+    for index, counter in counters.items():
+        snapshot = counter.snapshot()
+        if snapshot.get("bytes_sent", 0) <= 0 or snapshot.get("bytes_received", 0) <= 0:
+            inactive.append(
+                f"stream {index}: sent={snapshot.get('bytes_sent', 0)} "
+                f"received={snapshot.get('bytes_received', 0)} "
+                f"socket_error={snapshot.get('error')}")
+    if missing or inactive:
+        details = []
+        if missing:
+            details.append(f"missing streams: {missing}")
+        details.extend(inactive)
+        raise ThroughputError("stream validation failed: " + "; ".join(details))
 
 
 def _aggregate_totals(counters: dict) -> dict:

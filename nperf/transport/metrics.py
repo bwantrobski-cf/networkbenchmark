@@ -83,6 +83,8 @@ class StreamCounters:
                 self.max_seq_seen = peer["max_seq_seen"]
             if peer.get("retransmits", 0) > self.retransmits:
                 self.retransmits = peer["retransmits"]
+            if peer.get("error"):
+                self.error = peer["error"]
 
 
 class RttTracker:
