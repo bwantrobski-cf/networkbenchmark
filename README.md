@@ -105,10 +105,16 @@ without preventing IPv4 startup.
 
 
 ```bash
-# Installed command
+# Start the server with its default bind address and ports
+python nperf.py server
+
+# Equivalent installed command
+nperf server
+
+# Explicitly specifying the defaults
 nperf server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
 
-# Direct launcher
+# Direct launcher with explicit defaults
 python nperf.py server --bind 0.0.0.0 --udp-port 10000 --tcp-port 11000 --control-port 12000
 
 # Custom ports and a dedicated log directory
@@ -121,6 +127,12 @@ python nperf.py server --bind 10.0.0.5 --udp-port 20000 --tcp-port 21000 \
 ### Client: throughput test
 
 ```bash
+# On the server host, run first:
+python nperf.py server
+
+# On the client host: TCP upload with 16 streams across 4 worker processes/cores
+python nperf.py tput --server-ip 10.0.0.5 --tcp -P 16 --procs 4 --time 30
+
 # TCP upload, one stream, 10 seconds
 nperf tput --server-ip 10.0.0.5 --tcp --time 10
 python nperf.py tput --server-ip 10.0.0.5 --tcp --time 10
