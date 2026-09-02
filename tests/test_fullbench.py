@@ -68,6 +68,29 @@ class FullbenchTests(unittest.TestCase):
         self.assertEqual(exported_payloads[0]["error"], "data plane failed")
         self.assertIsNone(exported_payloads[0]["result"])
 
+    def test_exported_tests_pause_between_fullbench_cases(self):
+        config = FullBenchConfig(
+            "198.51.100.10",
+            transports=["tcp"],
+            directions=["up"],
+            streams=[1, 8],
+            procs=[1],
+            export_url="https://example.test/nperf-results",
+        )
+
+        with patch.object(fullbench, "discover_path_mtu", return_value={
+                "success": True,
+                "path_mtu": 1400,
+                "path_mtu_source": "test",
+                "fallback_used": False,
+            }), patch.object(fullbench.logging_store, "save_result", return_value=("result.json", "result.log")), \
+             patch.object(fullbench, "run_throughput_test", side_effect=ThroughputError("data plane failed")), \
+             patch.object(fullbench, "export_result", return_value={"ok": True, "status": 200, "error": None}), \
+             patch.object(fullbench.time, "sleep") as sleep:
+            fullbench.run_fullbench(config, stop_requested=threading.Event(), log_base_dir="/tmp")
+
+        sleep.assert_called_once_with(5)
+
 
 if __name__ == "__main__":
     unittest.main()

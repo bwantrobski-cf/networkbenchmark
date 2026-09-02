@@ -15,6 +15,7 @@ so it can run headless anywhere the package is installed.
 import json
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -383,6 +384,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
                 log(f"[{idx}/{total}] {label}: exported {result_status} (HTTP {res['status']})")
             else:
                 log(f"[{idx}/{total}] {label}: export FAILED: {res['error']}")
+            if idx < total:
+                time.sleep(5)
 
         tests.append(record)
 
