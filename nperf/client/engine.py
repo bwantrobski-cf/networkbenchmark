@@ -458,6 +458,19 @@ def _worker_process_failure(procs: list, status_q, require_stopped: bool = False
     return "\n".join(details) or None
 
 
+def _stop_client_workers(mp_state: dict):
+    """Stop all workers within one shared drain timeout."""
+    mp_state["stop_flag"].value = 1
+    deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
+    for process in mp_state["procs"]:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining == 0:
+            break
+        process.join(timeout=remaining)
+    return _worker_process_failure(
+        mp_state["procs"], mp_state["worker_status_q"], require_stopped=True)
+
+
 def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: str,
                            ports: list, mp_ctx, shared):
     """Spawn worker processes and wait for every stream to connect. Returns a
@@ -918,16 +931,10 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         control.send("stop")
         client_worker_failure = None
         if use_mp:
-            if cfg.transport != "tcp" or cfg.direction == "up":
-                mp_state["stop_flag"].value = 1
-            for p in mp_state["procs"]:
-                p.join(timeout=constants.WORKER_DRAIN_TIMEOUT_SEC)
-            client_worker_failure = _worker_process_failure(
-                mp_state["procs"], mp_state["worker_status_q"], require_stopped=True)
+            client_worker_failure = _stop_client_workers(mp_state)
         else:
-            if cfg.transport != "tcp" or cfg.direction == "up":
-                for ev in stream_stop_events.values():
-                    ev.set()
+            for ev in stream_stop_events.values():
+                ev.set()
             for thread in stream_threads:
                 thread.join(timeout=constants.WORKER_DRAIN_TIMEOUT_SEC)
             if cfg.transport == "tcp" and cfg.direction == "up":

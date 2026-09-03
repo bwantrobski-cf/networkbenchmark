@@ -82,6 +82,29 @@ class EngineTests(unittest.TestCase):
 
         self.assertIn("exited before the test stopped", failure)
 
+    def test_stop_client_workers_signals_before_joining(self):
+        stop_flag = SimpleNamespace(value=0)
+        joined_after_stop = []
+        process = SimpleNamespace(
+            name="worker-1",
+            pid=123,
+            exitcode=0,
+            is_alive=lambda: False,
+            join=lambda timeout: joined_after_stop.append((stop_flag.value, timeout)),
+        )
+        state = {
+            "stop_flag": stop_flag,
+            "procs": [process],
+            "worker_status_q": queue.Queue(),
+        }
+
+        self.assertIsNone(engine._stop_client_workers(state))
+
+        self.assertEqual(stop_flag.value, 1)
+        self.assertEqual(len(joined_after_stop), 1)
+        self.assertEqual(joined_after_stop[0][0], 1)
+        self.assertLessEqual(joined_after_stop[0][1], constants.WORKER_DRAIN_TIMEOUT_SEC)
+
     def test_stream_validation_rejects_inactive_stream(self):
         cfg = engine.ThroughputClientConfig("198.51.100.10", streams=1)
         counters = {0: metrics.StreamCounters(0)}
