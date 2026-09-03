@@ -1,0 +1,21 @@
+nperf/client/engine.py
+  s_fce9fd6dbee85b::t_90bdfdfb21e6b6 461-473,934,936-937
+tests/test_engine.py
+  s_fce9fd6dbee85b::t_fcd19ea9d50357 85-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c1b42f298521481b532be2670dd5a9eaacbb8e1e",
+  "prompts": {},
+  "sessions": {
+    "s_fce9fd6dbee85b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fa17669e3ffeirfk4QQVR99Wnf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "BenW <bwantrobski@cloudflare.com>"
+    }
+  }
+}
