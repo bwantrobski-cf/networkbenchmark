@@ -164,8 +164,8 @@ def _slim_result(summary):
 
 def export_result(url, payload, method="POST", headers=None, timeout_sec=15.0):
     """POST/PUT a JSON payload to an HTTP(S) endpoint. Returns a result dict
-    {ok, status, error} and never raises (so a failed export does not abort the
-    benchmark)."""
+    {ok, status, error} and never raises, allowing the remaining benchmark
+    cases to run before the CLI reports any export failures."""
     data = json.dumps(payload, default=str).encode("utf-8")
     hdrs = {"Content-Type": "application/json"}
     hdrs.update(headers or {})
@@ -417,6 +417,11 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         },
         "test_count": total,
         "completed": len(tests),
+        "test_failures": sum(1 for test in tests if not test.get("ok")),
+        "export_failures": sum(
+            1 for test in tests
+            if cfg.export_url and not (test.get("export") or {}).get("ok")
+        ),
         "tests": tests,
     }
 
@@ -428,6 +433,11 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         "",
     ]
     for t in tests:
+        export = t.get("export")
+        export_status = ""
+        if export is not None:
+            export_status = (f" export=ok(HTTP {export.get('status')})" if export.get("ok")
+                             else f" export=FAIL({export.get('error')})")
         if t["ok"]:
             metric = (f"retransmits={t.get('retransmits')}"
                       if t.get("transport") == "tcp"
@@ -435,9 +445,9 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             text_lines.append(f"{t['label']}: send={t.get('send_mbps')} Mbps "
                               f"recv={t.get('recv_mbps')} Mbps {metric} "
                               f"mtu={t.get('path_mtu')} tcp_mss={t.get('tcp_mss_bytes')} "
-                              f"udp_datagram={t.get('udp_datagram_bytes')}")
+                              f"udp_datagram={t.get('udp_datagram_bytes')}{export_status}")
         else:
-            text_lines.append(f"{t['label']}: FAILED: {t.get('error')}")
+            text_lines.append(f"{t['label']}: FAILED: {t.get('error')}{export_status}")
     json_path, log_path = logging_store.save_result(
         constants.TEST_TYPE_FULLBENCH, manifest, text_lines, base_dir=log_base_dir)
     manifest["manifest_json"] = json_path

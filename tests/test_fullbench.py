@@ -91,6 +91,51 @@ class FullbenchTests(unittest.TestCase):
 
         sleep.assert_called_once_with(5)
 
+    def test_export_failure_is_counted_and_written_to_manifest_log(self):
+        config = FullBenchConfig(
+            "198.51.100.10",
+            transports=["tcp"],
+            directions=["up"],
+            streams=[1],
+            procs=[1],
+            export_url="https://example.test/nperf-results",
+        )
+        saved_text = []
+
+        def capture_result(_test_type, _payload, text_lines, **_kwargs):
+            saved_text.extend(text_lines)
+            return "result.json", "result.log"
+
+        summary = {
+            "run_id": "run-id",
+            "send_mbps": 100.0,
+            "recv_mbps": 99.0,
+            "send_pps": 1.0,
+            "recv_pps": 1.0,
+            "loss_pct": None,
+            "retransmits": 1,
+            "path_mtu": 1400,
+            "tcp_mss_bytes": 1360,
+            "udp_datagram_bytes": 1372,
+            "log_json": "test.json",
+        }
+        with patch.object(fullbench, "discover_path_mtu", return_value={
+                "success": True,
+                "path_mtu": 1400,
+                "path_mtu_source": "test",
+                "fallback_used": False,
+            }), patch.object(fullbench.logging_store, "save_result", side_effect=capture_result), \
+             patch.object(fullbench, "run_throughput_test", return_value=summary), \
+             patch.object(fullbench, "export_result", return_value={
+                 "ok": False, "status": None, "error": "DNS failed",
+             }):
+            manifest = fullbench.run_fullbench(
+                config, stop_requested=threading.Event(), log_base_dir="/tmp")
+
+        self.assertEqual(manifest["test_failures"], 0)
+        self.assertEqual(manifest["export_failures"], 1)
+        self.assertTrue(any("export=FAIL(DNS failed)" in line for line in saved_text))
+
 
 if __name__ == "__main__":
     unittest.main()

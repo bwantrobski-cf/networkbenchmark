@@ -366,8 +366,15 @@ def cmd_fullbench(args):
         sys.exit(1)
     _print_fullbench_summary(manifest)
     failed_tests = [test for test in manifest["tests"] if not test.get("ok")]
-    if failed_tests:
-        print(f"ERROR: {len(failed_tests)} fullbench test(s) failed")
+    failed_exports = [
+        test for test in manifest["tests"]
+        if cfg.export_url and not (test.get("export") or {}).get("ok")
+    ]
+    if failed_tests or failed_exports:
+        if failed_exports:
+            print(f"ERROR: {len(failed_exports)} fullbench export(s) failed")
+        if failed_tests:
+            print(f"ERROR: {len(failed_tests)} fullbench test(s) failed")
         sys.exit(1)
 
 
