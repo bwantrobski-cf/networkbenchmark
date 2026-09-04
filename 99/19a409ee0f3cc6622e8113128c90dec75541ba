@@ -1,0 +1,25 @@
+nperf/cli.py
+  s_fce9fd6dbee85b::t_62bec3f380b51a 103-106,260,321-322
+nperf/client/engine.py
+  s_fce9fd6dbee85b::t_2b4a24a504b723 69-75,154-156,503,546-552,565-571,587,591-592,601,603-605,613,615,624-627,630-631,688-689,700-701,703-708,713-714,871-879,1044-1048
+tests/test_engine.py
+  s_fce9fd6dbee85b::t_2af3a9271feb77 14-19,33-132,143-153
+tests/test_udp_tuning_metrics.py
+  s_fce9fd6dbee85b::t_0cdef722c82721 7,13,16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9919a409ee0f3cc6622e8113128c90dec75541ba",
+  "prompts": {},
+  "sessions": {
+    "s_fce9fd6dbee85b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fa17669e3ffeirfk4QQVR99Wnf",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "BenW <bwantrobski@cloudflare.com>"
+    }
+  }
+}
