@@ -100,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
                             f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s)")
     p_fb.add_argument("--start-port", type=int, default=None,
                        help="server base port (auto per transport if omitted)")
+    p_fb.add_argument("--udp-port", type=int, default=None,
+                       help="server UDP base port (default: 10000)")
+    p_fb.add_argument("--tcp-port", type=int, default=None,
+                       help="server TCP base port (default: 11000)")
     p_fb.add_argument("--bind", default="0.0.0.0", help="local address to bind data sockets")
     p_fb.add_argument("--label", default=None, help="optional label attached to every result")
     p_fb.add_argument("--run-id", type=int, default=None,
@@ -253,7 +257,7 @@ def _print_tuning_summary(tuning):
     target = tuning.get("acceptable_loss_pct")
     probe = tuning.get("probe") or {}
     print(f"  acceptable loss target: {target:.2f}%")
-    print(f"  unpaced probe: offered={probe.get('offered_mbps', 0):.0f} Mbps  "
+    print(f"  paced probe: offered={probe.get('offered_mbps', 0):.0f} Mbps  "
           f"goodput={probe.get('goodput_mbps', 0):.0f} Mbps  loss={probe.get('loss_pct', 0):.2f}%")
     trials = tuning.get("trials") or []
     if trials:
@@ -314,6 +318,8 @@ def cmd_fullbench(args):
             udp_max_duration_sec=args.udp_max_duration,
             bind=args.bind,
             start_port=args.start_port,
+            udp_port=args.udp_port,
+            tcp_port=args.tcp_port,
             export_url=args.export_url,
             export_method=args.export_method,
             export_headers=fullbench_mod.parse_headers(args.export_header),

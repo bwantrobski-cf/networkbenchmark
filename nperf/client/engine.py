@@ -66,6 +66,13 @@ class ThroughputClientConfig:
         the fixed test duration."""
         return self.max_duration_sec if self.tune_udp else self.duration_sec
 
+    @property
+    def initial_rate_per_stream_bps(self) -> float:
+        """Start tuned UDP senders paced so they cannot burst before tuning."""
+        if not self.tune_udp:
+            return 0.0
+        return (constants.UDP_TUNE_START_MBPS * 1e6 / 8.0) / self.streams
+
 
 class ThroughputError(Exception):
     pass
@@ -144,6 +151,9 @@ def _udp_trial_metrics(direction, local_start, local_end, peer_start, peer_end,
     observed_lost_packets = delta(received_end, received_start, "packets_lost")
     expected = sent_packets
     lost_packets = max(observed_lost_packets, expected - received_packets)
+    # Measurement windows are paused and drained before snapshots, but cap the
+    # result defensively so stale telemetry can never report impossible loss.
+    lost_packets = min(expected, lost_packets)
     return {
         "offered_mbps": sent_bytes * 8 / offered_dt / 1e6,
         "goodput_mbps": received_bytes * 8 / received_dt / 1e6,
@@ -490,7 +500,7 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
     stop_flag = mp_ctx.Value("b", 0, lock=False)
     # Per-stream target send rate in bytes/sec (0 = unpaced); driven by the UDP
     # tuning ramp. Shared lock-free so the controller can update it live.
-    rate_value = mp_ctx.Value("d", 0.0, lock=False)
+    rate_value = mp_ctx.Value("d", cfg.initial_rate_per_stream_bps, lock=False)
     connected_q = mp_ctx.Queue()
     worker_status_q = mp_ctx.Queue()
 
@@ -533,6 +543,13 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
             "worker_status_q": worker_status_q, "nproc": len(active_groups)}
 
 
+def _udp_tuning_measurement_budget_sec() -> float:
+    drain_sec = constants.PEER_STATS_INTERVAL_SEC * 2
+    peer_wait_budget_sec = constants.PEER_STATS_INTERVAL_SEC * 4
+    return (constants.UDP_TUNE_SETTLE_SEC + constants.UDP_TUNE_TRIAL_SEC
+            + (drain_sec * 2) + peer_wait_budget_sec)
+
+
 def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate,
                     on_interval, stop_requested, tune_start, text_log, check_workers=None):
     """AIMD (iperf-style) ramp: find the highest UDP send rate whose measured
@@ -545,6 +562,13 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
     deadline = tune_start + cfg.max_duration_sec
     streams = max(1, cfg.streams)
     state = {"target_aggregate_mbps": 0.0}
+    pause_rate_ps = 1.0
+    drain_sec = constants.PEER_STATS_INTERVAL_SEC * 2
+    measurement_budget_sec = _udp_tuning_measurement_budget_sec()
+
+    if time.time() + measurement_budget_sec > deadline:
+        raise ThroughputError(
+            f"UDP tuning max duration must be at least {measurement_budget_sec:.1f}s")
 
     def _sample_for(seconds):
         end = time.time() + seconds
@@ -560,11 +584,12 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
                 on_interval(entry)
 
     def _measure(rate_ps_bps):
-        """Set a per-stream rate (bytes/sec; 0 = unpaced), let it settle, then
-        measure offered rate / goodput / loss over one trial window."""
+        """Settle at a rate, then pause around a drained measurement window."""
         apply_rate(rate_ps_bps)
         state["target_aggregate_mbps"] = (rate_ps_bps * streams * 8 / 1e6) if rate_ps_bps else 0.0
         _sample_for(constants.UDP_TUNE_SETTLE_SEC)
+        apply_rate(pause_rate_ps)
+        _sample_for(drain_sec)
         peer_before = peer_stats.snapshot()
         if peer_before is not None:
             peer_a = peer_stats.wait_for_update(
@@ -573,7 +598,11 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
             peer_a = None
         a = _aggregate_totals(counters)
         ta = time.time()
+        apply_rate(rate_ps_bps)
         _sample_for(constants.UDP_TUNE_TRIAL_SEC)
+        tb = time.time()
+        apply_rate(pause_rate_ps)
+        _sample_for(drain_sec)
         peer_before_end = peer_stats.snapshot()
         if peer_before_end is not None:
             peer_b = peer_stats.wait_for_update(
@@ -581,18 +610,10 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
         else:
             peer_b = None
         b = _aggregate_totals(counters)
-        tb = time.time()
-        peer_dt = ((peer_b or {}).get("timestamp") - (peer_a or {}).get("timestamp")
-                   if peer_a is not None and peer_b is not None
-                   and peer_a.get("timestamp") is not None and peer_b.get("timestamp") is not None
-                   else None)
+        active_dt = max(1e-6, tb - ta)
         measured = _udp_trial_metrics(
-            cfg.direction, a, b, peer_a, peer_b, tb - ta,
-            peer_dt if peer_dt is not None and peer_dt > 0 else tb - ta)
-        local_dt = max(1e-6, tb - ta)
-        effective_peer_dt = peer_dt if peer_dt is not None and peer_dt > 0 else local_dt
+            cfg.direction, a, b, peer_a, peer_b, active_dt, active_dt)
         if measured is None:
-            dt = local_dt
             d_sent_bytes = max(0, b["bytes_sent"] - a["bytes_sent"])
             d_recv_bytes = max(0, b["bytes_received"] - a["bytes_received"])
             d_sent_pkts = max(0, b["packets_sent"] - a["packets_sent"])
@@ -600,14 +621,14 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
             d_lost = max(0, b["packets_lost"] - a["packets_lost"])
             expected = d_recv_pkts + d_lost
             measured = {
-                "offered_mbps": d_sent_bytes * 8 / dt / 1e6,
-                "goodput_mbps": d_recv_bytes * 8 / dt / 1e6,
-                "offered_pps": d_sent_pkts / dt,
-                "goodput_pps": d_recv_pkts / dt,
+                "offered_mbps": d_sent_bytes * 8 / active_dt / 1e6,
+                "goodput_mbps": d_recv_bytes * 8 / active_dt / 1e6,
+                "offered_pps": d_sent_pkts / active_dt,
+                "goodput_pps": d_recv_pkts / active_dt,
                 "loss_pct": (d_lost / expected * 100.0) if expected else 0.0,
             }
-        measured["local_interval_sec"] = local_dt
-        measured["peer_interval_sec"] = effective_peer_dt if peer_a is not None and peer_b is not None else None
+        measured["local_interval_sec"] = active_dt
+        measured["peer_interval_sec"] = None
         return {"target_mbps": state["target_aggregate_mbps"], **measured}
 
     def _ps_for_aggregate(mbps):
@@ -664,33 +685,33 @@ def _run_udp_tuning(cfg, counters, recorder, rtt_tracker, peer_stats, apply_rate
     # is saturated and the extra offered load is only filling a buffer -- loss
     # stays ~0 but latency balloons). Both cases back off + refine the step.
     while (not stop_requested.is_set()
-           and time.time() + constants.UDP_TUNE_SETTLE_SEC + constants.UDP_TUNE_TRIAL_SEC <= deadline
-           and step_ps >= min_step and rate_ps > 0):
+           and time.time() + measurement_budget_sec <= deadline
+           and rate_ps > 0):
         trial = _measure(rate_ps)
         trials.append(trial)
         gp = _goodput(trial)
         plateaued = (trial["loss_pct"] <= target
                      and accepted_goodput is not None
                      and gp <= accepted_goodput * (1.0 + constants.UDP_TUNE_MIN_GOODPUT_GAIN))
-        breach = trial["loss_pct"] > target or plateaued
         text_log.append(f"[tune] target={trial['target_mbps']:.0f} Mbps -> "
                         f"goodput={gp:.0f} Mbps loss={trial['loss_pct']:.2f}% "
                         f"window={trial.get('peer_interval_sec') or trial.get('local_interval_sec', 0):.2f}s"
                         + ("  (saturated)" if plateaued else ""))
+        if plateaued:
+            break
         _record(trial)
-        if breach:
-            rate_ps = max(step_ps, rate_ps * constants.UDP_TUNE_BACKOFF_FACTOR)  # mult. decrease
-            step_ps *= 0.5                                        # refine granularity
+        if trial["loss_pct"] > target:
+            next_rate_ps = max(min_step, rate_ps * constants.UDP_TUNE_BACKOFF_FACTOR)
+            step_ps = max(min_step, step_ps * 0.5)
+            if next_rate_ps >= rate_ps:
+                break
+            rate_ps = next_rate_ps                                # multiplicative decrease
         else:
             accepted_goodput = max(accepted_goodput or 0.0, gp)
             rate_ps += step_ps                                    # additive increase
 
-    # Leave the senders at the best sustainable paced rate (or unpaced only if
-    # nothing was measurable).
-    if best is not None and best.get("target_mbps"):
-        apply_rate(best["target_mbps"] * 1e6 / 8 / streams)
-    else:
-        apply_rate(0.0)
+    # Keep the sender effectively paused while the controller stops the run.
+    apply_rate(pause_rate_ps)
 
     if best is not None:
         text_log.append(f"[tune] best: target={best.get('target_mbps', 0):.0f} Mbps "
@@ -838,9 +859,6 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         while time.time() < calib_deadline and not stop_requested.is_set():
             time.sleep(0.05)
 
-        phase.start_running()
-        control.send("start_data")
-
         stream_stop_events = {}
         stream_threads = []
         start_time = time.time()
@@ -850,7 +868,15 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         if use_mp:
             client_rate_value = mp_state["rate_value"]
         else:
-            client_rate_value = stream_worker.RateHolder(0.0)
+            client_rate_value = stream_worker.RateHolder(cfg.initial_rate_per_stream_bps)
+
+        # The existing set_rate message works with older servers. TCP preserves
+        # its order ahead of start_data, so download senders are paced at birth.
+        if cfg.tune_udp and cfg.direction == "down":
+            control.send("set_rate", per_stream_bps=cfg.initial_rate_per_stream_bps)
+
+        phase.start_running()
+        control.send("start_data")
 
         if use_mp:
             mp_state["start_flag"].value = 1
@@ -1015,6 +1041,11 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None,
                          stop_requested: threading.Event = None,
                          log_base_dir: str = None) -> dict:
     stop_requested = stop_requested or threading.Event()
+    if cfg.tune_udp:
+        minimum_duration = _udp_tuning_measurement_budget_sec()
+        if cfg.max_duration_sec < minimum_duration:
+            raise ThroughputError(
+                f"UDP tuning max duration must be at least {minimum_duration:.1f}s")
     attempts = constants.UDP_RETRY_ATTEMPTS if cfg.transport == "udp" else 1
     last_error = None
     for attempt in range(attempts):

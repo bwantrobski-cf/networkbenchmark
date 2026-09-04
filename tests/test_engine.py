@@ -11,6 +11,12 @@ from nperf.transport import metrics, run_mode
 
 
 class EngineTests(unittest.TestCase):
+    def test_tuned_udp_initial_rate_is_paced_per_stream(self):
+        cfg = engine.ThroughputClientConfig(
+            "198.51.100.10", transport="udp", streams=8, acceptable_loss_pct=1.0)
+
+        self.assertEqual(cfg.initial_rate_per_stream_bps, 3_906_250.0)
+
     def test_udp_down_trial_counts_offered_packets_as_loss(self):
         local_start = {"bytes_received": 0, "packets_received": 0, "packets_lost": 0}
         local_end = {"bytes_received": 0, "packets_received": 0, "packets_lost": 0}
@@ -24,6 +30,106 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["goodput_pps"], 0.0)
         self.assertEqual(result["loss_pct"], 100.0)
 
+    def test_udp_trial_loss_uses_consistent_receiver_window(self):
+        local_start = {"bytes_sent": 0, "packets_sent": 0}
+        local_end = {"bytes_sent": 10_000, "packets_sent": 100}
+        peer_start = {"bytes_received": 0, "packets_received": 0, "packets_lost": 0}
+        peer_end = {"bytes_received": 9000, "packets_received": 90, "packets_lost": 10}
+
+        result = engine._udp_trial_metrics(
+            "up", local_start, local_end, peer_start, peer_end, 1.0, 1.0)
+
+        self.assertEqual(result["loss_pct"], 10.0)
+
+    def test_udp_tuning_tests_lower_rate_after_step_reaches_minimum(self):
+        cfg = SimpleNamespace(
+            acceptable_loss_pct=1.0,
+            max_duration_sec=10.0,
+            streams=1,
+            direction="up",
+        )
+        counter = Mock()
+        counter.snapshot.return_value = {
+            "bytes_sent": 0, "packets_sent": 0, "bytes_received": 0,
+            "packets_received": 0, "packets_lost": 0, "retransmits": 0,
+        }
+
+        class PeerStats:
+            def snapshot(self):
+                return {"generation": 1, "timestamp": 1.0}
+
+            def wait_for_update(self, after_generation, timeout_sec):
+                return {"generation": after_generation + 1, "timestamp": 2.0}
+
+        stop_requested = threading.Event()
+        measurements = iter([
+            {"offered_mbps": 250.0, "goodput_mbps": 100.0,
+             "offered_pps": 1.0, "goodput_pps": 1.0, "loss_pct": 10.0},
+            {"offered_mbps": 187.5, "goodput_mbps": 110.0,
+             "offered_pps": 1.0, "goodput_pps": 1.0, "loss_pct": 5.0},
+            {"offered_mbps": 140.625, "goodput_mbps": 120.0,
+             "offered_pps": 1.0, "goodput_pps": 1.0, "loss_pct": 2.0},
+            {"offered_mbps": 105.46875, "goodput_mbps": 100.0,
+             "offered_pps": 1.0, "goodput_pps": 1.0, "loss_pct": 0.5},
+        ])
+        calls = []
+
+        def measure(*args):
+            result = next(measurements)
+            if result["offered_mbps"] == 105.46875:
+                stop_requested.set()
+            return result
+
+        with patch.object(engine, "_udp_trial_metrics", side_effect=measure), \
+             patch.object(constants, "UDP_TUNE_SETTLE_SEC", 0.0), \
+             patch.object(constants, "UDP_TUNE_TRIAL_SEC", 0.0), \
+             patch.object(constants, "PEER_STATS_INTERVAL_SEC", 0.0):
+            tuning = engine._run_udp_tuning(
+                cfg, {0: counter}, Mock(), Mock(), PeerStats(), calls.append,
+                None, stop_requested, engine.time.time(), [])
+
+        aggregate_rates = []
+        for rate in calls:
+            aggregate_rate = rate * 8 / 1e6
+            if aggregate_rate >= 1.0 and (not aggregate_rates or aggregate_rate != aggregate_rates[-1]):
+                aggregate_rates.append(aggregate_rate)
+        self.assertEqual(aggregate_rates[:4], [250.0, 187.5, 140.625, 105.46875])
+        self.assertEqual(tuning["best"]["target_mbps"], 105.46875)
+
+    def test_udp_tuning_does_not_select_saturated_trial_as_best(self):
+        cfg = SimpleNamespace(
+            acceptable_loss_pct=1.0, max_duration_sec=10.0, streams=1, direction="up")
+        counter = Mock()
+        counter.snapshot.return_value = {
+            "bytes_sent": 0, "packets_sent": 0, "bytes_received": 0,
+            "packets_received": 0, "packets_lost": 0, "retransmits": 0,
+        }
+
+        class PeerStats:
+            def snapshot(self):
+                return {"generation": 1, "timestamp": 1.0}
+
+            def wait_for_update(self, after_generation, timeout_sec):
+                return {"generation": after_generation + 1, "timestamp": 2.0}
+
+        measurements = iter([
+            {"offered_mbps": 250.0, "goodput_mbps": 100.0,
+             "offered_pps": 1.0, "goodput_pps": 1.0, "loss_pct": 0.0},
+            {"offered_mbps": 350.0, "goodput_mbps": 104.0,
+             "offered_pps": 1.0, "goodput_pps": 1.0, "loss_pct": 0.0},
+        ])
+
+        with patch.object(engine, "_udp_trial_metrics", side_effect=lambda *args: next(measurements)), \
+             patch.object(constants, "UDP_TUNE_SETTLE_SEC", 0.0), \
+             patch.object(constants, "UDP_TUNE_TRIAL_SEC", 0.0), \
+             patch.object(constants, "PEER_STATS_INTERVAL_SEC", 0.0):
+            tuning = engine._run_udp_tuning(
+                cfg, {0: counter}, Mock(), Mock(), PeerStats(), Mock(),
+                None, threading.Event(), engine.time.time(), [])
+
+        self.assertEqual(tuning["best"]["target_mbps"], 250.0)
+        self.assertEqual(tuning["trials"][0]["target_mbps"], 350.0)
+
     def test_udp_retry_wrapper_uses_exponential_backoff(self):
         cfg = engine.ThroughputClientConfig("198.51.100.10", transport="udp")
         result = {"run_id": "ok"}
@@ -33,6 +139,17 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(engine.run_throughput_test(cfg), result)
 
         sleep.assert_called_once_with(constants.UDP_RETRY_BACKOFF_SEC)
+
+    def test_udp_tuning_rejects_short_budget_before_starting(self):
+        cfg = engine.ThroughputClientConfig(
+            "198.51.100.10", transport="udp", acceptable_loss_pct=1.0,
+            max_duration_sec=1.0)
+
+        with patch.object(engine, "_run_throughput_test_once") as run_once, \
+             self.assertRaisesRegex(engine.ThroughputError, "must be at least"):
+            engine.run_throughput_test(cfg)
+
+        run_once.assert_not_called()
 
     def test_dispatch_marks_final_stats_after_merging_peer_counters(self):
         control = Mock()
