@@ -88,6 +88,27 @@ def tcp_mss_for_path_mtu(path_mtu, family=socket.AF_INET):
     return max(64, mtu - overhead)
 
 
+def path_mtu_for_packet_size(packet_size, transport, family=socket.AF_INET):
+    try:
+        size = int(packet_size)
+    except (TypeError, ValueError):
+        raise ValueError("packet length must be an integer") from None
+    if transport == "udp":
+        overhead = 48 if family == socket.AF_INET6 else 28
+        minimum = UDP_HEADER_SIZE
+        label = "UDP datagram"
+    elif transport == "tcp":
+        overhead = 60 if family == socket.AF_INET6 else 40
+        minimum = 64
+        label = "TCP MSS"
+    else:
+        raise ValueError(f"unsupported transport: {transport}")
+    maximum = 65535 - overhead
+    if not minimum <= size <= maximum:
+        raise ValueError(f"{label} length must be between {minimum} and {maximum} bytes")
+    return size + overhead
+
+
 def tcp_write_size_for_path_mtu(path_mtu, family=socket.AF_INET):
     mss = tcp_mss_for_path_mtu(path_mtu, family=family)
     if mss is None:

@@ -22,6 +22,7 @@ from .client import fullbench as fullbench_mod
 from .diagnostics.mtr import MtrRunner, MtrError
 from .diagnostics import connectivity, protocols
 from .diagnostics.pmtud import discover_path_mtu, PmtudError
+from .transport import stream_worker
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_tp.add_argument("--start-port", type=int, default=None,
                        help="base port the server is using for this transport "
                             "(default: 10000 for UDP, 11000 for TCP)")
+    p_tp.add_argument("--packet-length", type=int, default=None, metavar="BYTES",
+                       help="skip PMTUD and manually set the TCP MSS or UDP datagram length in bytes")
     p_tp.add_argument("--bind", default="0.0.0.0", help="local address to bind data sockets")
     p_tp.add_argument("--procs", type=int, default=1,
                        help="spread streams across N worker processes to use multiple CPU cores "
@@ -213,6 +216,13 @@ def cmd_throughput(args):
         max_duration_sec=max_dur,
         ipv6=args.ipv6,
     )
+    if args.packet_length is not None:
+        try:
+            cfg.path_mtu = stream_worker.path_mtu_for_packet_size(
+                args.packet_length, cfg.transport, family=cfg.family)
+        except ValueError as exc:
+            print(f"error: {exc}", flush=True)
+            return
 
     stop_requested = threading.Event()
 

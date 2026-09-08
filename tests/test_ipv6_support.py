@@ -1,6 +1,8 @@
 import socket
 import unittest
+from unittest.mock import patch
 
+from nperf import cli
 from nperf.cli import build_parser
 from nperf.client.engine import ThroughputClientConfig
 from nperf.common import net
@@ -46,6 +48,44 @@ class IPv6SupportTests(unittest.TestCase):
         self.assertEqual(stream_worker.udp_packet_size_for_path_mtu(1500, socket.AF_INET6), 1452)
         self.assertEqual(stream_worker.tcp_mss_for_path_mtu(1500), 1460)
         self.assertEqual(stream_worker.tcp_mss_for_path_mtu(1500, socket.AF_INET6), 1440)
+        self.assertEqual(stream_worker.path_mtu_for_packet_size(1472, "udp"), 1500)
+        self.assertEqual(stream_worker.path_mtu_for_packet_size(1452, "udp", socket.AF_INET6), 1500)
+        self.assertEqual(stream_worker.path_mtu_for_packet_size(1460, "tcp"), 1500)
+        self.assertEqual(stream_worker.path_mtu_for_packet_size(1440, "tcp", socket.AF_INET6), 1500)
+
+    def test_tput_manual_packet_length_sets_equivalent_path_mtu(self):
+        parser = build_parser()
+        cases = (
+            (["tput", "--server-ip", "198.51.100.5", "--udp", "--packet-length", "1472"], 1500),
+            (["tput", "--server-ip", "198.51.100.5", "--tcp", "--packet-length", "1460"], 1500),
+            (["tput", "--server-ip", "2001:db8::5", "-v6", "--udp", "--packet-length", "1452"], 1500),
+            (["tput", "--server-ip", "2001:db8::5", "-v6", "--tcp", "--packet-length", "1440"], 1500),
+        )
+        for argv, expected_path_mtu in cases:
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                with patch.object(cli.signal, "signal"), \
+                     patch.object(cli, "run_throughput_test", return_value={}) as run_test, \
+                     patch.object(cli, "_print_throughput_summary"):
+                    cli.cmd_throughput(args)
+                cfg = run_test.call_args.args[0]
+                self.assertEqual(cfg.path_mtu, expected_path_mtu)
+                self.assertIsNone(cfg.pmtud_info)
+
+    def test_tput_rejects_invalid_manual_packet_lengths(self):
+        parser = build_parser()
+        cases = (
+            ["tput", "--server-ip", "198.51.100.5", "--udp", "--packet-length", "16"],
+            ["tput", "--server-ip", "198.51.100.5", "--tcp", "--packet-length", "63"],
+            ["tput", "--server-ip", "2001:db8::5", "-v6", "--udp", "--packet-length", "65488"],
+            ["tput", "--server-ip", "2001:db8::5", "-v6", "--tcp", "--packet-length", "65476"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                with patch.object(cli, "run_throughput_test") as run_test:
+                    cli.cmd_throughput(args)
+                run_test.assert_not_called()
 
     def test_ipv6_cli_opt_in(self):
         default_config = ThroughputClientConfig("198.51.100.5")

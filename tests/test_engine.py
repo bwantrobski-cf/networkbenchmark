@@ -11,6 +11,20 @@ from nperf.transport import metrics, run_mode
 
 
 class EngineTests(unittest.TestCase):
+    def test_provided_path_mtu_skips_discovery(self):
+        cfg = engine.ThroughputClientConfig("198.51.100.10", path_mtu=1500)
+        control_sock = Mock()
+        control_sock.connect.side_effect = OSError("stop after sizing")
+
+        with patch.object(engine.addr, "resolve_host", return_value="198.51.100.10"), \
+             patch.object(engine.socket, "socket", return_value=control_sock), \
+             patch.object(engine, "_discover_path_mtu") as discover, \
+             self.assertRaisesRegex(OSError, "stop after sizing"):
+            engine._run_throughput_test_once(cfg)
+
+        discover.assert_not_called()
+        self.assertEqual(cfg.pmtud_info["path_mtu_source"], "provided")
+
     def test_tuned_udp_initial_rate_is_paced_per_stream(self):
         cfg = engine.ThroughputClientConfig(
             "198.51.100.10", transport="udp", streams=8, acceptable_loss_pct=1.0)

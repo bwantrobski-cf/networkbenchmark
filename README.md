@@ -149,6 +149,12 @@ python nperf.py tput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
 nperf tput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 python nperf.py tput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 
+# Skip PMTUD and manually use 1472-byte UDP datagrams
+nperf tput --server-ip 10.0.0.5 --udp --packet-length 1472
+
+# Skip PMTUD and manually request a 1460-byte TCP MSS
+nperf tput --server-ip 10.0.0.5 --tcp --packet-length 1460
+
 # UDP loss-target tuning: find the highest rate at or below 1% loss
 nperf tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
     --acceptable-loss 1.0 --max-duration 30
@@ -179,8 +185,11 @@ and macOS uses `TCP_CONNECTION_INFO.tcpi_txretransmitpackets`.
 ### PMTUD sizing for TCP and UDP
 
 Throughput and `fullbench` run Path MTU Discovery before the throughput tests.
-The resulting `path_mtu` is one shared network-path value used for both TCP and
-UDP; the tool does not use separate PMTUD values for the two transports.
+For `tput`, supplying `--packet-length BYTES` skips PMTUD and treats the value as
+the TCP MSS for a TCP test or the complete benchmark datagram length for a UDP
+test. Otherwise, the resulting `path_mtu` is one shared network-path value used
+for both TCP and UDP; the tool does not use separate PMTUD values for the two
+transports.
 
 The packet sizing is then derived differently because TCP and UDP have different
 headers:
