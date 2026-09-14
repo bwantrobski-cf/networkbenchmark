@@ -1,0 +1,47 @@
+MANIFEST.in
+  s_08c678a318e696::t_55589388f0ffb1 1
+nperf/common/host_telemetry.py
+  s_ab276c9424ec60::t_fb43130c3316ea 1-1204
+nperf/transport/stream_worker.py
+  s_ff811096e56265::t_651272d645894d 14-17,19,22,27,29-33,36-45,49-50,54-55,62,70-92,104-109,170,173-186,196,221-224,229,235,237,246-378,390-547,550-551,558-559,562-571,573-586,588-594,597-644,647-657,662-688,691-696,698,701-702,705-742,744-749,751-752,754-840,844-846,850-885,887-888,890-897,899-901,903-905,907-913,915-924,929-930,975-979,983,987-991,1015-1046,1051-1053
+setup.py
+  s_08c678a318e696::t_8fc85609359565 1-18
+tests/test_client_telemetry.py
+  s_ab276c9424ec60::t_57fc2a6fabcad1 1-267
+tests/test_host_telemetry.py
+  s_ab276c9424ec60::t_e2d7a0be3a12e9 1-434
+tests/test_udp_fast_path.py
+  s_ab276c9424ec60::t_308e873af15238 1-495
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1c29333c7231ff55352f772fb3cd6594a2fe0dec",
+  "prompts": {},
+  "sessions": {
+    "s_08c678a318e696": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f72f1f81effe496gqu9WQN3o9X",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "BenW <bwantrobski@cloudflare.com>"
+    },
+    "s_ab276c9424ec60": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f713b9aebffeuBLMRdpCe1X8it",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "BenW <bwantrobski@cloudflare.com>"
+    },
+    "s_ff811096e56265": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f713b9b12ffe92ZHqSMYqmhEQ4",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "BenW <bwantrobski@cloudflare.com>"
+    }
+  }
+}
