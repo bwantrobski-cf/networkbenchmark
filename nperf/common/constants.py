@@ -61,20 +61,28 @@ UDP_PAYLOAD_SIZE = 1200
 TCP_CHUNK_SIZE = 128 * 1024
 FALLBACK_PATH_MTU = 1300
 
+# PMTUD bounds are total IP packet sizes. Standard probing stops at Ethernet
+# MTU unless a caller explicitly requests a larger value, up to the jumbo cap.
+PMTUD_MIN_MTU = 68
+PMTUD_DEFAULT_MAX_MTU = 1500
+PMTUD_JUMBO_MAX_MTU = 9000
+MAX_PARALLEL_STREAMS = 64
+
 # ---------------------------------------------------------------------------
-# UDP loss-target tuning (AIMD rate ramp)
+# UDP loss-target tuning (multiplicative rate search)
 #
 # Unpaced UDP overruns the receiver and drops packets. When an acceptable loss
-# target is set, the client ramps the per-stream send rate iperf-style:
-# additive-increase while loss stays under target, multiplicative back-off when
-# a trial breaches it, converging on the highest rate that meets the target
-# within a max-duration budget.
+# target is set, the client increases the aggregate send rate by a percentage
+# while loss stays under target. Once it brackets the threshold, it refines the
+# range between the highest passing and lowest failing rates.
 # ---------------------------------------------------------------------------
-DEFAULT_MAX_DURATION_SEC = 30
+DEFAULT_MAX_DURATION_SEC = 120
 DEFAULT_ACCEPTABLE_LOSS_PCT = 1.0
 UDP_TUNE_PROBE_SEC = 2.0          # paced probe window at the start rate
-UDP_TUNE_TRIAL_SEC = 2.0          # per-trial measurement window
-UDP_TUNE_SETTLE_SEC = 0.5         # let a new rate take effect / previous drain
+UDP_TUNE_TRIAL_SEC = 5.0          # continuous per-step measurement window
+UDP_TUNE_MIN_TRIAL_DURATION_RATIO = 0.95
+UDP_TUNE_SETTLE_SEC = 2.0         # continuous warm-up before measurement
+UDP_TUNE_CONTROL_GRACE_SEC = 2.0  # keep workers alive beyond the search controller
 UDP_TUNE_BACKOFF_FACTOR = 0.75    # multiplicative decrease on a loss breach
 # The ramp is PACED from a fixed start rate (in aggregate Mbps) rather than an
 # unpaced line-rate burst. An unpaced probe can momentarily send multi-Gbps,
@@ -82,8 +90,11 @@ UDP_TUNE_BACKOFF_FACTOR = 0.75    # multiplicative decrease on a loss breach
 # security devices. Starting at UDP_TUNE_START_MBPS and adjusting up/down avoids
 # that.
 UDP_TUNE_START_MBPS = 250.0       # aggregate Mbps the UDP ramp starts at
-UDP_TUNE_STEP_MBPS = 100.0        # additive increase per successful trial (aggregate Mbps)
-UDP_TUNE_MIN_STEP_MBPS = 25.0     # converged once the step shrinks below this (aggregate Mbps)
+UDP_TUNE_MAX_RATE_MBPS = 100_000.0 # aggregate safety ceiling (100 Gbps)
+UDP_TUNE_INITIAL_INCREASE_PCT = 25.0  # first increase above the starting rate
+UDP_TUNE_INCREASE_GROWTH_FACTOR = 2.0 # grow the increase percentage after each passing trial
+UDP_TUNE_MAX_INCREASE_PCT = 100.0     # cap unbounded growth at 2x the prior rate
+UDP_TUNE_CONVERGENCE_PCT = 5.0    # stop once passing/failing rates are within this percentage
 # Loss alone can't detect a saturated path with a deep buffer: packets pile into
 # the buffer (huge latency) instead of being dropped, so loss stays ~0 while the
 # offered rate runs far above the real goodput. Treat a higher offered rate that

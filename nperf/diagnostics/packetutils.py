@@ -96,12 +96,20 @@ def parse_ip_header(data: bytes, family=None):
     }
 
 
-def parse_icmp_packet(raw: bytes, family=None):
+def parse_icmp_packet(raw: bytes, family=None, source_ip=None):
     """Parse a raw IPv4/IPv6 packet carrying ICMP or ICMPv6."""
-    ip = parse_ip_header(raw, family=family)
-    if ip is None:
-        return None
-    icmp_data = raw[ip["header_len"]:]
+    payload_only_v6 = (
+        family == socket.AF_INET6
+        and not (len(raw) >= 40 and (raw[0] >> 4) == 6)
+    )
+    if payload_only_v6:
+        ip = {"version": 6, "src": source_ip, "ttl": None, "header_len": 0}
+        icmp_data = raw
+    else:
+        ip = parse_ip_header(raw, family=family)
+        if ip is None:
+            return None
+        icmp_data = raw[ip["header_len"]:]
     if len(icmp_data) < 8:
         return None
 

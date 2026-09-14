@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Mapping
 
 # Allow running this file directly via `streamlit run .../webui/app.py`
 # without the package being pip-installed.
@@ -26,7 +27,7 @@ from nperf.client.engine import ThroughputClientConfig, run_throughput_test
 from nperf.client.fullbench import FullBenchConfig, run_fullbench
 from nperf.diagnostics.mtr import MtrRunner, MtrError
 from nperf.diagnostics import connectivity, protocols
-from nperf.diagnostics.pmtud import run_pmtud, PmtudError
+from nperf.diagnostics.pmtud import discover_path_mtu, PmtudError
 
 
 st.set_page_config(page_title="NPERF", layout="wide")
@@ -40,6 +41,7 @@ def _init_state():
     defaults = {
         "server_ip": "",
         "ipv6": False,
+        "jumbo_mtu": False,
         "udp_port": constants.DEFAULT_UDP_PORT,
         "tcp_port": constants.DEFAULT_TCP_PORT,
         "control_port": constants.DEFAULT_CONTROL_PORT,
@@ -78,6 +80,35 @@ _init_state()
 CAPS = privileges.probe_capabilities()
 
 
+def _tuning_trial_status(trial, target):
+    target_attained = trial.get("target_attained")
+    if target_attained is None:
+        target_attained = (trial.get("classification") or {}).get("target_attained")
+    if target_attained is False:
+        return "TARGET NOT ATTAINED"
+    return "OK" if trial.get("loss_pct", float("inf")) <= target else "BREACH"
+
+
+def _rxq_drop_display(endpoint):
+    if not isinstance(endpoint, Mapping):
+        return "unavailable"
+    supported = endpoint.get("rxq_overflow_supported")
+    if supported is None:
+        stream_support = [
+            stream.get("rxq_overflow_supported")
+            for stream in endpoint.get("streams") or []
+            if isinstance(stream, Mapping)
+        ]
+        supported = any(value is True for value in stream_support)
+    drops = endpoint.get("kernel_rxq_drops")
+    if supported is not True or drops is None or isinstance(drops, bool):
+        return "unavailable"
+    try:
+        return str(max(0, int(drops)))
+    except (TypeError, ValueError, OverflowError):
+        return "unavailable"
+
+
 def _cap_badge(name: str, label: str = None):
     label = label or name
     ok = CAPS.get(name)
@@ -102,6 +133,9 @@ def render_header():
     with col2:
         st.session_state.ipv6 = st.checkbox("Use IPv6", value=st.session_state.ipv6,
                                             help="Use IPv6 for the selected client test instead of the default IPv4.")
+        st.session_state.jumbo_mtu = st.checkbox(
+            "Allow jumbo MTU", value=st.session_state.jumbo_mtu,
+            help="Opt in to PMTUD probes up to total MTU 9000. Unchecked probes up to 1500.")
         st.caption(f"Selected IP version: {'IPv6' if st.session_state.ipv6 else 'IPv4'}")
     with col3:
         st.write("")
@@ -213,22 +247,33 @@ def render_throughput_tab():
 
     tune_enabled = False
     acceptable_loss = 1.0
+    udp_start_mbps = constants.UDP_TUNE_START_MBPS
+    udp_max_duration = constants.DEFAULT_MAX_DURATION_SEC
     if transport == "UDP":
         tcol1, tcol2 = st.columns(2)
         with tcol1:
-            tune_enabled = st.checkbox("Tune to acceptable loss (AIMD ramp)", value=False,
+            tune_enabled = st.checkbox("Tune to acceptable loss (multiplicative search)", value=False,
                                        disabled=busy,
                                        help="Ramp the UDP send rate to find the max rate whose loss "
-                                            "stays under the target. The Duration above becomes the "
-                                            "max time budget for the search.")
+                                            "stays under the target. The separate tuning duration "
+                                            "below is the max time budget for the search.")
         with tcol2:
             acceptable_loss = st.number_input("Acceptable loss (%)", min_value=0.0, max_value=100.0,
                                               value=1.0, step=0.1,
                                               disabled=busy or not tune_enabled,
                                               key="tp_acceptable_loss")
+        udp_start_mbps = st.number_input(
+            "UDP tuning start rate (Mbps)", min_value=1.0,
+            max_value=constants.UDP_TUNE_MAX_RATE_MBPS, value=constants.UDP_TUNE_START_MBPS,
+            step=50.0, disabled=busy or not tune_enabled, key="tp_udp_start_mbps")
+        udp_max_duration = st.number_input(
+            "UDP tuning max duration (sec)", min_value=10,
+            max_value=3600, value=int(constants.DEFAULT_MAX_DURATION_SEC),
+            disabled=busy or not tune_enabled, key="tp_udp_max_duration")
         if tune_enabled:
-            st.caption(f"Tuning mode: 'Duration' ({int(duration)}s) is the max search budget; "
-                       f"the result is the highest rate meeting <= {acceptable_loss:.2f}% loss.")
+            st.caption(f"Tuning mode: {int(udp_max_duration)}s max search budget; "
+                       f"start at {udp_start_mbps:g} Mbps and find the highest rate meeting "
+                       f"<= {acceptable_loss:.2f}% loss.")
 
     bcol1, bcol2 = st.columns(2)
     start_clicked = bcol1.button("Start Test", type="primary", disabled=busy, use_container_width=True)
@@ -241,6 +286,7 @@ def render_throughput_tab():
             "streams": int(streams),
             "procs": int(procs),
             "start_port": int(start_port),
+            "jumbo_mtu": st.session_state.jumbo_mtu,
         }
         cfg = ThroughputClientConfig(
             server_ip=st.session_state.server_ip,
@@ -253,8 +299,10 @@ def render_throughput_tab():
             procs=int(procs),
             acceptable_loss_pct=(float(acceptable_loss)
                                  if (transport == "UDP" and tune_enabled) else None),
-            max_duration_sec=float(duration),
+            max_duration_sec=(float(udp_max_duration) if tune_enabled else float(duration)),
+            udp_start_mbps=float(udp_start_mbps),
             ipv6=st.session_state.ipv6,
+            jumbo_mtu=st.session_state.jumbo_mtu,
         )
         stop_event = threading.Event()
         live_list = []
@@ -278,7 +326,7 @@ def render_throughput_tab():
         launch_spec = st.session_state.get("tp_launch_spec") or {}
         st.caption(f"Running: {launch_spec.get('transport')} {launch_spec.get('direction')} | "
                    f"streams={launch_spec.get('streams')} | procs={launch_spec.get('procs')} | "
-                   f"base port={launch_spec.get('start_port')}")
+                   f"base port={launch_spec.get('start_port')} | jumbo MTU={launch_spec.get('jumbo_mtu')}")
         holder = st.session_state.get("tp_result_holder", {})
         # Snapshot the shared list: the background worker thread appends to it
         # concurrently, so build the DataFrame from a stable copy to avoid a
@@ -319,11 +367,21 @@ def render_throughput_tab():
 
     summary = st.session_state.tp_summary
     if summary:
-        st.success("Test complete")
+        tuning = summary.get("tuning") or {}
+        termination_reason = tuning.get("termination_reason")
+        if termination_reason == "target_not_attained":
+            st.error("Sender target not attained. This result is not a network throughput ceiling.")
+        elif tuning and not tuning.get("search_complete", False):
+            st.warning("Test complete with an unconfirmed lower bound, not a measured ceiling.")
+        else:
+            st.success("Test complete")
         observed_streams = len(summary.get("per_stream") or [])
         configured_streams = summary.get("streams", observed_streams)
         st.caption(f"Address family: {summary.get('ip_version', 'IPv4')} | "
                    f"parallel streams: {configured_streams} configured, {observed_streams} observed")
+        st.caption(f"PMTUD: jumbo_mtu={summary.get('jumbo_mtu', False)} | "
+                   f"max MTU={summary.get('probe_max_mtu')} | "
+                   f"ceiling reached={summary.get('probe_ceiling_reached')}")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Send", f"{summary['send_mbps']:.2f} Mbps")
         m2.metric("Recv", f"{summary['recv_mbps']:.2f} Mbps")
@@ -342,31 +400,59 @@ def render_throughput_tab():
                        f"{constants.TCP_MSS_ESTIMATE}-byte MSS (the byte stream has no "
                        "application-visible packet boundaries).")
 
-        tuning = summary.get("tuning")
         if tuning:
-            st.write("**UDP rate tuning (AIMD ramp)**")
-            best = tuning.get("best") or {}
+            st.write("**UDP rate tuning (multiplicative search)**")
+            best = tuning.get("best")
             probe = tuning.get("probe") or {}
             tc1, tc2, tc3 = st.columns(3)
-            tc1.metric("Best sustainable goodput", f"{best.get('goodput_mbps', 0):,.0f} Mbps")
-            tc2.metric("At loss", f"{best.get('loss_pct', 0):.2f}%")
+            best_label = ("Confirmed ceiling goodput" if tuning.get("ceiling_confirmed")
+                          else "Best passing lower bound")
+            tc1.metric(best_label, f"{best.get('goodput_mbps', 0):,.0f} Mbps" if best else "n/a")
+            tc2.metric("At loss", f"{best.get('loss_pct', 0):.2f}%" if best else "n/a")
             tc3.metric("Loss target", f"{tuning.get('acceptable_loss_pct', 0):.2f}%")
-            rows = [{
-                "target": "unpaced probe",
-                "offered (Mbps)": round(probe.get("offered_mbps", 0)),
-                "goodput (Mbps)": round(probe.get("goodput_mbps", 0)),
-                "loss %": round(probe.get("loss_pct", 0), 2),
-            }]
+            if not tuning.get("search_complete", False):
+                st.warning(f"Search incomplete: {tuning.get('termination_reason', 'unknown')}. "
+                           "The displayed rate is the best tested rate, not a confirmed ceiling.")
+            elif not best:
+                st.warning("No tested rate met the loss target.")
+            rows = []
+            if probe:
+                rows.append({
+                    "target": "paced probe",
+                    "status": _tuning_trial_status(
+                        probe, tuning.get("acceptable_loss_pct", 0)),
+                    "offered (Mbps)": round(probe.get("offered_mbps", 0)),
+                    "goodput (Mbps)": round(probe.get("goodput_mbps", 0)),
+                    "loss %": round(probe.get("loss_pct", 0), 2),
+                })
             for tr in tuning.get("trials", []):
                 rows.append({
                     "target": f"{tr['target_mbps']:.0f} Mbps",
+                    "status": _tuning_trial_status(
+                        tr, tuning.get("acceptable_loss_pct", 0)),
                     "offered (Mbps)": round(tr["offered_mbps"]),
                     "goodput (Mbps)": round(tr["goodput_mbps"]),
                     "loss %": round(tr["loss_pct"], 2),
                 })
-            st.table(pd.DataFrame(rows))
-            if not best.get("target_mbps"):
-                st.caption("Unpaced already met the loss target -- no rate limiting needed.")
+            if rows:
+                st.table(pd.DataFrame(rows))
+            if tuning.get("limiting_factor"):
+                st.write("**Limiting evidence**")
+                st.table(pd.DataFrame([{
+                    "Factor": tuning.get("limiting_factor"),
+                    "Scope": tuning.get("limiting_scope") or "unknown",
+                    "Confidence": tuning.get("limiting_confidence") or "low",
+                }]))
+
+        if summary.get("transport") == "udp":
+            udp_batch = summary.get("udp_batch") or {}
+            socket_telemetry = summary.get("socket_telemetry") or {}
+            st.caption(
+                "UDP data plane: "
+                f"client backend={(udp_batch.get('client') or {}).get('selected', 'unknown')} | "
+                f"server backend={(udp_batch.get('server') or {}).get('selected', 'unknown')} | "
+                f"client RXQ drops={_rxq_drop_display(socket_telemetry.get('client'))} | "
+                f"server RXQ drops={_rxq_drop_display(socket_telemetry.get('server'))}")
 
         lr = summary.get("loaded_rtt") or {}
         st.write("**Latency (control-channel probe RTT)**")
@@ -430,7 +516,8 @@ def render_fullbench_tab():
 
     tune_enabled = False
     acceptable_loss = 1.0
-    udp_max_duration = 30
+    udp_max_duration = int(constants.DEFAULT_MAX_DURATION_SEC)
+    udp_start_mbps = constants.UDP_TUNE_START_MBPS
     if "UDP" in transports:
         col1, col2 = st.columns(2)
         with col1:
@@ -440,9 +527,14 @@ def render_fullbench_tab():
                                               value=1.0, step=0.1,
                                               disabled=busy or not tune_enabled,
                                               key="fb_acceptable_loss")
-        udp_max_duration = st.number_input("UDP tuning max duration (sec)", min_value=1, max_value=3600,
-                                           value=30, disabled=busy or not tune_enabled,
+        udp_max_duration = st.number_input("UDP tuning max duration (sec)", min_value=10, max_value=3600,
+                                           value=int(constants.DEFAULT_MAX_DURATION_SEC),
+                                           disabled=busy or not tune_enabled,
                                            key="fb_udp_max_duration")
+        udp_start_mbps = st.number_input(
+            "UDP tuning start rate (Mbps)", min_value=1.0,
+            max_value=constants.UDP_TUNE_MAX_RATE_MBPS, value=constants.UDP_TUNE_START_MBPS,
+            step=50.0, disabled=busy or not tune_enabled, key="fb_udp_start_mbps")
 
     col1, col2 = st.columns(2)
     start_clicked = col1.button("Start Fullbench", type="primary", disabled=busy,
@@ -463,9 +555,11 @@ def render_fullbench_tab():
                 duration_sec=float(duration),
                 acceptable_loss_pct=(float(acceptable_loss) if tune_enabled else None),
                 udp_max_duration_sec=float(udp_max_duration),
+                udp_start_mbps=float(udp_start_mbps),
                 udp_port=int(st.session_state.udp_port),
                 tcp_port=int(st.session_state.tcp_port),
                 ipv6=st.session_state.ipv6,
+                jumbo_mtu=st.session_state.jumbo_mtu,
             )
             stop_event = threading.Event()
             progress = []
@@ -505,16 +599,47 @@ def render_fullbench_tab():
 
     manifest = st.session_state.fb_manifest
     if manifest:
-        st.success(f"Fullbench complete: {manifest.get('completed', 0)}/{manifest.get('test_count', 0)} tests")
+        failures = int(manifest.get("test_failures", 0) or 0)
+        completed = int(manifest.get("completed", 0) or 0)
+        planned = int(manifest.get("test_count", 0) or 0)
+        completion_status = manifest.get("status") or (
+            "complete" if completed >= planned else "incomplete")
+        incomplete = (completed < planned
+                      or completion_status in ("aborted", "incomplete"))
+        invalid_benchmarks = sum(
+            test.get("tuning_termination_reason") == "target_not_attained"
+            for test in manifest.get("tests", []))
+        status_message = (f"Fullbench {completion_status}: {completed}/{planned} tests; "
+                          f"{failures} failed; {invalid_benchmarks} invalid ceiling result(s)")
+        if failures or incomplete or invalid_benchmarks:
+            st.error(status_message)
+        else:
+            st.success(status_message)
         st.caption(f"Benchmark ID: {manifest.get('benchmark_id')} | IP version: {manifest.get('ip_version', 'IPv4')}")
+        st.caption(f"PMTUD: jumbo_mtu={manifest.get('jumbo_mtu', False)} | "
+                   f"max MTU={manifest.get('probe_max_mtu')} | "
+                   f"ceiling reached={manifest.get('probe_ceiling_reached')}")
         rows = []
         for test in manifest.get("tests", []):
+            if test.get("tuning_termination_reason") == "target_not_attained":
+                status = "TARGET NOT ATTAINED"
+            elif not test.get("ok"):
+                status = "FAILED"
+            elif test.get("tuning_search_complete") is False:
+                status = "INCOMPLETE"
+            else:
+                status = "OK"
             row = {
                 "Transport": test.get("transport", "").upper(),
                 "Direction": test.get("direction", "").title(),
                 "Streams": test.get("streams"),
                 "Processes": test.get("procs"),
-                "Status": "OK" if test.get("ok") else "FAILED",
+                "Status": status,
+                "Search Result": test.get("tuning_termination_reason"),
+                "Result Type": test.get("tuning_result_kind"),
+                "Limiting Factor": test.get("tuning_limiting_factor"),
+                "Limit Scope": test.get("tuning_limiting_scope"),
+                "Confidence": test.get("tuning_limiting_confidence"),
                 "Send Mbps": test.get("send_mbps"),
                 "Recv Mbps": test.get("recv_mbps"),
                 "Loss %": test.get("loss_pct"),
@@ -646,19 +771,29 @@ def render_pmtud_section():
     if st.button("Run PMTUD", disabled=not CAPS.get(pmtud_capability)):
         with st.spinner("Running PMTUD..."):
             try:
-                st.session_state.pmtud_result = run_pmtud(
+                result = discover_path_mtu(
                     st.session_state.server_ip, udp_port=st.session_state.udp_port,
+                    max_mtu=(constants.PMTUD_JUMBO_MAX_MTU if st.session_state.jumbo_mtu
+                             else constants.PMTUD_DEFAULT_MAX_MTU),
                     ipv6=st.session_state.ipv6)
-            except PmtudError as exc:
+                result["jumbo_mtu"] = st.session_state.jumbo_mtu
+                st.session_state.pmtud_result = result
+            except (PmtudError, ValueError) as exc:
                 st.session_state.pmtud_result = {"success": False, "error": str(exc)}
 
     result = st.session_state.pmtud_result
     if result:
         if result.get("success"):
             st.success(f"Path MTU: {result['path_mtu']} bytes (payload {result.get('path_mtu_payload_bytes')} bytes)")
+        elif isinstance(result.get("path_mtu"), int):
+            st.warning(f"Path MTU fallback: {result['path_mtu']} bytes ({result.get('fallback_reason')})")
         else:
             st.error(result.get("error"))
-        st.caption(f"Connectivity confirmed: {result.get('connectivity_confirmed')}")
+        st.caption(f"Source: {result.get('path_mtu_source')} | "
+                   f"connectivity confirmed: {result.get('connectivity_confirmed')} | "
+                   f"jumbo_mtu={result.get('jumbo_mtu', False)} | "
+                   f"max MTU={result.get('probe_max_mtu')} | "
+                   f"ceiling reached={result.get('probe_ceiling_reached')}")
         with st.expander("Raw result"):
             st.json(result)
         if st.button("Save PMTUD log"):

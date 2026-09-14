@@ -15,6 +15,7 @@ import argparse
 import signal
 import sys
 import threading
+from collections.abc import Mapping
 
 from .common import constants, privileges, logging_store
 from .client.engine import ThroughputClientConfig, ThroughputError, run_throughput_test
@@ -59,17 +60,23 @@ def build_parser() -> argparse.ArgumentParser:
                        help="base port the server is using for this transport "
                             "(default: 10000 for UDP, 11000 for TCP)")
     p_tp.add_argument("--packet-length", type=int, default=None, metavar="BYTES",
-                       help="skip PMTUD and manually set the TCP MSS or UDP datagram length in bytes")
+                       help="skip PMTUD and manually set the TCP MSS or UDP datagram length in bytes "
+                            "(maximum is limited by the 9000-byte total path-MTU cap)")
+    p_tp.add_argument("--jumbo-mtu", action="store_true",
+                       help="allow PMTUD to probe total MTUs up to 9000 instead of the default 1500")
     p_tp.add_argument("--bind", default="0.0.0.0", help="local address to bind data sockets")
     p_tp.add_argument("--procs", type=int, default=1,
                        help="spread streams across N worker processes to use multiple CPU cores "
                             "(default: 1 = single-process/threaded). Requires >1 stream.")
     p_tp.add_argument("--acceptable-loss", type=float, default=None, metavar="PCT",
-                       help="UDP only: tune the send rate (AIMD ramp) to find the max rate whose "
-                            "loss stays <= PCT%%. In this mode --time becomes a max-duration budget.")
+                       help="UDP only: tune the send rate (multiplicative search) to find the max rate whose "
+                            "loss stays <= PCT%%. The search uses --max-duration as its time budget.")
     p_tp.add_argument("--max-duration", type=float, default=None, metavar="SEC",
                        help="UDP tuning: max time budget for the rate search "
-                            f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s; overrides --time as the budget).")
+                            f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s).")
+    p_tp.add_argument("--udp-start-mbps", type=float, default=constants.UDP_TUNE_START_MBPS,
+                       metavar="MBPS",
+                       help=f"UDP tuning starting aggregate rate (default: {constants.UDP_TUNE_START_MBPS:g} Mbps)")
     p_tp.add_argument("--log-dir", default=None)
     p_tp.set_defaults(func=cmd_throughput)
 
@@ -87,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="comma-separated directions to test: up, down (default: up,down)")
     p_fb.add_argument("--streams", default="1,8,16,32",
                        help="comma-separated list of parallel-stream counts, e.g. 1,8,16,32 "
-                            "(default: 1,8,16,32)")
+                            f"(default: 1,8,16,32; maximum: {constants.MAX_PARALLEL_STREAMS})")
     p_fb.add_argument("--procs", default="1",
                        help="worker processes per test: a single value applied to every run, or a "
                             "comma-separated list matching --streams (paired per stream count). "
@@ -100,13 +107,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_fb.add_argument("--udp-max-duration", type=float, default=constants.DEFAULT_MAX_DURATION_SEC,
                        metavar="SEC",
                        help=f"max time budget for each UDP tuning search "
-                            f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s)")
+                             f"(default: {constants.DEFAULT_MAX_DURATION_SEC}s)")
+    p_fb.add_argument("--udp-start-mbps", type=float, default=constants.UDP_TUNE_START_MBPS,
+                       metavar="MBPS",
+                       help=f"UDP tuning starting aggregate rate (default: {constants.UDP_TUNE_START_MBPS:g} Mbps)")
     p_fb.add_argument("--start-port", type=int, default=None,
                        help="server base port (auto per transport if omitted)")
     p_fb.add_argument("--udp-port", type=int, default=None,
                        help="server UDP base port (default: 10000)")
     p_fb.add_argument("--tcp-port", type=int, default=None,
                        help="server TCP base port (default: 11000)")
+    p_fb.add_argument("--jumbo-mtu", action="store_true",
+                       help="allow PMTUD to probe total MTUs up to 9000 instead of the default 1500")
     p_fb.add_argument("--bind", default="0.0.0.0", help="local address to bind data sockets")
     p_fb.add_argument("--label", default=None, help="optional label attached to every result")
     p_fb.add_argument("--run-id", type=int, default=None,
@@ -161,8 +173,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_pmtud.add_argument("--server-ip", required=True)
     p_pmtud.add_argument("-v6", "--ipv6", action="store_true", help="use IPv6 instead of the default IPv4")
     p_pmtud.add_argument("--udp-port", type=int, default=constants.DEFAULT_UDP_PORT)
-    p_pmtud.add_argument("--min-size", type=int, default=68)
-    p_pmtud.add_argument("--max-size", type=int, default=9000)
+    p_pmtud.add_argument("--jumbo-mtu", action="store_true",
+                         help="allow total-MTU probes up to 9000 instead of the default 1500")
+    min_mtu_group = p_pmtud.add_mutually_exclusive_group()
+    min_mtu_group.add_argument(
+        "--min-mtu", type=int, default=None, metavar="MTU",
+        help=f"minimum total IP MTU to probe (default: {constants.PMTUD_MIN_MTU})")
+    min_mtu_group.add_argument(
+        "--min-size", type=int, default=None, metavar="UDP_PAYLOAD_BYTES",
+        help="deprecated: minimum UDP payload size; converted to total IP MTU")
+    max_mtu_group = p_pmtud.add_mutually_exclusive_group()
+    max_mtu_group.add_argument(
+        "--max-mtu", type=int, default=None, metavar="MTU",
+        help="maximum total IP MTU to probe (default: selected 1500/9000 mode ceiling)")
+    max_mtu_group.add_argument(
+        "--max-size", type=int, default=None, metavar="UDP_PAYLOAD_BYTES",
+        help="deprecated: maximum UDP payload size; converted to total IP MTU")
     p_pmtud.add_argument("--timeout", type=float, default=1.5)
     p_pmtud.add_argument("--log-dir", default=None)
     p_pmtud.set_defaults(func=cmd_pmtud)
@@ -200,26 +226,39 @@ def cmd_throughput(args):
     if args.acceptable_loss is not None and args.transport != "udp":
         print("error: --acceptable-loss is only valid for UDP (--udp)", flush=True)
         return
-    max_dur = args.max_duration if args.max_duration is not None else args.time
+    max_dur = (args.max_duration if args.max_duration is not None
+               else (constants.DEFAULT_MAX_DURATION_SEC
+                     if args.acceptable_loss is not None else args.time))
 
-    cfg = ThroughputClientConfig(
-        server_ip=args.server_ip,
-        control_port=args.control_port,
-        transport=args.transport,
-        direction="down" if args.reverse else "up",
-        streams=args.parallel,
-        duration_sec=args.time,
-        start_port=args.start_port,
-        bind=args.bind,
-        procs=args.procs,
-        acceptable_loss_pct=args.acceptable_loss,
-        max_duration_sec=max_dur,
-        ipv6=args.ipv6,
-    )
+    try:
+        cfg = ThroughputClientConfig(
+            server_ip=args.server_ip,
+            control_port=args.control_port,
+            transport=args.transport,
+            direction="down" if args.reverse else "up",
+            streams=args.parallel,
+            duration_sec=args.time,
+            start_port=args.start_port,
+            bind=args.bind,
+            procs=args.procs,
+            acceptable_loss_pct=args.acceptable_loss,
+            max_duration_sec=max_dur,
+            udp_start_mbps=args.udp_start_mbps,
+            ipv6=args.ipv6,
+            jumbo_mtu=args.jumbo_mtu,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", flush=True)
+        sys.exit(2)
     if args.packet_length is not None:
         try:
-            cfg.path_mtu = stream_worker.path_mtu_for_packet_size(
+            path_mtu = stream_worker.path_mtu_for_packet_size(
                 args.packet_length, cfg.transport, family=cfg.family)
+            if path_mtu > constants.PMTUD_JUMBO_MAX_MTU:
+                raise ValueError(
+                    f"packet length implies a {path_mtu}-byte path MTU, exceeding "
+                    f"the {constants.PMTUD_JUMBO_MAX_MTU}-byte cap")
+            cfg.path_mtu = path_mtu
         except ValueError as exc:
             print(f"error: {exc}", flush=True)
             return
@@ -260,47 +299,111 @@ def cmd_throughput(args):
         print(f"ERROR: throughput test could not start: {exc}", flush=True)
         sys.exit(1)
     _print_throughput_summary(summary)
+    termination_reason = (summary.get("tuning") or {}).get("termination_reason")
+    if (summary.get("aborted")
+            or summary.get("status") in ("aborted", "cancelled")
+            or termination_reason in ("stopped", "target_not_attained")):
+        sys.exit(1)
+
+
+def _tuning_trial_status(trial, target):
+    target_attained = trial.get("target_attained")
+    if target_attained is None:
+        target_attained = (trial.get("classification") or {}).get("target_attained")
+    if target_attained is False:
+        return "TARGET NOT ATTAINED"
+    return "ok" if trial.get("loss_pct", float("inf")) <= target else "BREACH"
 
 
 def _print_tuning_summary(tuning):
-    print("\n=== UDP Rate Tuning (AIMD ramp) ===")
+    print("\n=== UDP Rate Tuning (multiplicative search) ===")
     target = tuning.get("acceptable_loss_pct")
     probe = tuning.get("probe") or {}
     print(f"  acceptable loss target: {target:.2f}%")
-    print(f"  paced probe: offered={probe.get('offered_mbps', 0):.0f} Mbps  "
-          f"goodput={probe.get('goodput_mbps', 0):.0f} Mbps  loss={probe.get('loss_pct', 0):.2f}%")
+    print(f"  start: {tuning.get('start_mbps', 0):g} Mbps; automatic increase: "
+          f"{tuning.get('initial_increase_pct', 0):g}% to "
+          f"{tuning.get('max_increase_pct', 0):g}%")
+    if probe:
+        probe_status = _tuning_trial_status(probe, target)
+        print(f"  paced probe: offered={probe.get('offered_mbps', 0):.0f} Mbps  "
+              f"goodput={probe.get('goodput_mbps', 0):.0f} Mbps  "
+              f"loss={probe.get('loss_pct', 0):.2f}%  [{probe_status}]")
+    else:
+        print("  paced probe: not completed")
     trials = tuning.get("trials") or []
     if trials:
         print("  ramp trials (target -> goodput @ loss):")
         for tr in trials:
-            flag = "ok" if tr["loss_pct"] <= target else "BREACH"
+            flag = _tuning_trial_status(tr, target)
             print(f"    {tr['target_mbps']:8.0f} Mbps -> {tr['goodput_mbps']:8.0f} Mbps "
                   f"@ {tr['loss_pct']:5.2f}%  [{flag}]")
     best = tuning.get("best")
+    reason = tuning.get("termination_reason", "unknown")
+    confirmed = bool(tuning.get("ceiling_confirmed"))
     if best:
         label = "unpaced (already under target)" if not best.get("target_mbps") else f"{best['target_mbps']:.0f} Mbps target"
-        print(f"  BEST sustainable: {label} -> goodput={best.get('goodput_mbps', 0):.0f} Mbps "
+        result_label = ("CONFIRMED ceiling" if confirmed
+                        else "best passing lower bound (ceiling unconfirmed)")
+        print(f"  {result_label}: {label} -> goodput={best.get('goodput_mbps', 0):.0f} Mbps "
               f"({best.get('goodput_pps', 0):.0f} pps) at {best.get('loss_pct', 0):.2f}% loss")
     else:
         print("  no rate met the loss target within the budget")
+    if not tuning.get("search_complete", False):
+        print(f"  search incomplete: {reason}")
+    if reason == "target_not_attained":
+        print("  RESULT INVALID AS NETWORK CEILING: sender did not attain the requested load")
+    limiting_factor = tuning.get("limiting_factor")
+    if limiting_factor:
+        print("  limiting evidence: "
+              f"factor={limiting_factor} scope={tuning.get('limiting_scope') or 'unknown'} "
+              f"confidence={tuning.get('limiting_confidence') or 'low'}")
+
+
+def _rxq_drop_display(endpoint):
+    if not isinstance(endpoint, Mapping):
+        return "unavailable"
+    supported = endpoint.get("rxq_overflow_supported")
+    if supported is None:
+        stream_support = [
+            stream.get("rxq_overflow_supported")
+            for stream in endpoint.get("streams") or []
+            if isinstance(stream, Mapping)
+        ]
+        supported = any(value is True for value in stream_support)
+    drops = endpoint.get("kernel_rxq_drops")
+    if supported is not True or drops is None or isinstance(drops, bool):
+        return "unavailable"
+    try:
+        return str(max(0, int(drops)))
+    except (TypeError, ValueError, OverflowError):
+        return "unavailable"
 
 
 def _print_throughput_summary(summary):
     tuning = summary.get("tuning")
     if tuning:
         _print_tuning_summary(tuning)
+    pmtud = summary.get("pmtud") or {}
     print("\n=== Throughput Test Summary ===")
+    print(f"  status: {summary.get('status', 'complete')}")
     print(f"  IP version: {summary.get('ip_version', 'IPv4')}")
     print(f"  path MTU: {summary.get('path_mtu')} bytes  "
-          f"source={summary.get('pmtud', {}).get('path_mtu_source', 'unknown')}  "
-          f"bidirectional={summary.get('pmtud', {}).get('bidirectional_validated')} "
-          f"method={summary.get('pmtud', {}).get('bidirectional_validation', 'unknown')}")
+          f"source={pmtud.get('path_mtu_source', 'unknown')}  "
+          f"bidirectional={pmtud.get('bidirectional_validated')} "
+          f"method={pmtud.get('bidirectional_validation', 'unknown')}")
+    print(f"  PMTUD ceiling: jumbo_mtu={summary.get('jumbo_mtu', False)}  "
+          f"max_mtu={summary.get('probe_max_mtu')}  "
+          f"reached={summary.get('probe_ceiling_reached')}")
     print(f"  packet sizing: TCP MSS={summary.get('tcp_mss_bytes')} bytes  "
           f"UDP datagram={summary.get('udp_datagram_bytes')} bytes")
     print(f"  send: {summary['send_mbps']:.2f} Mbps   recv: {summary['recv_mbps']:.2f} Mbps")
     print(f"  send: {summary.get('send_pps', 0):.1f} pps   recv: {summary.get('recv_pps', 0):.1f} pps")
     if summary.get("loss_pct") is not None:
         print(f"  UDP packet loss: {summary['loss_pct']:.3f}%")
+        udp_batch = summary.get("udp_batch") or {}
+        print("  UDP batch backend: "
+              f"client={(udp_batch.get('client') or {}).get('selected', 'unknown')} "
+              f"server={(udp_batch.get('server') or {}).get('selected', 'unknown')}")
     if summary.get("retransmits") is not None:
         print(f"  TCP retransmits: {summary['retransmits']}")
     print(f"  unloaded RTT: {summary.get('unloaded_rtt_ms')} ms")
@@ -310,6 +413,11 @@ def _print_throughput_summary(summary):
     bb = summary.get("bufferbloat") or {}
     print(f"  bufferbloat: BDP={bb.get('bdp_bytes')} bytes  buffered={bb.get('buffered_bytes')} bytes  "
           f"bloat_factor={bb.get('bloat_factor')}")
+    socket_telemetry = summary.get("socket_telemetry") or {}
+    if summary.get("transport") == "udp" and socket_telemetry:
+        print("  kernel RX queue drops: "
+              f"client={_rxq_drop_display(socket_telemetry.get('client'))} "
+              f"server={_rxq_drop_display(socket_telemetry.get('server'))}")
     print(f"  log: {summary.get('log_json')}")
     print(f"       {summary.get('log_text')}")
 
@@ -326,6 +434,7 @@ def cmd_fullbench(args):
             duration_sec=args.time,
             acceptable_loss_pct=args.acceptable_loss,
             udp_max_duration_sec=args.udp_max_duration,
+            udp_start_mbps=args.udp_start_mbps,
             bind=args.bind,
             start_port=args.start_port,
             udp_port=args.udp_port,
@@ -343,6 +452,7 @@ def cmd_fullbench(args):
             tool_version=args.tool_version,
             test_type=args.test_type,
             ipv6=args.ipv6,
+            jumbo_mtu=args.jumbo_mtu,
         )
     except ValueError as exc:
         print(f"ERROR: {exc}")
@@ -352,8 +462,11 @@ def cmd_fullbench(args):
     print(f"fullbench plan: {len(plan)} test(s) -> {cfg.server_ip} ({cfg.ip_version})")
     print(f"identity: ip_version={cfg.ip_version} run_id={cfg.run_id} vm_name={cfg.vm_name} cloud={cfg.cloud} "
           f"environment={cfg.environment} test_type={cfg.test_type}")
+    print(f"PMTUD ceiling: jumbo_mtu={cfg.jumbo_mtu} max_mtu="
+          f"{constants.PMTUD_JUMBO_MAX_MTU if cfg.jumbo_mtu else constants.PMTUD_DEFAULT_MAX_MTU}")
     for i, spec in enumerate(plan, start=1):
-        mode = (f"tune<= {cfg.acceptable_loss_pct}% (<= {cfg.udp_max_duration_sec:.0f}s)"
+        mode = (f"tune<= {cfg.acceptable_loss_pct}% from {cfg.udp_start_mbps:g} Mbps "
+                f"(<= {cfg.udp_max_duration_sec:.0f}s)"
                 if spec["tune"] else f"fixed {cfg.duration_sec:.0f}s")
         print(f"  [{i}] {spec['transport']} {spec['direction']} "
               f"streams={spec['streams']} procs={spec['procs']}  [{mode}]")
@@ -386,11 +499,21 @@ def cmd_fullbench(args):
         test for test in manifest["tests"]
         if cfg.export_url and not (test.get("export") or {}).get("ok")
     ]
-    if failed_tests or failed_exports:
+    invalid_benchmarks = [
+        test for test in manifest["tests"]
+        if test.get("tuning_termination_reason") == "target_not_attained"
+    ]
+    incomplete = (manifest.get("completed", 0) < manifest.get("test_count", 0)
+                  or manifest.get("status") in ("aborted", "incomplete"))
+    if failed_tests or failed_exports or invalid_benchmarks or incomplete:
+        if incomplete:
+            print("ERROR: fullbench matrix did not complete")
         if failed_exports:
             print(f"ERROR: {len(failed_exports)} fullbench export(s) failed")
         if failed_tests:
             print(f"ERROR: {len(failed_tests)} fullbench test(s) failed")
+        if invalid_benchmarks:
+            print(f"ERROR: {len(invalid_benchmarks)} fullbench result(s) are not valid network ceilings")
         sys.exit(1)
 
 
@@ -402,13 +525,26 @@ def _print_fullbench_summary(manifest):
     print(f"  path MTU: {pmtud.get('path_mtu')} bytes  source={pmtud.get('path_mtu_source', 'unknown')}  "
           f"bidirectional={pmtud.get('bidirectional_validated')} "
           f"method={pmtud.get('bidirectional_validation', 'unknown')}")
+    print(f"  PMTUD ceiling: jumbo_mtu={manifest.get('jumbo_mtu', False)}  "
+          f"max_mtu={manifest.get('probe_max_mtu')}  "
+          f"reached={manifest.get('probe_ceiling_reached')}")
     print(f"  packet sizing: TCP MSS={pmtud.get('tcp_mss_bytes')} bytes  "
           f"UDP datagram={pmtud.get('udp_datagram_bytes')} bytes")
+    status = manifest.get("status") or (
+        "complete" if manifest.get("completed", 0) >= manifest.get("test_count", 0)
+        else "incomplete")
+    print(f"  status: {status}")
     print(f"  completed: {manifest['completed']}/{manifest['test_count']}")
     header = (f"  {'transport':<9} {'dir':<5} {'streams':>7} {'procs':>5} {'send Mbps':>11} "
               f"{'recv Mbps':>11} {'send pps':>11} {'recv pps':>11} {'TCP retx/UDP loss':>17}")
     print(header)
     for t in manifest["tests"]:
+        if t.get("tuning_termination_reason") == "target_not_attained":
+            print(f"  {t['transport']:<9} {t['direction']:<5} {t['streams']:>7} {t['procs']:>5}"
+                  "  TARGET NOT ATTAINED: not a network ceiling; "
+                  f"factor={t.get('tuning_limiting_factor') or 'unknown'} "
+                  f"scope={t.get('tuning_limiting_scope') or 'unknown'}")
+            continue
         if not t.get("ok"):
             print(f"  {t['transport']:<9} {t['direction']:<5} {t['streams']:>7} {t['procs']:>5}"
                   f"  FAILED: {t.get('error')}")
@@ -419,6 +555,8 @@ def _print_fullbench_summary(manifest):
         else:
             loss = t.get("loss_pct")
             metric_str = f"{loss:.3f}%" if isinstance(loss, (int, float)) else "-"
+            if t.get("tuning_search_complete") is False:
+                metric_str += f" INCOMPLETE({t.get('tuning_termination_reason', 'unknown')})"
         exp = t.get("export")
         exp_str = ""
         if exp is not None:
@@ -531,20 +669,55 @@ def cmd_connectivity(args):
 
 
 def cmd_pmtud(args):
+    udp_overhead = 48 if args.ipv6 else 28
+    legacy_size_used = args.min_size is not None or args.max_size is not None
+    if legacy_size_used:
+        print("WARNING: --min-size/--max-size are deprecated UDP-payload-byte "
+              "options; use --min-mtu/--max-mtu for total IP MTU bytes.",
+              file=sys.stderr)
+    min_mtu = (args.min_mtu if args.min_mtu is not None
+               else (args.min_size + udp_overhead
+                     if args.min_size is not None else constants.PMTUD_MIN_MTU))
+    mode_max_mtu = (constants.PMTUD_JUMBO_MAX_MTU
+                    if args.jumbo_mtu else constants.PMTUD_DEFAULT_MAX_MTU)
+    max_mtu = (args.max_mtu if args.max_mtu is not None
+               else (args.max_size + udp_overhead
+                     if args.max_size is not None else mode_max_mtu))
+    if min_mtu < constants.PMTUD_MIN_MTU:
+        print(f"ERROR: --min-mtu must be at least {constants.PMTUD_MIN_MTU}")
+        sys.exit(2)
+    if max_mtu < constants.PMTUD_MIN_MTU:
+        print(f"ERROR: --max-mtu must be at least {constants.PMTUD_MIN_MTU}")
+        sys.exit(2)
+    if min_mtu > max_mtu:
+        print("ERROR: --min-mtu must be less than or equal to --max-mtu")
+        sys.exit(2)
+    if max_mtu > mode_max_mtu:
+        mode = "jumbo" if args.jumbo_mtu else "standard"
+        suggestion = "" if args.jumbo_mtu else "; use --jumbo-mtu to opt in to larger probes"
+        print(f"ERROR: --max-mtu {max_mtu} exceeds the {mode} mode cap of {mode_max_mtu}{suggestion}")
+        sys.exit(2)
+
     caps = privileges.probe_capabilities()
     pmtud_capability = "pmtud_ipv6" if args.ipv6 else "pmtud"
     if not caps.get(pmtud_capability):
         print(f"ERROR: PMTUD is unavailable: {privileges.capability_reason(pmtud_capability, caps)}")
         sys.exit(1)
 
-    print(f"Running PMTUD ({'IPv6' if args.ipv6 else 'IPv4'}) to {args.server_ip}:{args.udp_port}...")
+    print(f"Running PMTUD ({'IPv6' if args.ipv6 else 'IPv4'}) to {args.server_ip}:{args.udp_port} "
+          f"with total-MTU range {min_mtu}-{max_mtu}...")
     try:
-        result = discover_path_mtu(args.server_ip, udp_port=args.udp_port, min_size=args.min_size,
-                                   max_size=args.max_size, timeout_sec=args.timeout,
+        result = discover_path_mtu(args.server_ip, udp_port=args.udp_port, min_mtu=min_mtu,
+                                   max_mtu=max_mtu, timeout_sec=args.timeout,
                                    ipv6=args.ipv6)
+    except ValueError as exc:
+        print(f"ERROR: invalid PMTUD MTU range: {exc}")
+        sys.exit(2)
     except PmtudError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
+
+    result["jumbo_mtu"] = bool(args.jumbo_mtu)
 
     if result["success"]:
         print(f"  Path MTU: {result['path_mtu']} bytes (payload {result.get('path_mtu_payload_bytes')} bytes)")
@@ -552,6 +725,8 @@ def cmd_pmtud(args):
         print(f"  Path MTU fallback: {result['path_mtu']} bytes")
     print(f"  source: {result.get('path_mtu_source')}")
     print(f"  connectivity confirmed: {result.get('connectivity_confirmed')}")
+    print(f"  probe max MTU: {result.get('probe_max_mtu')} bytes; "
+          f"ceiling reached: {result.get('probe_ceiling_reached')}; jumbo_mtu={result['jumbo_mtu']}")
 
     text_lines = [f"PMTUD to {args.server_ip}:{args.udp_port}", str(result)]
     json_path, log_path = logging_store.save_result(constants.TEST_TYPE_PMTUD, result, text_lines,

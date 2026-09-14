@@ -3,20 +3,29 @@ per-stream port listeners, and relaying this side's local stats back to the
 client over the control channel every SAMPLE_INTERVAL_SEC.
 """
 
+import ctypes
+import math
 import multiprocessing
+import operator
+import os
 import queue
 import socket
 import threading
 import time
 import traceback
 
-from ..common import constants, net
-from ..transport import stream_worker, metrics, latency_probe, run_mode, shared_counters
+from ..common import constants, host_telemetry, net
+from ..transport import (latency_probe, metrics, run_mode, shared_counters,
+                         stream_worker, udp_batch)
 from ..transport.control_connection import ControlChannel
 
 
 class ProtocolError(Exception):
     pass
+
+
+_UINT32_MAX = (1 << 32) - 1
+_TCP_PREAMBLE_TIMEOUT_SEC = 2.0
 
 
 def _server_should_use_mp(params: dict, n: int) -> bool:
@@ -40,10 +49,26 @@ class ThroughputSession:
         self.stream_sockets = {}
         self.stream_addrs = {}
         self.stream_stop_events = {}
+        self._stream_attach_lock = threading.Lock()
+        self._claimed_stream_indices = set()
+        self._accepting_streams = True
         self.listener_sockets = []
+        self.borrowed_stream_indices = set()
         self.threads = []
         self.data_ready_event = threading.Event()
         self.stop_received_event = threading.Event()
+        self.data_started_event = threading.Event()
+        self._timing_lock = threading.Lock()
+        now = time.monotonic()
+        self.start_wait_started_at = None
+        self.data_started_at = None
+        self.cleanup_started_at = None
+        self.last_control_activity_at = now
+        self.phase_deadline_at = None
+        self.phase_deadline_message = None
+        self.control_idle_deadline_enabled = False
+        self.deadline_failure_message = None
+        self.watchdog_stop_event = threading.Event()
 
         # Multiprocessing: stream 0 stays in the main process (it shares the
         # always-on base-port listener); streams 1..N-1 are handled by worker
@@ -52,6 +77,7 @@ class ThroughputSession:
         self.mp_enabled = _server_should_use_mp(params, n)
         self.worker_indices = list(range(1, n)) if self.mp_enabled else []
         self.worker_procs = []
+        self.worker_assignments = {}
         self.worker_setup_errors = []
         self.cleanup_terminated_pids = set()
         if self.mp_enabled:
@@ -65,51 +91,238 @@ class ThroughputSession:
             # Per-stream send rate (bytes/sec, 0 = unpaced) for download tuning;
             # the client drives it via 'set_rate' control messages.
             self.rate_value = self.mp_ctx.Value("d", 0.0, lock=False)
+            self.trial_value = self.mp_ctx.Value(
+                ctypes.c_uint32, 0, lock=False)
         else:
             self.counters = {i: metrics.StreamCounters(i) for i in range(n)}
             self.rate_value = stream_worker.RateHolder(0.0)
+            self.trial_value = stream_worker.TrialHolder(0)
 
-    def attach_stream(self, index: int, sock, addr=None, spawn_receiver: bool = True):
-        if self.params["transport"] == "tcp":
-            stream_worker.configure_tcp_socket(sock, self.params.get("path_mtu"))
-        self.stream_sockets[index] = sock
-        if addr is not None:
-            self.stream_addrs[index] = addr
-        self.stream_ready[index].set()
+    def note_control_activity(self, now=None):
+        with self._timing_lock:
+            self.last_control_activity_at = (
+                time.monotonic() if now is None else float(now))
 
-        if self.params["direction"] == "up" and spawn_receiver:
-            stop_ev = threading.Event()
-            self.stream_stop_events[index] = stop_ev
-            if self.params["transport"] == "tcp":
-                th = threading.Thread(target=stream_worker.tcp_receiver_loop,
-                                       args=(sock, self.counters[index], stop_ev), daemon=True)
-            else:
-                th = threading.Thread(target=stream_worker.udp_receiver_loop,
-                                       args=(sock, self.counters[index], stop_ev),
-                                       kwargs={"known_peer_addr": addr}, daemon=True)
-            th.start()
-            self.threads.append(th)
+    def begin_start_wait(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        with self._timing_lock:
+            self.start_wait_started_at = now
+            self.last_control_activity_at = now
+            self.phase_deadline_at = (
+                now + constants.MAX_RUN_TIME_FAILSAFE_SEC)
+            self.phase_deadline_message = (
+                "timed out waiting for start_data after "
+                f"{constants.MAX_RUN_TIME_FAILSAFE_SEC:g} seconds")
+            self.control_idle_deadline_enabled = True
 
-    def stop_all_streams(self):
-        stop_receivers = self.params["transport"] != "tcp" or self.params["direction"] == "down"
+    def mark_data_started(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        run_timeout = (
+            min(float(self.params["duration_sec"]),
+                constants.MAX_RUN_TIME_FAILSAFE_SEC)
+            + constants.SOCKET_TIMEOUT_SEC)
+        with self._timing_lock:
+            self.data_started_at = now
+            self.last_control_activity_at = now
+            self.phase_deadline_at = now + run_timeout
+            self.phase_deadline_message = (
+                f"throughput run exceeded its {run_timeout:g} second deadline")
+            self.control_idle_deadline_enabled = True
+
+    def arm_phase_deadline(self, message, timeout_sec, now=None):
+        now = time.monotonic() if now is None else float(now)
+        with self._timing_lock:
+            self.phase_deadline_at = now + max(0.0, float(timeout_sec))
+            self.phase_deadline_message = str(message)
+            self.control_idle_deadline_enabled = False
+
+    def begin_cleanup(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        with self._timing_lock:
+            if self.cleanup_started_at is not None:
+                return
+            self.cleanup_started_at = now
+            self.phase_deadline_at = now + constants.FINAL_STATS_TIMEOUT_SEC
+            self.phase_deadline_message = "server session cleanup timed out"
+            self.control_idle_deadline_enabled = False
+
+    def set_deadline_failure(self, message):
+        with self._timing_lock:
+            if self.deadline_failure_message is None:
+                self.deadline_failure_message = str(message)
+
+    def timing_snapshot(self):
+        with self._timing_lock:
+            return {
+                "start_wait_started_at": self.start_wait_started_at,
+                "data_started_at": self.data_started_at,
+                "cleanup_started_at": self.cleanup_started_at,
+                "last_control_activity_at": self.last_control_activity_at,
+                "phase_deadline_at": self.phase_deadline_at,
+                "phase_deadline_message": self.phase_deadline_message,
+                "control_idle_deadline_enabled": self.control_idle_deadline_enabled,
+                "deadline_failure_message": self.deadline_failure_message,
+            }
+
+    def try_attach_stream(self, index: int, sock, addr=None,
+                          spawn_receiver: bool = True) -> bool:
+        """Atomically claim and attach one stream, returning False if claimed."""
+        with self._stream_attach_lock:
+            if (not self._accepting_streams
+                    or self.stop_received_event.is_set()
+                    or index in self._claimed_stream_indices
+                    or self.stream_ready[index].is_set()):
+                return False
+
+            self._claimed_stream_indices.add(index)
+            stop_ev = None
+            receiver_thread = None
+            borrowed = (self.params["transport"] == "udp" and index == 0
+                        and not spawn_receiver)
+            try:
+                if self.params["transport"] == "tcp":
+                    stream_worker.configure_tcp_socket(
+                        sock, self.params.get("path_mtu"),
+                        counters=self.counters[index])
+                else:
+                    # Stream 0 borrows the always-on base socket, so a rejected
+                    # or failed claim must never close it.
+                    stream_worker.configure_udp_socket(
+                        sock, self.counters[index])
+                self.stream_sockets[index] = sock
+                if borrowed:
+                    self.borrowed_stream_indices.add(index)
+                if addr is not None:
+                    self.stream_addrs[index] = addr
+
+                if self.params["direction"] == "up" and spawn_receiver:
+                    stop_ev = threading.Event()
+                    self.stream_stop_events[index] = stop_ev
+                    if self.params["transport"] == "tcp":
+                        receiver_thread = threading.Thread(
+                            target=stream_worker.tcp_receiver_loop,
+                            args=(sock, self.counters[index], stop_ev,
+                                  self.params.get("path_mtu")), daemon=True)
+                    else:
+                        receiver_thread = threading.Thread(
+                            target=stream_worker.udp_receiver_loop,
+                            args=(sock, self.counters[index], stop_ev),
+                            kwargs={
+                                "known_peer_addr": addr,
+                                "path_mtu": self.params.get("path_mtu"),
+                                "session_cookie":
+                                    stream_worker.udp_session_cookie(self.run_id),
+                            }, daemon=True)
+                    self.threads.append(receiver_thread)
+                    receiver_thread.start()
+
+                self.stream_ready[index].set()
+                return True
+            except BaseException:
+                if stop_ev is not None:
+                    stop_ev.set()
+                    if self.stream_stop_events.get(index) is stop_ev:
+                        self.stream_stop_events.pop(index, None)
+                if receiver_thread is not None:
+                    try:
+                        self.threads.remove(receiver_thread)
+                    except ValueError:
+                        pass
+                if self.stream_sockets.get(index) is sock:
+                    self.stream_sockets.pop(index, None)
+                if addr is not None and self.stream_addrs.get(index) == addr:
+                    self.stream_addrs.pop(index, None)
+                if borrowed:
+                    self.borrowed_stream_indices.discard(index)
+                self.stream_ready[index].clear()
+                self._claimed_stream_indices.discard(index)
+                raise
+
+    def attach_stream(self, index: int, sock, addr=None,
+                      spawn_receiver: bool = True) -> bool:
+        return self.try_attach_stream(
+            index, sock, addr=addr, spawn_receiver=spawn_receiver)
+
+    def stop_all_streams(self, abort: bool = False):
+        if abort:
+            self.stop_received_event.set()
+        with self._stream_attach_lock:
+            self._accepting_streams = False
+            stream_stop_events = tuple(self.stream_stop_events.values())
+            listener_sockets = tuple(self.listener_sockets)
+            stream_sockets = tuple(self.stream_sockets.items())
+            borrowed_stream_indices = frozenset(self.borrowed_stream_indices)
+        stop_receivers = (abort or self.params["transport"] != "tcp"
+                          or self.params["direction"] == "down")
+        if stop_receivers:
+            for ev in stream_stop_events:
+                ev.set()
         if self.mp_enabled:
             if stop_receivers:
                 self.stop_flag.value = 1
+            deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
             for p in self.worker_procs:
-                p.join(timeout=constants.WORKER_DRAIN_TIMEOUT_SEC)
+                p.join(timeout=max(0.0, deadline - time.monotonic()))
             for p in self.worker_procs:
                 if p.is_alive():
                     self.cleanup_terminated_pids.add(p.pid)
                     p.terminate()
                     p.join(timeout=2)
-        if stop_receivers:
-            for ev in self.stream_stop_events.values():
-                ev.set()
-        for sock in self.listener_sockets:
+        for sock in listener_sockets:
             try:
                 sock.close()
             except OSError:
                 pass
+        if abort:
+            for index, sock in stream_sockets:
+                if index in borrowed_stream_indices:
+                    continue
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+
+def _accept_matching_tcp_stream(listener, run_id, index, deadline, cancelled):
+    while not cancelled():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        listener.settimeout(min(
+            remaining, max(0.01, constants.CONTROL_RECV_POLL_SEC)))
+        try:
+            conn, addr = listener.accept()
+        except socket.timeout:
+            continue
+
+        keep = False
+        try:
+            preamble_deadline = min(
+                deadline,
+                time.monotonic() + _TCP_PREAMBLE_TIMEOUT_SEC)
+            preamble_bytes = stream_worker.recv_exact(
+                conn, stream_worker.PREAMBLE_SIZE, preamble_deadline,
+                cancelled=cancelled)
+            preamble = (stream_worker.parse_preamble(preamble_bytes)
+                        if preamble_bytes is not None else None)
+            if (preamble and preamble[0] == constants.DATA_STREAM_MAGIC
+                    and preamble[1] == run_id and preamble[2] == index
+                    and not cancelled()):
+                keep = True
+                return conn, addr
+        except OSError:
+            pass
+        finally:
+            if not keep:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+    return None
 
 
 def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, port: int):
@@ -126,23 +339,34 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
             sock.listen(1)
         except OSError as exc:
             ctx.log(f"session {session.run_id[:8]}: failed to bind tcp port {port}: {exc}")
+            sock.close()
             return
         session.listener_sockets.append(sock)
-        sock.settimeout(30.0)
+        deadline = time.monotonic() + constants.SOCKET_TIMEOUT_SEC
         try:
-            conn, addr = sock.accept()
-        except (socket.timeout, OSError):
-            return
-        try:
-            preamble_bytes = conn.recv(stream_worker.PREAMBLE_SIZE)
+            result = _accept_matching_tcp_stream(
+                sock, session.run_id, index, deadline,
+                session.stop_received_event.is_set)
         except OSError:
-            conn.close()
             return
-        preamble = stream_worker.parse_preamble(preamble_bytes)
-        if not preamble or preamble[1] != session.run_id or preamble[2] != index:
-            conn.close()
-            return
-        session.attach_stream(index, conn, addr=addr, spawn_receiver=True)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if result is not None:
+            conn, addr = result
+            if session.stop_received_event.is_set():
+                conn.close()
+                return
+            try:
+                attached = session.try_attach_stream(
+                    index, conn, addr=addr, spawn_receiver=True)
+            except Exception:
+                conn.close()
+                raise
+            if not attached:
+                conn.close()
 
     def _udp_worker():
         sock = socket.socket(family, socket.SOCK_DGRAM)
@@ -156,13 +380,22 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
             sock.close()
             return
         session.listener_sockets.append(sock)
-        result = stream_worker.read_udp_preamble(sock, timeout_sec=30.0)
+        result = stream_worker.read_udp_preamble(
+            sock, timeout_sec=constants.SOCKET_TIMEOUT_SEC,
+            expected_run_id=session.run_id, expected_stream_index=index)
         if not result:
             return
         run_id, idx, addr = result
         if run_id != session.run_id or idx != index:
             return
-        session.attach_stream(index, sock, addr=addr, spawn_receiver=True)
+        try:
+            attached = session.try_attach_stream(
+                index, sock, addr=addr, spawn_receiver=True)
+        except Exception:
+            sock.close()
+            raise
+        if not attached:
+            sock.close()
 
     target = _tcp_worker if transport == "tcp" else _udp_worker
     th = threading.Thread(target=target, daemon=True)
@@ -171,8 +404,8 @@ def _spawn_extra_stream_listener(ctx, session: ThroughputSession, index: int, po
 
 
 def _server_worker_proc_inner(assignments, run_id, role, transport, bind, duration_sec,
-                              shared, start_flag, stop_flag, ready_q, rate_value=None,
-                              path_mtu=None, family=socket.AF_INET):
+                               shared, start_flag, stop_flag, ready_q, rate_value=None,
+                               path_mtu=None, family=socket.AF_INET, trial_value=None):
     """Worker process handling a subset of streams (indices >= 1).
 
     Runs in phases so the main process never races the client:
@@ -186,6 +419,7 @@ def _server_worker_proc_inner(assignments, run_id, role, transport, bind, durati
     """
     listeners = {}
     for i, port in assignments:
+        ls = None
         try:
             if transport == "tcp":
                 ls = socket.socket(family, socket.SOCK_STREAM)
@@ -193,7 +427,6 @@ def _server_worker_proc_inner(assignments, run_id, role, transport, bind, durati
                 net.configure_ipv6_socket(ls)
                 ls.bind(net.bind_address(bind, port, family))
                 ls.listen(1)
-                ls.settimeout(30.0)
             else:
                 ls = socket.socket(family, socket.SOCK_DGRAM)
                 ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -202,34 +435,40 @@ def _server_worker_proc_inner(assignments, run_id, role, transport, bind, durati
                 ls.bind(net.bind_address(bind, port, family))
             listeners[i] = ls
         except OSError as exc:
+            if ls is not None:
+                ls.close()
             ready_q.put(("error", i, str(exc)))
 
     ready_q.put(("bound", None, None))
 
     socks = {}
+    setup_deadline = time.monotonic() + constants.SOCKET_TIMEOUT_SEC
     for i, _port in assignments:
         ls = listeners.get(i)
         if ls is None:
             continue
         if transport == "tcp":
             try:
-                conn, addr = ls.accept()
-                preamble_bytes = conn.recv(stream_worker.PREAMBLE_SIZE)
+                result = _accept_matching_tcp_stream(
+                    ls, run_id, i, setup_deadline,
+                    lambda: bool(stop_flag.value))
             except OSError as exc:
                 ready_q.put(("error", i, str(exc)))
                 ls.close()
                 continue
             ls.close()
-            preamble = stream_worker.parse_preamble(preamble_bytes)
-            if not preamble or preamble[1] != run_id or preamble[2] != i:
-                ready_q.put(("error", i, "bad preamble"))
-                conn.close()
+            if result is None:
+                if not stop_flag.value:
+                    ready_q.put(("error", i, "preamble timeout"))
                 continue
+            conn, addr = result
             stream_worker.configure_tcp_socket(conn, path_mtu)
             socks[i] = (conn, None)
             ready_q.put(("ready", i, addr))
         else:
-            result = stream_worker.read_udp_preamble(ls, timeout_sec=30.0)
+            result = stream_worker.read_udp_preamble(
+                ls, timeout_sec=constants.SOCKET_TIMEOUT_SEC,
+                expected_run_id=run_id, expected_stream_index=i)
             if not result:
                 ready_q.put(("error", i, "preamble timeout"))
                 ls.close()
@@ -242,12 +481,23 @@ def _server_worker_proc_inner(assignments, run_id, role, transport, bind, durati
             socks[i] = (ls, addr)
             ready_q.put(("ready", i, addr))
 
+    if stop_flag.value:
+        for sock, _dest in socks.values():
+            sock.close()
+        return
+
     views = {i: shared.view(i) for i, _port in assignments}
-    stream_worker.run_stream_group(socks, role, transport, views, duration_sec,
-                                    wait_start=lambda: bool(start_flag.value),
-                                    stopped=lambda: bool(stop_flag.value),
-                                    rate_value=rate_value,
-                                    path_mtu=path_mtu)
+    worker_options = {
+        "wait_start": lambda: bool(start_flag.value),
+        "stopped": lambda: bool(stop_flag.value),
+        "rate_value": rate_value,
+        "path_mtu": path_mtu,
+    }
+    if transport == "udp":
+        worker_options["trial_value"] = trial_value
+        worker_options["session_cookie"] = stream_worker.udp_session_cookie(run_id)
+    stream_worker.run_stream_group(
+        socks, role, transport, views, duration_sec, **worker_options)
     for sock, _dest in socks.values():
         try:
             sock.close()
@@ -256,12 +506,13 @@ def _server_worker_proc_inner(assignments, run_id, role, transport, bind, durati
 
 
 def _server_worker_proc(assignments, run_id, role, transport, bind, duration_sec,
-                        shared, start_flag, stop_flag, ready_q, status_q, rate_value=None,
-                        path_mtu=None, family=socket.AF_INET):
+                         shared, start_flag, stop_flag, ready_q, status_q, rate_value=None,
+                         path_mtu=None, family=socket.AF_INET, trial_value=None):
     try:
         _server_worker_proc_inner(
             assignments, run_id, role, transport, bind, duration_sec, shared,
-            start_flag, stop_flag, ready_q, rate_value, path_mtu, family)
+            start_flag, stop_flag, ready_q, rate_value, path_mtu, family,
+            trial_value)
     except BaseException as exc:
         process = multiprocessing.current_process()
         status_q.put({
@@ -323,20 +574,23 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
             args=(group, session.run_id, role, transport, ctx.config.bind, duration_sec,
                   session.shared, session.start_flag, session.stop_flag, session.worker_ready_q,
                   session.worker_status_q, session.rate_value, path_mtu,
-                  params.get("family", socket.AF_INET)),
+                  params.get("family", socket.AF_INET), session.trial_value),
             daemon=True)
         p.start()
         session.worker_procs.append(p)
+        session.worker_assignments[p.pid] = [index for index, _port in group]
 
     # Barrier: wait until every worker reports its ports are bound/listening
     # before returning (the caller then sends hello_ack). This prevents the
     # client from racing ahead and hitting 'connection refused' while a forked
     # worker is still starting up.
     bound = 0
-    deadline = time.time() + 30
-    while bound < len(active_groups) and time.time() < deadline:
+    deadline = time.monotonic() + constants.SOCKET_TIMEOUT_SEC
+    while bound < len(active_groups) and time.monotonic() < deadline:
         try:
-            status, idx, detail = session.worker_ready_q.get(timeout=1.0)
+            remaining = max(0.0, deadline - time.monotonic())
+            status, idx, detail = session.worker_ready_q.get(
+                timeout=min(1.0, remaining))
         except queue.Empty:
             failure = _server_worker_failure(session)
             if failure:
@@ -349,6 +603,8 @@ def _spawn_server_workers(ctx, session: ThroughputSession, ports: list):
             session.worker_setup_errors.append(error)
             ctx.log(f"session {session.run_id[:8]}: {error}")
             raise ProtocolError(error)
+    if bound < len(active_groups):
+        raise TimeoutError("server workers did not bind their stream ports in time")
     ctx.log(f"session {session.run_id[:8]}: {len(session.worker_procs)} worker "
              f"process(es) handling streams {idxs} ({role}); {bound} bound")
 
@@ -402,9 +658,35 @@ def _start_sender_threads(ctx, session: ThroughputSession):
             th = threading.Thread(target=stream_worker.udp_sender_loop,
                                    args=(sock, addr, i, session.counters[i], stop_ev, duration_sec, start_time),
                                    kwargs={"rate_value": session.rate_value,
-                                           "path_mtu": session.params.get("path_mtu")}, daemon=True)
+                                           "path_mtu": session.params.get("path_mtu"),
+                                            "trial_value": session.trial_value,
+                                            "session_cookie":
+                                                stream_worker.udp_session_cookie(session.run_id),
+                                            # The base-port socket also serves PMTUD and
+                                           # connectivity traffic and must stay unconnected.
+                                           "connect_socket": i != 0}, daemon=True)
         th.start()
         session.threads.append(th)
+
+
+def _wait_for_sender_trial(session: ThroughputSession, trial_id: int) -> list[int]:
+    expected = set(range(session.num_streams))
+    deadline = time.monotonic() + constants.SOCKET_TIMEOUT_SEC
+    while True:
+        observed = {
+            index for index, counters in session.counters.items()
+            if counters.snapshot().get("observed_trial_id") == trial_id
+        }
+        if observed == expected:
+            return []
+        worker_failure = _server_worker_failure(session)
+        if worker_failure:
+            raise ProtocolError(
+                f"server worker failed while entering UDP trial {trial_id}:\n"
+                f"{worker_failure}")
+        if time.monotonic() >= deadline:
+            return sorted(expected - observed)
+        time.sleep(0.002)
 
 
 def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChannel):
@@ -412,6 +694,7 @@ def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChan
         try:
             msg = control.recv(timeout=1.0)
         except EOFError:
+            session.begin_cleanup()
             session.phase.stop()
             session.stop_received_event.set()
             break
@@ -419,11 +702,13 @@ def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChan
         if msg is None:
             continue
 
+        session.note_control_activity()
         mtype = msg.get("type")
         if mtype == "probe":
             try:
                 latency_probe.handle_probe_message(control, msg)
             except OSError:
+                session.begin_cleanup()
                 session.phase.stop()
                 session.stop_received_event.set()
                 break
@@ -434,7 +719,47 @@ def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChan
                 session.rate_value.value = float(msg.get("per_stream_bps", 0.0))
             except (TypeError, ValueError):
                 pass
+        elif mtype == "set_trial" and session.params["transport"] == "udp":
+            try:
+                raw_trial_id = msg["trial_id"]
+                if isinstance(raw_trial_id, bool):
+                    raise TypeError
+                trial_id = operator.index(raw_trial_id)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if 0 <= trial_id <= _UINT32_MAX:
+                # Trial 0 is the non-measurement/warmup interval.
+                session.trial_value.value = trial_id
+                if (session.params["direction"] == "down"
+                        and session.phase.phase == run_mode.RunPhase.RUNNING):
+                    try:
+                        missing = _wait_for_sender_trial(session, trial_id)
+                    except ProtocolError as exc:
+                        control.send("error", error=str(exc))
+                        session.begin_cleanup()
+                        session.phase.stop()
+                        session.stop_received_event.set()
+                        break
+                    if missing:
+                        error = (
+                            f"server UDP senders did not observe trial {trial_id}: "
+                            f"missing_streams={missing}")
+                        control.send("error", error=error)
+                        session.begin_cleanup()
+                        session.phase.stop()
+                        session.stop_received_event.set()
+                        break
+                control.send("set_trial_ack", trial_id=trial_id)
         elif mtype == "start_data":
+            if session.data_started_event.is_set():
+                error = "duplicate start_data message"
+                control.send("error", error=error)
+                session.begin_cleanup()
+                session.phase.stop()
+                session.stop_received_event.set()
+                break
+            session.data_started_event.set()
+            session.mark_data_started()
             session.phase.start_running()
             session.data_ready_event.set()
             if session.mp_enabled:
@@ -442,9 +767,44 @@ def _control_dispatch_loop(ctx, session: ThroughputSession, control: ControlChan
             if session.params["direction"] == "down":
                 _start_sender_threads(ctx, session)
         elif mtype == "stop":
+            session.begin_cleanup()
             session.phase.stop()
             session.stop_received_event.set()
             break
+
+
+def _session_deadline_error(session: ThroughputSession, now=None):
+    now = time.monotonic() if now is None else float(now)
+    timing = session.timing_snapshot()
+    if timing["deadline_failure_message"] is not None:
+        return timing["deadline_failure_message"]
+    phase_deadline = timing["phase_deadline_at"]
+    if phase_deadline is not None and now >= phase_deadline:
+        return timing["phase_deadline_message"] or "throughput session deadline expired"
+    if (timing["control_idle_deadline_enabled"]
+            and now - timing["last_control_activity_at"]
+            >= constants.SOCKET_TIMEOUT_SEC):
+        return ("control channel was idle for "
+                f"{constants.SOCKET_TIMEOUT_SEC:g} seconds")
+    return None
+
+
+def _session_watchdog(session: ThroughputSession, control: ControlChannel):
+    while not session.watchdog_stop_event.wait(
+            constants.CONTROL_RECV_POLL_SEC):
+        deadline_error = _session_deadline_error(session)
+        if deadline_error is None:
+            continue
+        session.set_deadline_failure(deadline_error)
+        session.phase.stop()
+        session.stop_received_event.set()
+        if session.watchdog_stop_event.wait(constants.CONTROL_RECV_POLL_SEC):
+            return
+        # Closing from the watchdog also interrupts a blocked sendall(), which
+        # is otherwise able to bypass every deadline in the handler thread.
+        control.close()
+        session.watchdog_stop_event.wait()
+        return
 
 
 def _wait_for_final_stats_ack(control: ControlChannel, timeout_sec: float) -> bool:
@@ -460,28 +820,170 @@ def _wait_for_final_stats_ack(control: ControlChannel, timeout_sec: float) -> bo
     return False
 
 
+def _server_topology(session: ThroughputSession) -> dict:
+    controller_pid = os.getpid()
+    controller_streams = ([0] if session.mp_enabled
+                          else list(range(session.num_streams)))
+    workers = [{"pid": controller_pid, "streams": controller_streams}]
+    for process in session.worker_procs:
+        workers.append({
+            "pid": process.pid,
+            "streams": list(session.worker_assignments.get(process.pid, [])),
+        })
+    topology = {
+        "controller_pid": controller_pid,
+        "multiprocessing": session.mp_enabled,
+        "workers": workers,
+    }
+    if session.params["transport"] == "udp":
+        topology["udp_batch"] = udp_batch.backend_status()
+    return topology
+
+
+def _server_host_sample(session: ThroughputSession) -> dict:
+    """Capture telemetry without allowing observability to fail a test run."""
+    try:
+        topology = _server_topology(session)
+    except Exception as exc:
+        topology = {
+            "controller_pid": os.getpid(),
+            "multiprocessing": False,
+            "workers": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    pids = [worker.get("pid") for worker in topology.get("workers", [])
+            if isinstance(worker.get("pid"), int)]
+    try:
+        sample = host_telemetry.snapshot_endpoint(pid=os.getpid(), pids=pids)
+        if not isinstance(sample, dict):
+            raise TypeError("snapshot_endpoint returned a non-dictionary value")
+        sample = dict(sample)
+    except Exception as exc:
+        sample = {
+            "available": False,
+            "complete": False,
+            "reason": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "captured_at": time.monotonic(),
+            "pid": os.getpid(),
+            "host_cpu": None,
+            "process_cpu": None,
+            "udp": None,
+        }
+    try:
+        sample["topology"] = topology
+    except Exception as exc:
+        sample["topology"] = {
+            "controller_pid": os.getpid(),
+            "multiprocessing": session.mp_enabled,
+            "workers": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return sample
+
+
+def _udp_hello_fields() -> dict:
+    return {
+        "udp_wire_version": stream_worker.UDP_WIRE_VERSION,
+        "udp_batch": udp_batch.backend_status(),
+    }
+
+
+def _validate_session_params(params: dict) -> int:
+    if not isinstance(params, dict):
+        raise ProtocolError("throughput parameters must be an object")
+    raw_streams = params.get("streams", 1)
+    if isinstance(raw_streams, bool):
+        raise ProtocolError("streams must be an integer")
+    try:
+        streams = operator.index(raw_streams)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProtocolError("streams must be an integer") from exc
+    if not 1 <= streams <= constants.MAX_PARALLEL_STREAMS:
+        raise ProtocolError(
+            f"streams must be from 1 to {constants.MAX_PARALLEL_STREAMS}")
+    raw_duration = params.get(
+        "duration_sec", constants.DEFAULT_TEST_DURATION_SEC)
+    if isinstance(raw_duration, bool):
+        raise ProtocolError("duration_sec must be a finite positive number no "
+                            f"greater than {constants.MAX_RUN_TIME_FAILSAFE_SEC}")
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProtocolError("duration_sec must be a finite positive number no "
+                            f"greater than {constants.MAX_RUN_TIME_FAILSAFE_SEC}") from exc
+    if (not math.isfinite(duration) or duration <= 0
+            or duration > constants.MAX_RUN_TIME_FAILSAFE_SEC):
+        raise ProtocolError("duration_sec must be a finite positive number no "
+                            f"greater than {constants.MAX_RUN_TIME_FAILSAFE_SEC}")
+    path_mtu = params.get("path_mtu")
+    if (path_mtu is not None
+            and (isinstance(path_mtu, bool) or not isinstance(path_mtu, int)
+                 or not constants.PMTUD_MIN_MTU
+                 <= path_mtu <= constants.PMTUD_JUMBO_MAX_MTU)):
+        raise ProtocolError(
+            f"path_mtu must be an integer from {constants.PMTUD_MIN_MTU} "
+            f"to {constants.PMTUD_JUMBO_MAX_MTU}")
+    params["duration_sec"] = duration
+    return streams
+
+
 def handle_control_connection(ctx, sock: socket.socket, peer_addr):
     control = ControlChannel(sock)
     session = None
+    session_claimed = False
+    dispatch_thread = None
+    watchdog_thread = None
     try:
-        msg = control.recv(timeout=30)
+        msg = control.recv(timeout=constants.SOCKET_TIMEOUT_SEC)
         if not msg or msg.get("type") != "hello":
             control.close()
             return
 
         run_id = msg["run_id"]
         params = msg["params"]
+        try:
+            n = _validate_session_params(params)
+        except ProtocolError as exc:
+            control.send("hello_ack", ok=False, error=str(exc))
+            raise
         params["family"] = sock.family
         params["ip_version"] = net.ip_version_label(family=sock.family)
-        n = max(1, int(params.get("streams", 1)))
         transport = params.get("transport", "tcp")
         params["streams"] = n
+
+        if transport == "udp":
+            requested_wire_version = params.get("udp_wire_version")
+            try:
+                wire_version_matches = (
+                    not isinstance(requested_wire_version, bool)
+                    and operator.index(requested_wire_version)
+                    == stream_worker.UDP_WIRE_VERSION)
+            except TypeError:
+                wire_version_matches = False
+            if not wire_version_matches:
+                error = ("UDP wire version mismatch: client requested "
+                         f"{requested_wire_version!r}; server requires "
+                         f"{stream_worker.UDP_WIRE_VERSION}")
+                control.send("hello_ack", ok=False, error=error,
+                             **_udp_hello_fields())
+                raise ProtocolError(error)
 
         base_port = ctx.config.udp_port if transport == "udp" else ctx.config.tcp_port
         ports = [base_port + i for i in range(n)]
 
         session = ThroughputSession(run_id, params, control)
-        ctx.set_session(session)
+        if ctx.set_session(session) is False:
+            error = "server is busy with another throughput session"
+            control.send("hello_ack", ok=False, error=error, **(
+                _udp_hello_fields() if transport == "udp" else {}))
+            raise ProtocolError(error)
+        session_claimed = True
+        session.arm_phase_deadline(
+            "server session setup timed out", constants.SOCKET_TIMEOUT_SEC)
+        watchdog_thread = threading.Thread(
+            target=_session_watchdog, args=(session, control), daemon=True)
+        watchdog_thread.start()
         ctx.log(f"session {run_id[:8]} started: {transport} {params.get('direction')} "
                  f"streams={n} duration={params.get('duration_sec')}s ports={ports}")
 
@@ -492,30 +994,50 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
             for i in range(1, n):
                 _spawn_extra_stream_listener(ctx, session, i, ports[i])
 
-        control.send("hello_ack", ok=True, ports=ports)
+        session.arm_phase_deadline(
+            "data stream setup timed out", constants.SOCKET_TIMEOUT_SEC)
+        hello_fields = _udp_hello_fields() if transport == "udp" else {}
+        control.send("hello_ack", ok=True, ports=ports, **hello_fields)
 
-        deadline = time.time() + 30
+        deadline = time.monotonic() + constants.SOCKET_TIMEOUT_SEC
         for i in range(n):
             while not session.stream_ready[i].is_set():
-                if session.stream_ready[i].wait(timeout=0.1):
+                remaining = max(0.0, deadline - time.monotonic())
+                if session.stream_ready[i].wait(timeout=min(0.1, remaining)):
                     break
                 if session.worker_setup_errors:
                     raise ProtocolError("; ".join(session.worker_setup_errors))
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     raise TimeoutError(f"stream {i} did not connect in time")
             control.send("stream_ready", index=i)
 
-        msg = control.recv(timeout=60)
+        start_timeout = min(
+            constants.SOCKET_TIMEOUT_SEC * 2,
+            constants.MAX_RUN_TIME_FAILSAFE_SEC)
+        session.arm_phase_deadline(
+            "start handshake timed out", start_timeout)
+        msg = control.recv(timeout=start_timeout)
         if not msg or msg.get("type") != "start":
             raise ProtocolError("expected 'start' message")
         control.send("start_ack")
+        session.begin_start_wait()
 
         dispatch_thread = threading.Thread(target=_control_dispatch_loop,
                                             args=(ctx, session, control), daemon=True)
         dispatch_thread.start()
 
-        while not session.stop_received_event.is_set():
-            time.sleep(constants.PEER_STATS_INTERVAL_SEC)
+        while not session.stop_received_event.wait(
+                constants.PEER_STATS_INTERVAL_SEC):
+            deadline_error = _session_deadline_error(session)
+            if deadline_error:
+                session.set_deadline_failure(deadline_error)
+                session.phase.stop()
+                session.stop_received_event.set()
+                try:
+                    control.send("error", error=deadline_error)
+                except OSError:
+                    pass
+                raise TimeoutError(deadline_error)
             worker_failure = _server_worker_failure(session)
             if worker_failure:
                 error = f"server worker process failed:\n{worker_failure}"
@@ -525,13 +1047,31 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
             for counters in session.counters.values():
                 streams_payload.append(counters.snapshot())
             try:
-                control.send("peer_stats", t=time.time(), streams=streams_payload)
+                control.send("peer_stats", t=time.time(), streams=streams_payload,
+                             host_sample=_server_host_sample(session))
             except OSError:
                 break
 
+        deadline_error = session.timing_snapshot()["deadline_failure_message"]
+        if deadline_error:
+            try:
+                control.send("error", error=deadline_error)
+            except OSError:
+                pass
+            raise TimeoutError(deadline_error)
+
+        session.begin_cleanup()
+
+        # Capture the terminal host state before signalling or joining workers.
+        final_host_sample = _server_host_sample(session)
         session.stop_all_streams()
+        thread_deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
         for thread in session.threads:
-            thread.join(timeout=10)
+            thread.join(timeout=max(0.0, thread_deadline - time.monotonic()))
+        stuck_threads = [thread.name for thread in session.threads if thread.is_alive()]
+        if stuck_threads:
+            raise ProtocolError(
+                f"server data threads did not stop: {stuck_threads}")
         if session.params["transport"] == "tcp" and session.params["direction"] == "down":
             for data_socket in session.stream_sockets.values():
                 try:
@@ -540,9 +1080,11 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
                     pass
         dispatch_thread.join(timeout=2)
         if session.cleanup_terminated_pids:
-            ctx.log(
-                f"session {session.run_id[:8]}: force-stopped receiver workers after drain timeout: "
-                f"{sorted(session.cleanup_terminated_pids)}")
+            error = (
+                "server force-stopped data workers; counters are incomplete: "
+                f"pids={sorted(session.cleanup_terminated_pids)}")
+            control.send("error", error=error)
+            raise ProtocolError(error)
         worker_failure = _server_worker_failure(session, require_stopped=True)
         if worker_failure:
             error = f"server worker process failed:\n{worker_failure}"
@@ -550,7 +1092,18 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
             raise ProtocolError(error)
 
         final_streams = [c.snapshot() for c in session.counters.values()]
-        control.send("final_stats", streams=final_streams)
+        final_udp_backend = None
+        if session.params["transport"] == "udp":
+            final_udp_backend = udp_batch.aggregate_backend_status(final_streams)
+            try:
+                final_host_sample["topology"]["udp_batch"] = final_udp_backend
+            except (KeyError, TypeError):
+                pass
+        session.arm_phase_deadline(
+            "final control exchange timed out", constants.SOCKET_TIMEOUT_SEC)
+        control.send("final_stats", streams=final_streams,
+                     host_sample=final_host_sample,
+                     udp_batch=final_udp_backend)
         if not _wait_for_final_stats_ack(control, constants.SOCKET_TIMEOUT_SEC):
             raise ProtocolError("client did not acknowledge final peer statistics")
         control.send("done")
@@ -560,7 +1113,21 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
     except (EOFError, TimeoutError, ProtocolError, OSError) as exc:
         ctx.log(f"session error ({peer_addr}): {exc}")
     finally:
-        if session is not None:
-            session.stop_all_streams()
-            ctx.clear_session(session.run_id)
-        control.close()
+        try:
+            if session is not None and session_claimed:
+                session.begin_cleanup()
+                session.phase.stop()
+                session.stop_received_event.set()
+                try:
+                    session.stop_all_streams(abort=True)
+                finally:
+                    try:
+                        ctx.clear_session(session.run_id)
+                    finally:
+                        session.watchdog_stop_event.set()
+        finally:
+            control.close()
+            if dispatch_thread is not None:
+                dispatch_thread.join(timeout=2)
+            if watchdog_thread is not None:
+                watchdog_thread.join(timeout=2)

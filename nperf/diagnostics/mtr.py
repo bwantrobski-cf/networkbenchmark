@@ -248,7 +248,8 @@ class MtrRunner:
             except OSError:
                 continue
 
-            parsed = pkt.parse_icmp_packet(raw, family=self.family)
+            parsed = pkt.parse_icmp_packet(
+                raw, family=self.family, source_ip=from_addr[0])
             if not parsed:
                 continue
 

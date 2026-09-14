@@ -42,6 +42,27 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+On Linux CPython, installation also builds the optional
+`nperf.transport._udp_batch` extension when a C compiler and Python headers are
+available (`build-essential python3-dev` on Debian/Ubuntu). The default
+`NPERF_UDP_BACKEND=auto` selects it when available and otherwise uses the
+portable Python implementation. Use `NPERF_UDP_BACKEND=native` to require the
+native backend or `NPERF_UDP_BACKEND=python` for comparison.
+
+Verify a native installation with a local IPv4/IPv6 UDP batch self-test:
+
+```bash
+NPERF_UDP_BACKEND=native .venv/bin/python -c \
+    'import json; from nperf.transport import udp_batch; print(json.dumps(udp_batch.self_test(), sort_keys=True))'
+```
+
+Strict `native` mode fails if the extension cannot be imported or used. `auto`
+may fall back at import time, or after a platform rejects the native syscalls;
+the requested and selected backends and any runtime fallback are recorded in
+UDP results. The self-test exercises every loopback address family available on
+the host; managed dual-stack deployments can additionally require both `IPv4`
+and `IPv6` in its `families` result.
+
 ## Running
 
 The examples below show both supported command forms:
@@ -149,6 +170,9 @@ python nperf.py tput --server-ip 10.0.0.5 --udp --reverse -P 4 --time 30
 nperf tput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 python nperf.py tput --server-ip 10.0.0.5 --udp -P 8 --procs 8 --time 30
 
+# Opt in to PMTUD above 1500, up to a total MTU of 9000
+nperf tput --server-ip 10.0.0.5 --tcp --jumbo-mtu
+
 # Skip PMTUD and manually use 1472-byte UDP datagrams
 nperf tput --server-ip 10.0.0.5 --udp --packet-length 1472
 
@@ -157,9 +181,9 @@ nperf tput --server-ip 10.0.0.5 --tcp --packet-length 1460
 
 # UDP loss-target tuning: find the highest rate at or below 1% loss
 nperf tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
-    --acceptable-loss 1.0 --max-duration 30
+    --acceptable-loss 1.0 --udp-start-mbps 250 --max-duration 120
 python nperf.py tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
-    --acceptable-loss 1.0 --max-duration 30
+    --acceptable-loss 1.0 --udp-start-mbps 250 --max-duration 120
 
 # Use non-default server ports and save local logs elsewhere
 nperf tput --server-ip 10.0.0.5 --udp --start-port 20000 \
@@ -190,6 +214,14 @@ the TCP MSS for a TCP test or the complete benchmark datagram length for a UDP
 test. Otherwise, the resulting `path_mtu` is one shared network-path value used
 for both TCP and UDP; the tool does not use separate PMTUD values for the two
 transports.
+
+PMTUD bounds are total IP MTUs, not UDP payload sizes. By default NPERF probes
+up to MTU 1500. Add `--jumbo-mtu` to `tput`, `fullbench`, or `pmtud` to opt in to
+probing up to MTU 9000. This is only a search ceiling: either mode still finds
+and uses a lower usable path MTU, then derives the TCP MSS and UDP datagram
+length from that discovered value. A manual `--packet-length` continues to skip
+PMTUD and is not changed by the ceiling mode, but the derived total path MTU
+must not exceed NPERF's total path-MTU cap of 9000 bytes.
 
 The packet sizing is then derived differently because TCP and UDP have different
 headers:
@@ -223,10 +255,10 @@ to the throughput log for verification.
 
 ### Scaling with multiple CPU cores (`--procs`)
 
-At very high packet rates a single Python process becomes CPU-bound (the GIL
-serialises per-packet work), capping throughput well below the link. Use
-`--procs N` to spread the parallel streams (`-P`) across `N` worker processes
-so send/receive work runs on multiple cores:
+At very high packet rates a single process can become CPU- or syscall-bound,
+capping throughput below the link. Native Linux UDP batching reduces syscall
+overhead, while `--procs N` spreads the parallel streams (`-P`) across `N`
+worker processes so send/receive work can use multiple cores:
 
 - Requires more than one stream (`-P > 1`); with a single stream it is a no-op.
 - The **server mirrors the client's `--procs`** automatically over the control
@@ -251,23 +283,70 @@ Instead of a fixed rate, give a **target loss** and let the tool find the
 highest UDP rate that stays under it:
 
 ```bash
-# Find the max UDP upload rate with <= 1% loss, searching for up to 30s
+# Find the max UDP upload rate with <= 1% loss, searching for up to 120s
 nperf tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
-    --acceptable-loss 1.0 --max-duration 30
+    --acceptable-loss 1.0 --udp-start-mbps 250 --max-duration 120
 python nperf.py tput --server-ip 10.0.0.5 --udp -P 4 --procs 4 \
-    --acceptable-loss 1.0 --max-duration 30
+    --acceptable-loss 1.0 --udp-start-mbps 250 --max-duration 120
 ```
 
-- `--acceptable-loss PCT` turns on the search (UDP only). `--time` / `--max-duration`
-  becomes the **max time budget** for the ramp rather than a fixed run length.
-- The search is an **AIMD ramp** (iperf-style): it first probes unpaced to find
-  the ceiling, then additively increases the paced send rate while loss stays
-  under target and multiplicatively backs off (refining the step) when a trial
-  breaches it, converging on the best sustainable rate.
+- `--acceptable-loss PCT` turns on the search (UDP only). `--max-duration`
+  sets the **max time budget** for the ramp; its default is 120 seconds.
+- Each attempted rate runs continuously for a 2-second warm-up followed by a
+  5-second measurement. Loss over that measurement determines whether the next
+  attempt increases or decreases.
+- `--udp-start-mbps` sets the initial aggregate rate; it is divided evenly among
+  the configured streams. Starts and automatically derived rates are capped at
+  100,000 Mbps to prevent numeric overflow from disabling pacing.
+- The start rate must be high enough to emit at least one datagram per stream
+  during the 5-second measurement window. NPERF rejects a lower start and never
+  backs the search below that packet-sampling floor.
+- The first passing probe increases the attempted rate by 25%. Consecutive
+  passing trials automatically grow that increase to 50%, then 100%; subsequent
+  unbounded trials remain capped at a 100% increase. Users do not configure the
+  scaling percentages.
+- After a breach, the search refines the bracket between the highest passing and
+  lowest failing rates by percentage until they are within 5%. An initial breach
+  backs off the attempted rate by 25% per trial.
+- `search_complete` and `termination_reason` distinguish a converged result from
+  the highest rate reached before the time budget expired.
+- `ceiling_confirmed` and `result_kind` distinguish a confirmed ceiling from a
+  `passing_lower_bound`, `endpoint_limited`, stopped, or no-passing-rate result.
+- `search=budget_exhausted` means the reported best rate passed the loss target,
+  but the budget ended before the search confirmed an upper boundary.
+- `search=target_not_attained` means the sender emitted less than 95% of the
+  requested load. The test executed, but it is endpoint-limited and not evidence
+  of a network ceiling; CLI/fullbench automation returns a nonzero status for
+  that case.
+- High-capacity paths may need the default 120-second budget to bracket the loss
+  threshold and refine the result.
 - Works in both directions: for upload the client paces its senders; for
   download (`-R`) the server mirrors the target rate over the control channel.
-- The result reports the best sustainable **goodput** and packets/sec at or
-  below your loss target, plus the full per-trial rate-vs-loss series.
+- The result reports confirmed-ceiling goodput or clearly labels the best tested
+  passing lower bound, plus the full per-trial rate-vs-loss series.
+
+UDP wire v3 tags every datagram with a 64-bit sequence, exact trial ID, and
+per-run cookie. Sender and receiver counters are compared for the same tagged
+trial, so warm-up, delayed telemetry, duplicate packets, and stale packets from
+an earlier run do not contaminate trial loss. Linux uses `sendmmsg`/`recvmmsg`
+in batches when the native backend is installed; dedicated sockets are
+connected, buffers are reused, and actual socket buffers plus `SO_RXQ_OVFL`
+drops are recorded. The server and client reject different UDP wire versions
+rather than silently producing incompatible measurements. Wire v3 is not
+backward compatible with older UDP endpoints, so upgrade both endpoints before
+running UDP tests.
+
+Tuned trials classify sender target attainment separately from receiver/path
+loss causality. Sender CPU and send-buffer evidence can explain a missed target;
+receiver CPU, `SO_RXQ_OVFL`, and Linux UDP receive errors can explain measured
+loss. When endpoint telemetry is complete but shows no endpoint pressure, loss
+is labeled `network_or_remote` with low confidence rather than asserted as a
+proven network fault. Unsupported or partial telemetry remains explicit and
+does not turn missing evidence into a zero-valued measurement.
+
+These batching and wire-format optimizations are UDP-specific. TCP shares PMTUD,
+buffer reuse, socket-buffer reporting, and host telemetry, but continues to use
+the kernel TCP byte stream, flow control, and retransmission behavior.
 
 To raise the ceiling itself on Ubuntu, enlarge the socket buffers
 (`net.core.rmem_max` / `wmem_max`), `net.core.netdev_max_backlog`, use more
@@ -283,29 +362,29 @@ JSON to an HTTP(S) endpoint (e.g. a Cloudflare Worker that writes to D1).
 
 ```bash
 # TCP + UDP, upload + download, at 1/8/16/32 streams. UDP uses loss-target
-# tuning (<=1% loss, up to 30s each); results POST to an ingestion endpoint.
+# tuning (<=1% loss, up to 120s each); results POST to an ingestion endpoint.
 nperf fullbench --server-ip 10.0.0.5 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
-    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --acceptable-loss 1.0 --udp-max-duration 120 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
 
 # The same fullbench matrix over IPv6
 nperf fullbench --server-ip 2001:db8::5 -v6 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
-    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --acceptable-loss 1.0 --udp-max-duration 120 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
 python nperf.py fullbench --server-ip 10.0.0.5 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
-    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --acceptable-loss 1.0 --udp-max-duration 120 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
 
 # The same fullbench matrix over IPv6
 python nperf.py fullbench --server-ip 2001:db8::5 -v6 \
     --streams 1,8,16,32 --procs 1,4,8,8 \
-    --acceptable-loss 1.0 --udp-max-duration 30 \
+    --acceptable-loss 1.0 --udp-max-duration 120 \
     --export-url https://viz.example.com/ingest \
     --export-header "Authorization: Bearer $TOKEN" --export-slim
 
@@ -325,6 +404,7 @@ python nperf.py fullbench --server-ip 10.0.0.5 --transports udp --directions dow
 ```
 
 - `--streams` is a comma-separated list of stream counts (e.g. `1,8,16,32`).
+  Every count must be between 1 and the wire-protocol limit of 64.
 - `--procs` is either a single value applied to every run, or a comma-separated
   list **paired** with `--streams` (so `1,8,16,32` + `1,4,8,8` uses 1 proc for
   the 1-stream run, 4 for 8 streams, 8 for 16 and 32).
@@ -335,16 +415,29 @@ python nperf.py fullbench --server-ip 10.0.0.5 --transports udp --directions dow
   `--udp-max-duration` as each search's budget; TCP tests still use `--time`.
 - Every test is saved individually to `logs/` (JSON + text), and a combined
   `fullbench` manifest is written summarizing the whole run.
+- Tuned records promote `tuning_search_complete`, `tuning_ceiling_confirmed`,
+  `tuning_result_kind`, `tuning_termination_reason`, `tuning_limiting_factor`,
+  `tuning_limiting_scope`, and `tuning_limiting_confidence`. `ok` remains the
+  execution-status field for compatibility. A completed test whose sender cannot
+  attain its requested target therefore has `ok=true` and `error=null`, while
+  `tuning_ceiling_confirmed=false`, `tuning_result_kind=endpoint_limited`, and
+  `tuning_termination_reason=target_not_attained` mark it as an invalid network
+  ceiling.
 - Throughput and fullbench tests run the UDP/ICMP/fixed PMTUD discovery chain
   before sending traffic, use the selected path MTU for TCP/UDP sizing, and
-  record `path_mtu`, `path_mtu_source`, `tcp_mss_bytes`, and `udp_datagram_bytes`
-  in local results and exported fullbench payloads.
+  record `path_mtu`, `path_mtu_source`, `jumbo_mtu`, `probe_max_mtu`,
+  `probe_ceiling_reached`, `tcp_mss_bytes`, and `udp_datagram_bytes` in local
+  results and exported fullbench payloads. Add `--jumbo-mtu` to opt in to the
+  9000-MTU ceiling; the default ceiling is 1500.
 - `--export-url` POSTs each test's JSON result as it completes. Use
   `--export-method` (`POST`/`PUT`), repeatable `--export-header "Key: Value"`
   for auth, and `--export-slim` to drop the bulky `interval_series`,
   `per_stream`, and `source_ports` fields for lighter payloads. A failed export
   is logged but does not abort the run.
 - `--dry-run` prints the planned matrix without executing.
+- A manifest has `status=complete`, `aborted`, or `incomplete`, plus boolean
+  `complete` and `aborted` fields. Cancellation between cases preserves all
+  completed records but never reports the partial matrix as successful.
 
 **Identity / ingestion metadata.** For storing results in a database (e.g. a
 Cloudflare D1 table via a results-API Worker), each test can carry identity
@@ -412,6 +505,9 @@ The top-level exported object has this structure:
   "procs": 2,
   "tuned": false,
   "path_mtu": 1500,
+  "jumbo_mtu": false,
+  "probe_max_mtu": 1500,
+  "probe_ceiling_reached": true,
   "path_mtu_source": "udp_pmtud",
   "pmtud_fallback_used": false,
   "pmtud_fallback_reason": null,
@@ -438,6 +534,9 @@ The top-level exported object has this structure:
     "procs": 2,
     "duration_sec": 10,
     "path_mtu": 1500,
+    "jumbo_mtu": false,
+    "probe_max_mtu": 1500,
+    "probe_ceiling_reached": true,
     "tcp_mss_bytes": 1460,
     "udp_datagram_bytes": 1472,
     "totals": {
@@ -483,9 +582,10 @@ The top-level exported object has this structure:
 orchestration/ingestion fields. `benchmark_id` groups all tests from one
 fullbench run; `test_index` and `test_count` identify the test's position in
 that matrix. `nb_run_id` is the unique throughput-test UUID. `ok` and `error`
-report execution status. The duplicated rate, loss, retransmit, MTU, and
-packet-sizing fields are convenient ingestion columns; the complete metrics
-remain under `result`.
+report execution status, not whether a tuned result is a confirmed network
+ceiling; use the promoted tuning fields for that distinction. The duplicated
+rate, loss, retransmit, MTU, and packet-sizing fields are convenient ingestion
+columns; the complete metrics remain under `result`.
 
 **`result` fields.** The result contains the test identity (`run_id`, `server`,
 `ip_version`, `transport`, `direction`, `streams`, `procs`, `duration_sec`),
@@ -500,12 +600,23 @@ contains stream counter snapshots including `index`, byte/packet counters,
 loss, retransmits, and source port, and `source_ports` maps stream indexes to
 local source ports. These three fields may be omitted by `--export-slim`.
 
+`host_telemetry` contains client/server host CPU, per-core softirq, aggregate
+controller/worker process CPU, and Linux UDP counter deltas. `socket_telemetry`
+records requested and actual socket buffers. CLI/UI receive-queue drop values
+are UDP-only and are shown as `unavailable` when `SO_RXQ_OVFL` support is absent
+or unknown; a displayed `0` means supported telemetry observed zero drops.
+UDP results also include `udp_wire_version` and `udp_batch` backend status for
+both endpoints. These fields are retained by `--export-slim`.
+
 For tuned UDP tests, `tuning` is an object with `acceptable_loss_pct`,
-`max_duration_sec`, `probe`, `trials`, `best`, and `best_effort`. Trial objects
-contain the target rate, offered/goodput Mbps and packets/sec, loss percentage,
-and local/peer interval durations. `best` is the highest-goodput trial meeting
-the loss target; `best_effort` is the highest-goodput trial when no trial meets
-it. For non-tuned tests, `tuning` is `null`.
+`max_duration_sec`, `probe`, `trials`, `best`, `best_effort`, `search_complete`,
+`ceiling_confirmed`, `result_kind`, and limiting-factor fields. Trial objects
+contain target and attained rates, exact sender-clock measurement duration,
+offered/goodput Mbps and packets/sec, loss, sequence diagnostics, socket-drop
+deltas, host telemetry, and classification. `best` is the highest-goodput
+passing trial, but it is a confirmed ceiling only when `ceiling_confirmed=true`;
+`best_effort` preserves diagnostics when no trial passes. For non-tuned tests,
+`tuning` is `null`.
 
 **PMTUD fields.** `path_mtu_source` is `udp_pmtud`, `icmp_pmtud`, or
 `fixed_fallback`. `pmtud_fallback_used` indicates whether UDP PMTUD was not the
@@ -513,7 +624,10 @@ selected method. When the fixed fallback is used, `path_mtu` is 1300 and
 `pmtud_fallback_reason` explains why discovery failed. The nested `pmtud`
 diagnostic object is used in local results and manifests but is intentionally
 removed from the HTTP payload; the promoted PMTUD fields above preserve the
-important ingestion metadata.
+important ingestion metadata. `jumbo_mtu` records whether probing above 1500
+was enabled, `probe_max_mtu` is the total-MTU search ceiling, and
+`probe_ceiling_reached` means that the discovered value reached that ceiling;
+it does not prove that a larger MTU would fail.
 
 **Slim exports.** `--export-slim` removes only `result.interval_series`,
 `result.per_stream`, and `result.source_ports`. All top-level identity fields,
@@ -522,10 +636,10 @@ are still sent.
 
 The local fullbench manifest is separate from the HTTP payload. It contains the
 shared run metadata, fullbench configuration, PMTUD information, and a `tests`
-array of all per-test records. The exporter sends each successful test record
-individually; it does not send that manifest as one request. Ingestion endpoints
-should read `result.*` for metrics and can persist the whole request body for
-full fidelity.
+array of all attempted per-test records, plus explicit matrix completion status.
+The exporter sends each attempted test record individually; it does not send
+that manifest as one request. Ingestion endpoints should read `result.*` for
+metrics and can persist the whole request body for full fidelity.
 
 ### Diagnostics
 
@@ -558,9 +672,13 @@ nperf connectivity --server-ip 10.0.0.5 --udp-port 20000 \
 python nperf.py connectivity --server-ip 10.0.0.5 --udp-port 20000 \
     --tcp-port 21000 --timeout 5 --log-dir ./diagnostic-logs
 
-# Discover the largest path MTU using DF-marked probes
+# Discover the largest path MTU up to the default total-MTU ceiling of 1500
 nperf pmtud --server-ip 10.0.0.5
 python nperf.py pmtud --server-ip 10.0.0.5
+
+# Opt in to jumbo probing up to total MTU 9000
+nperf pmtud --server-ip 10.0.0.5 --jumbo-mtu
+python nperf.py pmtud --server-ip 10.0.0.5 --jumbo-mtu
 
 # IPv6 PMTUD
 nperf pmtud --server-ip 2001:db8::5 -v6
@@ -568,9 +686,9 @@ python nperf.py pmtud --server-ip 2001:db8::5 -v6
 
 # Narrow the PMTUD search and use the server's configured UDP port
 nperf pmtud --server-ip 10.0.0.5 --udp-port 20000 \
-    --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
+    --jumbo-mtu --min-mtu 576 --max-mtu 2000 --timeout 2 --log-dir ./pmtud-logs
 python nperf.py pmtud --server-ip 10.0.0.5 --udp-port 20000 \
-    --min-size 576 --max-size 2000 --timeout 2 --log-dir ./pmtud-logs
+    --jumbo-mtu --min-mtu 576 --max-mtu 2000 --timeout 2 --log-dir ./pmtud-logs
 
 # Run the UDP/TCP/ICMP/ESP/NAT-T/GRE reachability matrix
 nperf protocols --server-ip 10.0.0.5
@@ -627,6 +745,13 @@ tab (UI).
 The Web UI's **Use IPv6** selector applies to throughput and all diagnostics;
 IPv4 is selected by default. The selected `IPv4`/`IPv6` value is shown in the
 connectivity, throughput, and MTR results and is included in saved logs.
+The shared **Allow jumbo MTU** checkbox is off by default and controls the same
+1500/9000 PMTUD ceiling for throughput, fullbench, and direct PMTUD diagnostics.
+The direct-PMTUD `--min-mtu` and `--max-mtu` options use total IP-MTU bytes. The
+deprecated `--min-size` and `--max-size` options retain their committed UDP
+payload-byte units; NPERF adds the IPv4 (28-byte) or IPv6 (48-byte) IP/UDP
+overhead before applying the selected total-MTU cap. Do not combine each legacy
+bound with its corresponding total-MTU option.
 
 ## Logs
 

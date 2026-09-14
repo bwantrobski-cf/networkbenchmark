@@ -28,7 +28,10 @@ class ServerContext:
 
     def set_session(self, session):
         with self._lock:
+            if self.active_session is not None:
+                return False
             self.active_session = session
+            return True
 
     def clear_session(self, run_id):
         with self._lock:

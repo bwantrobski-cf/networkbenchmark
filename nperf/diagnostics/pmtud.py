@@ -1,10 +1,10 @@
 """Path MTU Discovery tests against the server.
 
 The primary method sends DF-flagged UDP probes of increasing/binary-searched
-size to the server's UDP echo port. When UDP PMTUD fails, the fallback sends
-DF-flagged ICMP echo probes, starting at 1450 bytes and refining the largest
-successful packet. The discovery chain ultimately uses a fixed fallback MTU
-when both probe methods fail.
+total IP MTU to the server's UDP echo port. Standard probing stops at 1500;
+callers can opt in to jumbo probing up to 9000. When UDP PMTUD fails, the
+fallback applies the same bounds to DF-flagged ICMP echo probes. The discovery
+chain ultimately uses a fixed fallback MTU when both probe methods fail.
 
 Requires a raw ICMP socket (root/administrator).
 """
@@ -17,14 +17,12 @@ import time
 from ..common import constants, net
 from . import packetutils as pkt
 
-MIN_PROBE_SIZE = 68
-MAX_PROBE_SIZE = 9000
 DEFAULT_TIMEOUT_SEC = 1.5
 DEFAULT_ATTEMPTS_PER_SIZE = 2
 ICMP_START_PACKET_BYTES = 1450
 ICMP_STEP_BYTES = 50
-ICMP_MIN_PACKET_BYTES = 576
-ICMP_MAX_PACKET_BYTES = 9000
+ICMP_MIN_PACKET_BYTES = constants.PMTUD_MIN_MTU
+ICMP_MAX_PACKET_BYTES = constants.PMTUD_JUMBO_MAX_MTU
 
 
 class PmtudError(Exception):
@@ -39,7 +37,7 @@ def _set_dont_fragment(sock: socket.socket, family=socket.AF_INET):
 
 
 def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec, family):
-    """Return dict: {status: 'ok'|'too_big'|'timeout', rtt_ms, next_hop_mtu}."""
+    """Probe a UDP payload size and return its PMTUD status."""
     header_len = len(constants.CONNECTIVITY_MAGIC) + 8
     pad_len = max(0, size - header_len)
     payload = constants.CONNECTIVITY_MAGIC + secrets.token_bytes(8) + (b"\x00" * pad_len)
@@ -63,13 +61,14 @@ def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec, fam
             pass
 
         try:
-            raw, _ = icmp_sock.recvfrom(65535)
+            raw, from_addr = icmp_sock.recvfrom(65535)
         except socket.timeout:
             continue
         except OSError:
             continue
 
-        parsed = pkt.parse_icmp_packet(raw, family=family)
+        parsed = pkt.parse_icmp_packet(
+            raw, family=family, source_ip=from_addr[0])
         if not parsed:
             continue
         too_big = ((family == socket.AF_INET and parsed["type"] == pkt.ICMP_DEST_UNREACHABLE
@@ -84,9 +83,9 @@ def _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec, fam
 
 
 def _search_packet_size(probe, start: int = ICMP_START_PACKET_BYTES,
-                       step: int = ICMP_STEP_BYTES,
-                       min_size: int = ICMP_MIN_PACKET_BYTES,
-                       max_size: int = ICMP_MAX_PACKET_BYTES) -> dict:
+                        step: int = ICMP_STEP_BYTES,
+                        min_size: int = ICMP_MIN_PACKET_BYTES,
+                        max_size: int = ICMP_MAX_PACKET_BYTES) -> dict:
     trace = []
 
     def attempt(size: int) -> dict:
@@ -99,24 +98,22 @@ def _search_packet_size(probe, start: int = ICMP_START_PACKET_BYTES,
     first = attempt(start)
     if first.get("status") == "ok":
         low = start
-        high = start + step
-        while high <= max_size:
+        while low < max_size:
+            high = min(low + step, max_size)
             result = attempt(high)
             if result.get("status") != "ok":
                 break
             low = high
-            high += step
         else:
             return {"success": True, "packet_bytes": low, "trace": trace, "error": None}
     else:
         high = start
-        low = start - step
-        while low >= min_size:
+        while high > min_size:
+            low = max(high - step, min_size)
             result = attempt(low)
             if result.get("status") == "ok":
                 break
             high = low
-            low -= step
         else:
             return {
                 "success": False,
@@ -134,6 +131,18 @@ def _search_packet_size(probe, start: int = ICMP_START_PACKET_BYTES,
             high = middle
 
     return {"success": True, "packet_bytes": low, "trace": trace, "error": None}
+
+
+def _validate_mtu_bounds(min_mtu: int, max_mtu: int) -> None:
+    if (isinstance(min_mtu, bool) or not isinstance(min_mtu, int)
+            or isinstance(max_mtu, bool) or not isinstance(max_mtu, int)):
+        raise ValueError("min_mtu and max_mtu must be integers")
+    if min_mtu < constants.PMTUD_MIN_MTU:
+        raise ValueError(f"min_mtu must be at least {constants.PMTUD_MIN_MTU}")
+    if max_mtu > constants.PMTUD_JUMBO_MAX_MTU:
+        raise ValueError(f"max_mtu must not exceed {constants.PMTUD_JUMBO_MAX_MTU}")
+    if min_mtu > max_mtu:
+        raise ValueError("min_mtu must be less than or equal to max_mtu")
 
 
 def _icmp_probe_size(icmp_sock, server_ip: str, family, identifier: int,
@@ -157,13 +166,14 @@ def _icmp_probe_size(icmp_sock, server_ip: str, family, identifier: int,
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         try:
-            raw, _ = icmp_sock.recvfrom(65535)
+            raw, from_addr = icmp_sock.recvfrom(65535)
         except socket.timeout:
             continue
         except OSError as exc:
             return {"status": "timeout", "rtt_ms": None, "next_hop_mtu": None, "error": str(exc)}
 
-        parsed = pkt.parse_icmp_packet(raw, family=family)
+        parsed = pkt.parse_icmp_packet(
+            raw, family=family, source_ip=from_addr[0])
         if not parsed:
             continue
         if (parsed.get("ip_src") == server_ip
@@ -189,9 +199,13 @@ def _icmp_probe_size(icmp_sock, server_ip: str, family, identifier: int,
     return {"status": "timeout", "rtt_ms": None, "next_hop_mtu": None}
 
 
-def run_icmp_pmtud(server_ip: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+def run_icmp_pmtud(server_ip: str,
+                   min_mtu: int = constants.PMTUD_MIN_MTU,
+                   max_mtu: int = constants.PMTUD_DEFAULT_MAX_MTU,
+                   timeout_sec: float = DEFAULT_TIMEOUT_SEC,
                    attempts_per_size: int = DEFAULT_ATTEMPTS_PER_SIZE,
                    family=socket.AF_INET, ipv6=False) -> dict:
+    _validate_mtu_bounds(min_mtu, max_mtu)
     if ipv6:
         family = socket.AF_INET6
     server_ip = net.resolve_host(server_ip, family=family)
@@ -222,7 +236,7 @@ def run_icmp_pmtud(server_ip: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC,
         return last_result
 
     try:
-        search = _search_packet_size(probe)
+        search = _search_packet_size(probe, min_size=min_mtu, max_size=max_mtu)
         path_mtu = int(search["packet_bytes"]) if search["success"] else None
         return {
             "server_ip": server_ip,
@@ -234,6 +248,8 @@ def run_icmp_pmtud(server_ip: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC,
                 int(search["packet_bytes"]) - (48 if family == socket.AF_INET6 else 28)
                 if search["success"] else None
             ),
+            "probe_max_mtu": max_mtu,
+            "probe_ceiling_reached": bool(search["success"] and path_mtu == max_mtu),
             "reported_next_hop_mtu": next(
                 (item.get("next_hop_mtu") for item in search["trace"] if item.get("next_hop_mtu")),
                 None,
@@ -246,16 +262,20 @@ def run_icmp_pmtud(server_ip: str, timeout_sec: float = DEFAULT_TIMEOUT_SEC,
 
 
 def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
-                     min_size: int = MIN_PROBE_SIZE, max_size: int = MAX_PROBE_SIZE,
+                     min_mtu: int = constants.PMTUD_MIN_MTU,
+                     max_mtu: int = constants.PMTUD_DEFAULT_MAX_MTU,
                      timeout_sec: float = DEFAULT_TIMEOUT_SEC,
                      attempts_per_size: int = DEFAULT_ATTEMPTS_PER_SIZE,
                      family=socket.AF_INET, ipv6=False) -> dict:
+    _validate_mtu_bounds(min_mtu, max_mtu)
+    if ipv6:
+        family = socket.AF_INET6
     try:
         primary = run_pmtud(
             server_ip,
             udp_port=udp_port,
-            min_size=min_size,
-            max_size=max_size,
+            min_mtu=min_mtu,
+            max_mtu=max_mtu,
             timeout_sec=timeout_sec,
             attempts_per_size=attempts_per_size,
             family=family,
@@ -270,6 +290,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "connectivity_confirmed": False,
             "path_mtu": None,
             "path_mtu_payload_bytes": None,
+            "probe_max_mtu": max_mtu,
+            "probe_ceiling_reached": False,
             "reported_next_hop_mtu": None,
             "bidirectional_validated": False,
             "bidirectional_validation": "unavailable",
@@ -277,6 +299,11 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "error": str(exc),
         }
 
+    primary.setdefault("probe_max_mtu", max_mtu)
+    primary.setdefault(
+        "probe_ceiling_reached",
+        bool(primary.get("success") and primary.get("path_mtu") == max_mtu),
+    )
     if primary.get("success") and isinstance(primary.get("path_mtu"), int):
         primary["path_mtu_source"] = "udp_pmtud"
         primary["fallback_used"] = False
@@ -285,6 +312,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
     try:
         icmp_result = run_icmp_pmtud(
             server_ip,
+            min_mtu=min_mtu,
+            max_mtu=max_mtu,
             timeout_sec=timeout_sec,
             attempts_per_size=attempts_per_size,
             family=family,
@@ -298,6 +327,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "connectivity_confirmed": False,
             "path_mtu": None,
             "path_mtu_payload_bytes": None,
+            "probe_max_mtu": max_mtu,
+            "probe_ceiling_reached": False,
             "reported_next_hop_mtu": None,
             "bidirectional_validated": False,
             "bidirectional_validation": "unavailable",
@@ -305,6 +336,11 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "error": str(exc),
         }
 
+    icmp_result.setdefault("probe_max_mtu", max_mtu)
+    icmp_result.setdefault(
+        "probe_ceiling_reached",
+        bool(icmp_result.get("success") and icmp_result.get("path_mtu") == max_mtu),
+    )
     primary["icmp_pmtud"] = icmp_result
     if icmp_result.get("success") and isinstance(icmp_result.get("path_mtu"), int):
         primary.update({
@@ -312,6 +348,8 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
             "connectivity_confirmed": True,
             "path_mtu": icmp_result["path_mtu"],
             "path_mtu_payload_bytes": icmp_result.get("path_mtu_payload_bytes"),
+            "probe_max_mtu": max_mtu,
+            "probe_ceiling_reached": bool(icmp_result.get("probe_ceiling_reached")),
             "reported_next_hop_mtu": icmp_result.get("reported_next_hop_mtu"),
             "bidirectional_validated": False,
             "bidirectional_validation": "icmp_echo_only",
@@ -321,47 +359,61 @@ def discover_path_mtu(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT
         })
         return primary
 
+    fallback_mtu = min(max_mtu, max(min_mtu, constants.FALLBACK_PATH_MTU))
     primary.update({
-        "path_mtu": constants.FALLBACK_PATH_MTU,
+        "path_mtu": fallback_mtu,
         "path_mtu_source": "fixed_fallback",
         "fallback_used": True,
         "fallback_reason": "UDP and ICMP PMTUD failed; using fixed fallback MTU",
         "bidirectional_validated": False,
         "bidirectional_validation": "fixed_fallback",
         "path_mtu_payload_bytes": None,
+        "probe_max_mtu": max_mtu,
+        "probe_ceiling_reached": False,
     })
     return primary
 
 
 def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
-              min_size: int = MIN_PROBE_SIZE, max_size: int = MAX_PROBE_SIZE,
+              min_mtu: int = constants.PMTUD_MIN_MTU,
+              max_mtu: int = constants.PMTUD_DEFAULT_MAX_MTU,
               timeout_sec: float = DEFAULT_TIMEOUT_SEC,
               attempts_per_size: int = DEFAULT_ATTEMPTS_PER_SIZE,
               family=socket.AF_INET, ipv6=False) -> dict:
+    _validate_mtu_bounds(min_mtu, max_mtu)
     if ipv6:
         family = socket.AF_INET6
+    udp_overhead = 48 if family == socket.AF_INET6 else 28
     server_ip = net.resolve_host(server_ip, family=family)
     icmp_protocol = socket.IPPROTO_ICMPV6 if family == socket.AF_INET6 else socket.IPPROTO_ICMP
     try:
         icmp_sock = socket.socket(family, socket.SOCK_RAW, icmp_protocol)
     except (PermissionError, OSError) as exc:
         raise PmtudError(f"unable to open raw ICMP socket (requires root/admin): {exc}")
-    icmp_sock.settimeout(0.05)
-
-    udp_sock = socket.socket(family, socket.SOCK_DGRAM)
-    udp_sock.settimeout(0.05)
-    _set_dont_fragment(udp_sock, family=family)
+    udp_sock = None
+    try:
+        icmp_sock.settimeout(0.05)
+        udp_sock = socket.socket(family, socket.SOCK_DGRAM)
+        udp_sock.settimeout(0.05)
+        _set_dont_fragment(udp_sock, family=family)
+    except Exception:
+        icmp_sock.close()
+        if udp_sock is not None:
+            udp_sock.close()
+        raise
 
     trace = []
     connectivity_confirmed = False
     reported_mtu_hint = None
 
-    def probe_with_retries(size):
+    def probe_with_retries(mtu):
         nonlocal connectivity_confirmed, reported_mtu_hint
+        payload_size = mtu - udp_overhead
         last = None
         for _ in range(attempts_per_size):
-            last = _probe_size(udp_sock, icmp_sock, server_ip, udp_port, size, timeout_sec, family)
-            trace.append({"size": size, **last})
+            last = _probe_size(
+                udp_sock, icmp_sock, server_ip, udp_port, payload_size, timeout_sec, family)
+            trace.append({"size": mtu, "payload_size": payload_size, **last})
             if last["status"] in ("ok", "too_big"):
                 connectivity_confirmed = True
                 if last.get("next_hop_mtu"):
@@ -370,7 +422,7 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
         return last
 
     try:
-        low_result = probe_with_retries(min_size)
+        low_result = probe_with_retries(min_mtu)
         if low_result["status"] != "ok":
             return {
                 "server_ip": server_ip,
@@ -379,6 +431,9 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
                 "success": False,
                 "connectivity_confirmed": connectivity_confirmed,
                 "path_mtu": None,
+                "path_mtu_payload_bytes": None,
+                "probe_max_mtu": max_mtu,
+                "probe_ceiling_reached": False,
                 "reported_next_hop_mtu": reported_mtu_hint,
                 "bidirectional_validated": False,
                 "bidirectional_validation": "udp_df_echo",
@@ -386,7 +441,7 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
                 "error": "server did not respond even at the minimum probe size; check connectivity first",
             }
 
-        low, high = min_size, max_size
+        low, high = min_mtu, max_mtu
         high_result = probe_with_retries(high)
         if high_result["status"] == "ok":
             low = high
@@ -405,8 +460,10 @@ def run_pmtud(server_ip: str, udp_port: int = constants.DEFAULT_UDP_PORT,
             "ip_version": net.ip_version_label(family=family),
             "success": True,
             "connectivity_confirmed": connectivity_confirmed,
-            "path_mtu": low + (48 if family == socket.AF_INET6 else 28),  # add back IP+UDP headers
-            "path_mtu_payload_bytes": low,
+            "path_mtu": low,
+            "path_mtu_payload_bytes": low - udp_overhead,
+            "probe_max_mtu": max_mtu,
+            "probe_ceiling_reached": low == max_mtu,
             "reported_next_hop_mtu": reported_mtu_hint,
             "bidirectional_validated": True,
             "bidirectional_validation": "udp_df_echo",

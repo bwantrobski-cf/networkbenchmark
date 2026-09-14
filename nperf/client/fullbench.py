@@ -13,6 +13,7 @@ so it can run headless anywhere the package is installed.
 """
 
 import json
+import math
 import socket
 import threading
 import time
@@ -87,14 +88,15 @@ class FullBenchConfig:
     def __init__(self, server_ip, control_port=None, transports=("tcp", "udp"),
                  directions=("up", "down"), streams=(1, 8, 16, 32), procs=(1,),
                  duration_sec=constants.DEFAULT_TEST_DURATION_SEC,
-                 acceptable_loss_pct=None,
-                 udp_max_duration_sec=constants.DEFAULT_MAX_DURATION_SEC,
-                 bind="0.0.0.0", start_port=None,
+                  acceptable_loss_pct=None,
+                  udp_max_duration_sec=constants.DEFAULT_MAX_DURATION_SEC,
+                  udp_start_mbps=constants.UDP_TUNE_START_MBPS,
+                  bind="0.0.0.0", start_port=None,
                  export_url=None, export_method="POST", export_headers=None,
                  export_slim=False, export_timeout_sec=15.0, label=None,
-                 run_id=None, vm_name=None, cloud=None, environment=None,
-                 tool_version=1, test_type="nperf", ipv6=False,
-                 udp_port=None, tcp_port=None):
+                  run_id=None, vm_name=None, cloud=None, environment=None,
+                  tool_version=1, test_type="nperf", ipv6=False,
+                  udp_port=None, tcp_port=None, jumbo_mtu=False):
         self.server_ip = server_ip
         self.ipv6 = bool(ipv6)
         self.family = net.family_for_ipv6(self.ipv6)
@@ -102,7 +104,18 @@ class FullBenchConfig:
         self.control_port = control_port or constants.DEFAULT_CONTROL_PORT
         self.transports = list(transports)
         self.directions = list(directions)
-        self.streams = list(streams)
+        try:
+            self.streams = [int(value) for value in streams]
+        except (TypeError, ValueError):
+            raise ValueError("streams must contain integers") from None
+        invalid_streams = [
+            value for value in self.streams
+            if not 1 <= value <= constants.MAX_PARALLEL_STREAMS
+        ]
+        if invalid_streams:
+            raise ValueError(
+                f"streams must be from 1 to {constants.MAX_PARALLEL_STREAMS} "
+                f"(got {invalid_streams[0]})")
         self.procs = list(procs)
         if len(self.procs) not in (1, len(self.streams)):
             raise ValueError(
@@ -111,11 +124,24 @@ class FullBenchConfig:
         self.duration_sec = float(duration_sec)
         self.acceptable_loss_pct = (float(acceptable_loss_pct)
                                     if acceptable_loss_pct is not None else None)
+        if (self.acceptable_loss_pct is not None
+                and (not math.isfinite(self.acceptable_loss_pct)
+                     or not 0 <= self.acceptable_loss_pct <= 100)):
+            raise ValueError("acceptable UDP loss must be a finite percentage from 0 to 100")
         self.udp_max_duration_sec = float(udp_max_duration_sec)
+        if not math.isfinite(self.udp_max_duration_sec) or self.udp_max_duration_sec <= 0:
+            raise ValueError("UDP maximum duration must be a finite value greater than 0 seconds")
+        self.udp_start_mbps = float(udp_start_mbps)
+        if (not math.isfinite(self.udp_start_mbps)
+                or not 0 < self.udp_start_mbps <= constants.UDP_TUNE_MAX_RATE_MBPS):
+            raise ValueError(
+                f"UDP tuning start rate must be greater than 0 and no more than "
+                f"{constants.UDP_TUNE_MAX_RATE_MBPS:g} Mbps")
         self.bind = bind
         self.start_port = start_port
         self.udp_port = int(udp_port or start_port or constants.DEFAULT_UDP_PORT)
         self.tcp_port = int(tcp_port or start_port or constants.DEFAULT_TCP_PORT)
+        self.jumbo_mtu = bool(jumbo_mtu)
         self.export_url = export_url
         self.export_method = (export_method or "POST").upper()
         self.export_headers = dict(export_headers or {})
@@ -219,13 +245,19 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     started_at = datetime.now(timezone.utc).isoformat()
     pmtud_udp_port = cfg.udp_port
     pmtud_server_ip = cfg.server_ip
+    probe_max_mtu = (constants.PMTUD_JUMBO_MAX_MTU
+                     if cfg.jumbo_mtu else constants.PMTUD_DEFAULT_MAX_MTU)
     pmtud_result = discover_path_mtu(
         pmtud_server_ip,
         udp_port=pmtud_udp_port,
+        max_mtu=probe_max_mtu,
         family=cfg.family,
         ipv6=cfg.ipv6,
     )
     pmtud_result.setdefault("ip_version", cfg.ip_version)
+    pmtud_result["jumbo_mtu"] = cfg.jumbo_mtu
+    pmtud_result.setdefault("probe_max_mtu", probe_max_mtu)
+    pmtud_result.setdefault("probe_ceiling_reached", False)
     pmtud_fallback_used = bool(pmtud_result.get("fallback_used"))
     path_mtu = pmtud_result.get("path_mtu")
     tcp_mss_bytes = stream_worker.tcp_mss_for_path_mtu(path_mtu, family=cfg.family)
@@ -235,6 +267,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         f"success={pmtud_result.get('success')} connectivity_confirmed={pmtud_result.get('connectivity_confirmed')}",
         f"path_mtu={path_mtu} payload={pmtud_result.get('path_mtu_payload_bytes')}",
         f"path_mtu_source={pmtud_result.get('path_mtu_source', 'pmtud')} fallback_used={pmtud_fallback_used}",
+        f"jumbo_mtu={cfg.jumbo_mtu} probe_max_mtu={pmtud_result.get('probe_max_mtu')} "
+        f"probe_ceiling_reached={pmtud_result.get('probe_ceiling_reached')}",
         f"bidirectional_validated={pmtud_result.get('bidirectional_validated')} "
         f"validation={pmtud_result.get('bidirectional_validation', 'unknown')}",
         f"tcp_mss_bytes={tcp_mss_bytes} udp_datagram_bytes={udp_datagram_bytes}",
@@ -252,6 +286,9 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         "udp_datagram_bytes": udp_datagram_bytes,
         "path_mtu_source": pmtud_result.get("path_mtu_source", "pmtud"),
         "fallback_used": pmtud_fallback_used,
+        "jumbo_mtu": cfg.jumbo_mtu,
+        "probe_max_mtu": pmtud_result.get("probe_max_mtu"),
+        "probe_ceiling_reached": bool(pmtud_result.get("probe_ceiling_reached")),
         "path_mtu_payload_bytes": pmtud_result.get("path_mtu_payload_bytes"),
         "reported_next_hop_mtu": pmtud_result.get("reported_next_hop_mtu"),
         "fallback_reason": pmtud_result.get("fallback_reason"),
@@ -269,10 +306,12 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     validated = pmtud_result.get("bidirectional_validated")
     if pmtud_fallback_used:
         log(f"fullbench PMTUD fallback source={pmtud_result.get('path_mtu_source')}; using MTU={path_mtu} bytes; "
+            f"probe_max_mtu={probe_max_mtu} ceiling_reached={pmtud_info['probe_ceiling_reached']}; "
             f"bidirectional_validated={validated} validation={validation}; local log: {pmtud_json_path}")
     else:
         log(f"fullbench PMTUD: path MTU={path_mtu} bytes; bidirectional_validated={validated} "
-            f"validation={validation}; local log: {pmtud_json_path}")
+            f"validation={validation}; probe_max_mtu={probe_max_mtu} "
+            f"ceiling_reached={pmtud_info['probe_ceiling_reached']}; local log: {pmtud_json_path}")
     plan = cfg.build_plan()
     total = len(plan)
     log(f"fullbench {benchmark_id}: {total} test(s) queued -> {cfg.server_ip}")
@@ -283,25 +322,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             log("fullbench: stop requested, aborting remaining tests")
             break
 
-        label = _spec_label(spec)
-        log(f"[{idx}/{total}] {label}: starting")
-
-        client_cfg = ThroughputClientConfig(
-            server_ip=cfg.server_ip,
-            control_port=cfg.control_port,
-            transport=spec["transport"],
-            direction=spec["direction"],
-            streams=spec["streams"],
-            duration_sec=cfg.duration_sec,
-            start_port=(cfg.udp_port if spec["transport"] == "udp" else cfg.tcp_port),
-            bind=cfg.bind,
-            procs=spec["procs"],
-            acceptable_loss_pct=(cfg.acceptable_loss_pct if spec["tune"] else None),
-            max_duration_sec=cfg.udp_max_duration_sec,
-            path_mtu=path_mtu,
-            pmtud_info=pmtud_info,
-            ipv6=cfg.ipv6,
-        )
+        case_label = _spec_label(spec)
+        log(f"[{idx}/{total}] {case_label}: starting")
 
         # Each individual test carries its own unique recorded_at timestamp.
         record = {
@@ -318,7 +340,8 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "benchmark_id": benchmark_id,
             "test_index": idx,
             "test_count": total,
-            "label": label,
+            "label": cfg.label,
+            "case_label": case_label,
             "crypto_setting": cfg.label,
             "transport": spec["transport"],
             "direction": spec["direction"],
@@ -326,6 +349,9 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "procs": spec["procs"],
             "tuned": spec["tune"],
             "path_mtu": path_mtu,
+            "jumbo_mtu": cfg.jumbo_mtu,
+            "probe_max_mtu": pmtud_info.get("probe_max_mtu"),
+            "probe_ceiling_reached": pmtud_info.get("probe_ceiling_reached"),
             "path_mtu_source": pmtud_info.get("path_mtu_source"),
             "pmtud_fallback_used": pmtud_info.get("fallback_used"),
             "pmtud_fallback_reason": pmtud_info.get("fallback_reason"),
@@ -338,11 +364,47 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         }
 
         try:
+            client_cfg = ThroughputClientConfig(
+                server_ip=cfg.server_ip,
+                control_port=cfg.control_port,
+                transport=spec["transport"],
+                direction=spec["direction"],
+                streams=spec["streams"],
+                duration_sec=cfg.duration_sec,
+                start_port=(cfg.udp_port if spec["transport"] == "udp" else cfg.tcp_port),
+                bind=cfg.bind,
+                procs=spec["procs"],
+                acceptable_loss_pct=(cfg.acceptable_loss_pct if spec["tune"] else None),
+                max_duration_sec=cfg.udp_max_duration_sec,
+                udp_start_mbps=cfg.udp_start_mbps,
+                path_mtu=path_mtu,
+                pmtud_info=pmtud_info,
+                ipv6=cfg.ipv6,
+                jumbo_mtu=cfg.jumbo_mtu,
+            )
             summary = run_throughput_test(client_cfg, stop_requested=stop_requested,
                                           log_base_dir=log_base_dir)
+            tuning = summary.get("tuning") or {}
+            termination_reason = tuning.get("termination_reason")
+            summary_status = summary.get("status")
+            case_aborted = bool(
+                summary.get("aborted")
+                or summary_status in ("aborted", "cancelled")
+                or termination_reason == "stopped")
             record["nb_run_id"] = summary.get("run_id")
-            record["ok"] = True
-            record["error"] = None
+            # `ok` is the established execution-status contract. Ceiling
+            # validity is reported separately by the promoted tuning fields.
+            record["status"] = (summary_status or
+                                ("cancelled" if case_aborted else "complete"))
+            record["complete"] = not case_aborted
+            record["aborted"] = case_aborted
+            record["cancelled"] = record["status"] == "cancelled"
+            record["ok"] = not case_aborted
+            if case_aborted:
+                record["error"] = "stopped by request"
+                stop_requested.set()
+            else:
+                record["error"] = None
             record["result"] = summary
             record["send_mbps"] = summary.get("send_mbps")
             record["recv_mbps"] = summary.get("recv_mbps")
@@ -354,18 +416,33 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             record["tcp_mss_bytes"] = summary.get("tcp_mss_bytes")
             record["udp_datagram_bytes"] = summary.get("udp_datagram_bytes")
             record["log_json"] = summary.get("log_json")
+            if tuning:
+                record["tuning_search_complete"] = tuning.get("search_complete")
+                record["tuning_ceiling_confirmed"] = tuning.get("ceiling_confirmed")
+                record["tuning_result_kind"] = tuning.get("result_kind")
+                record["tuning_termination_reason"] = tuning.get("termination_reason")
+                record["tuning_limiting_factor"] = tuning.get("limiting_factor")
+                record["tuning_limiting_scope"] = tuning.get("limiting_scope")
+                record["tuning_limiting_confidence"] = tuning.get("limiting_confidence")
             metric = (f"retransmits={summary.get('retransmits')}"
                       if spec["transport"] == "tcp"
                       else f"loss={summary.get('loss_pct')}")
-            log(f"[{idx}/{total}] {label}: send={summary.get('send_mbps', 0):.1f} Mbps "
-                f"recv={summary.get('recv_mbps', 0):.1f} Mbps {metric} "
+            tuning_status = (f" search={tuning.get('termination_reason')}"
+                             if tuning else "")
+            log(f"[{idx}/{total}] {case_label}: send={summary.get('send_mbps', 0):.1f} Mbps "
+                f"recv={summary.get('recv_mbps', 0):.1f} Mbps {metric}{tuning_status} "
                 f"mtu={summary.get('path_mtu')} tcp_mss={summary.get('tcp_mss_bytes')} "
                 f"udp_datagram={summary.get('udp_datagram_bytes')}")
         except Exception as exc:  # noqa: BLE001 -- one test failing must not kill the run
+            case_aborted = stop_requested.is_set()
             record["ok"] = False
+            record["status"] = "cancelled" if case_aborted else "failed"
+            record["complete"] = False
+            record["aborted"] = case_aborted
+            record["cancelled"] = case_aborted
             record["error"] = str(exc)
             record["result"] = None
-            log(f"[{idx}/{total}] {label}: FAILED: {exc}")
+            log(f"[{idx}/{total}] {case_label}: FAILED: {exc}")
 
         # Export per-test result (if configured).
         if cfg.export_url:
@@ -381,13 +458,21 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             record["export"] = res
             if res["ok"]:
                 result_status = "FAILURE result" if record["ok"] is False else "result"
-                log(f"[{idx}/{total}] {label}: exported {result_status} (HTTP {res['status']})")
+                log(f"[{idx}/{total}] {case_label}: exported {result_status} (HTTP {res['status']})")
             else:
-                log(f"[{idx}/{total}] {label}: export FAILED: {res['error']}")
-            if idx < total:
+                log(f"[{idx}/{total}] {case_label}: export FAILED: {res['error']}")
+            if idx < total and not stop_requested.is_set():
                 time.sleep(5)
 
         tests.append(record)
+
+    completed = len(tests)
+    if stop_requested.is_set() or any(test.get("aborted") for test in tests):
+        completion_status = "aborted"
+    elif completed == total:
+        completion_status = "complete"
+    else:
+        completion_status = "incomplete"
 
     manifest = {
         "benchmark_id": benchmark_id,
@@ -402,6 +487,9 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         "test_type": cfg.test_type,
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
+        "jumbo_mtu": cfg.jumbo_mtu,
+        "probe_max_mtu": pmtud_info.get("probe_max_mtu"),
+        "probe_ceiling_reached": pmtud_info.get("probe_ceiling_reached"),
         "pmtud": pmtud_info,
         "config": {
             "transports": cfg.transports,
@@ -410,13 +498,20 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
             "procs": cfg.procs,
             "udp_port": cfg.udp_port,
             "tcp_port": cfg.tcp_port,
+            "jumbo_mtu": cfg.jumbo_mtu,
+            "probe_max_mtu": pmtud_info.get("probe_max_mtu"),
+            "probe_ceiling_reached": pmtud_info.get("probe_ceiling_reached"),
             "duration_sec": cfg.duration_sec,
             "acceptable_loss_pct": cfg.acceptable_loss_pct,
             "udp_max_duration_sec": cfg.udp_max_duration_sec,
+            "udp_start_mbps": cfg.udp_start_mbps,
             "export_url": cfg.export_url,
         },
         "test_count": total,
-        "completed": len(tests),
+        "completed": completed,
+        "status": completion_status,
+        "complete": completion_status == "complete",
+        "aborted": completion_status == "aborted",
         "test_failures": sum(1 for test in tests if not test.get("ok")),
         "export_failures": sum(
             1 for test in tests
@@ -428,8 +523,11 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
     text_lines = [
         f"fullbench {benchmark_id} -> {cfg.server_ip} ip_version={cfg.ip_version}",
         f"PMTUD path MTU: {path_mtu} bytes",
+        f"PMTUD ceiling: jumbo_mtu={cfg.jumbo_mtu} max_mtu={pmtud_info.get('probe_max_mtu')} "
+        f"reached={pmtud_info.get('probe_ceiling_reached')}",
         f"Packet sizing: TCP MSS={tcp_mss_bytes} bytes  UDP datagram={udp_datagram_bytes} bytes",
         f"PMTUD local log: {pmtud_json_path}",
+        f"Matrix status: {completion_status} ({completed}/{total} cases completed)",
         "",
     ]
     for t in tests:
@@ -438,16 +536,23 @@ def run_fullbench(cfg: FullBenchConfig, on_progress=None, stop_requested: thread
         if export is not None:
             export_status = (f" export=ok(HTTP {export.get('status')})" if export.get("ok")
                              else f" export=FAIL({export.get('error')})")
-        if t["ok"]:
+        if t.get("tuning_termination_reason") == "target_not_attained":
+            text_lines.append(
+                f"{t['case_label']}: TARGET NOT ATTAINED: result is not a network ceiling"
+                f"{export_status}")
+        elif t["ok"]:
             metric = (f"retransmits={t.get('retransmits')}"
                       if t.get("transport") == "tcp"
                       else f"loss={t.get('loss_pct')}")
-            text_lines.append(f"{t['label']}: send={t.get('send_mbps')} Mbps "
-                              f"recv={t.get('recv_mbps')} Mbps {metric} "
+            tuning_status = (f" search={t.get('tuning_termination_reason')}"
+                             if t.get("tuning_termination_reason") else "")
+            text_lines.append(f"{t['case_label']}: send={t.get('send_mbps')} Mbps "
+                              f"recv={t.get('recv_mbps')} Mbps {metric}{tuning_status} "
                               f"mtu={t.get('path_mtu')} tcp_mss={t.get('tcp_mss_bytes')} "
                               f"udp_datagram={t.get('udp_datagram_bytes')}{export_status}")
         else:
-            text_lines.append(f"{t['label']}: FAILED: {t.get('error')}{export_status}")
+            text_lines.append(
+                f"{t['case_label']}: FAILED: {t.get('error')}{export_status}")
     json_path, log_path = logging_store.save_result(
         constants.TEST_TYPE_FULLBENCH, manifest, text_lines, base_dir=log_base_dir)
     manifest["manifest_json"] = json_path
