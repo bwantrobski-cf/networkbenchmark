@@ -8,6 +8,7 @@ bufferbloat measurement (see transport.metrics.compute_bufferbloat).
 import copy
 import collections
 import ctypes
+import errno
 import math
 import multiprocessing
 import operator
@@ -147,6 +148,39 @@ class ThroughputClientConfig:
 
 class ThroughputError(Exception):
     pass
+
+
+def _control_connection_error(cfg, server_ip, exc):
+    endpoint = (f"[{server_ip}]:{cfg.control_port}"
+                if cfg.family == socket.AF_INET6 else f"{server_ip}:{cfg.control_port}")
+    error_number = getattr(exc, "errno", None)
+    if (isinstance(exc, ConnectionRefusedError)
+            or error_number == errno.ECONNREFUSED):
+        detail = ("connection refused; verify nperf server is running and "
+                  f"TCP port {cfg.control_port} is allowed")
+    elif (isinstance(exc, (socket.timeout, TimeoutError))
+          or error_number == errno.ETIMEDOUT):
+        detail = ("connection timed out; verify routing, firewall rules, and "
+                  f"TCP port {cfg.control_port}")
+    elif error_number in (errno.EHOSTUNREACH, errno.ENETUNREACH):
+        detail = (f"no route to the host or network; verify {cfg.ip_version} "
+                  "routing and firewall rules")
+    elif error_number == errno.EADDRNOTAVAIL:
+        detail = (f"the local {cfg.ip_version} address is unavailable; verify "
+                  f"{cfg.ip_version} is configured on this host")
+    else:
+        detail = str(exc) or type(exc).__name__
+    return ThroughputError(
+        f"unable to connect to NPERF {cfg.ip_version} control channel at "
+        f"{endpoint}: {detail}")
+
+
+def _operational_throughput_error(exc):
+    if isinstance(exc, EOFError):
+        return ThroughputError(f"control connection closed by the server: {exc}")
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return ThroughputError(f"network operation timed out: {exc}")
+    return ThroughputError(f"network operation failed: {exc}")
 
 
 _UINT32_MAX = (1 << 32) - 1
@@ -2012,7 +2046,10 @@ def _validate_udp_hello_ack(message):
 def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
                               stop_requested: threading.Event = None,
                               log_base_dir: str = None) -> dict:
-    server_ip = addr.resolve_host(cfg.server_host, family=cfg.family)
+    try:
+        server_ip = addr.resolve_host(cfg.server_host, family=cfg.family)
+    except ValueError as exc:
+        raise ThroughputError(f"invalid {cfg.ip_version} server address: {exc}") from exc
     cfg.server_host = server_ip
     stop_requested = stop_requested or threading.Event()
 
@@ -2034,13 +2071,19 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
     minimum_tuning_rate_mbps = _validate_udp_tuning_sample_rate(cfg)
 
     control = None
-    control_sock = socket.socket(cfg.family, socket.SOCK_STREAM)
+    control_sock = None
     try:
+        control_sock = socket.socket(cfg.family, socket.SOCK_STREAM)
         control_sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
         control_sock.connect(net.sockaddr(server_ip, cfg.control_port, cfg.family))
         control = ControlChannel(control_sock)
+    except OSError as exc:
+        if control_sock is not None:
+            control_sock.close()
+        raise _control_connection_error(cfg, server_ip, exc) from exc
     except Exception:
-        control_sock.close()
+        if control_sock is not None:
+            control_sock.close()
         raise
 
     run_id = str(uuid.uuid4())
@@ -2493,9 +2536,13 @@ def run_throughput_test(cfg: ThroughputClientConfig, on_interval=None,
         except (ThroughputError, OSError, EOFError, TimeoutError) as exc:
             last_error = exc
             if attempt + 1 >= attempts or stop_requested.is_set():
-                raise
+                if isinstance(exc, ThroughputError):
+                    raise
+                raise _operational_throughput_error(exc) from exc
             time.sleep(constants.UDP_RETRY_BACKOFF_SEC * (2 ** attempt))
-    raise last_error
+    if isinstance(last_error, ThroughputError):
+        raise last_error
+    raise _operational_throughput_error(last_error) from last_error
 
 
 def _validate_udp_tuning_summary(cfg: ThroughputClientConfig, summary: dict) -> None:

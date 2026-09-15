@@ -122,7 +122,9 @@ Start the server on the host that will receive throughput connections. The
 installed console script and the direct launcher accept identical options. The
 server attempts IPv4 and IPv6 listeners independently; IPv4 remains the
 client default, and an unavailable IPv6 address or socket capability is logged
-without preventing IPv4 startup.
+without preventing IPv4 startup. With the default bind, each listener reports
+`families=IPv4,IPv6`; an explicit IPv4 or IPv6 `--bind` restricts the server to
+that address family.
 
 
 ```bash

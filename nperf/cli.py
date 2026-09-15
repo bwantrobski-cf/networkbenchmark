@@ -33,7 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_server = sub.add_parser("server", help="run as a server")
-    p_server.add_argument("--bind", default="0.0.0.0", help="address to bind (default: 0.0.0.0)")
+    p_server.add_argument("--bind", default="0.0.0.0",
+                          help="address to bind (default: all IPv4 and IPv6 interfaces)")
     p_server.add_argument("--control-port", type=int, default=constants.DEFAULT_CONTROL_PORT)
     p_server.add_argument("--udp-port", type=int, default=constants.DEFAULT_UDP_PORT,
                            help="base UDP port for connectivity checks + throughput streams (default: 10000)")
@@ -217,7 +218,9 @@ def cmd_server(args):
     from .server.engine import ServerConfig, run_server
     config = ServerConfig(bind=args.bind, control_port=args.control_port,
                            udp_port=args.udp_port, tcp_port=args.tcp_port, log_dir=args.log_dir)
-    print(f"NPERF server starting on {args.bind} "
+    bind_display = ("all IPv4 and IPv6 interfaces"
+                    if args.bind in (None, "", "0.0.0.0", "*") else args.bind)
+    print(f"NPERF server starting on {bind_display} "
           f"(control={args.control_port} udp={args.udp_port} tcp={args.tcp_port})", flush=True)
     run_server(config, block=True)
 
@@ -296,7 +299,10 @@ def cmd_throughput(args):
         summary = run_throughput_test(cfg, on_interval=on_interval, stop_requested=stop_requested,
                                       log_base_dir=args.log_dir)
     except ThroughputError as exc:
-        print(f"ERROR: throughput test could not start: {exc}", flush=True)
+        print(f"ERROR: throughput test failed: {exc}", flush=True)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: throughput test failed unexpectedly: {type(exc).__name__}: {exc}", flush=True)
         sys.exit(1)
     _print_throughput_summary(summary)
     termination_reason = (summary.get("tuning") or {}).get("termination_reason")

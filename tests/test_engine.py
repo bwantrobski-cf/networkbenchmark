@@ -1,4 +1,6 @@
+import errno
 import queue
+import socket
 import threading
 import unittest
 from types import SimpleNamespace
@@ -68,13 +70,38 @@ class EngineTests(unittest.TestCase):
         with patch.object(engine.addr, "resolve_host", return_value="198.51.100.10"), \
              patch.object(engine.socket, "socket", return_value=control_sock), \
              patch.object(engine, "_discover_path_mtu") as discover, \
-             self.assertRaisesRegex(OSError, "stop after sizing"):
+             self.assertRaisesRegex(engine.ThroughputError, "stop after sizing"):
             engine._run_throughput_test_once(cfg)
 
         discover.assert_not_called()
         self.assertEqual(cfg.pmtud_info["path_mtu_source"], "provided")
         self.assertIsNone(cfg.pmtud_info["probe_max_mtu"])
         self.assertFalse(cfg.pmtud_info["probe_ceiling_reached"])
+
+    def test_control_connection_errors_include_ipv6_endpoint_and_guidance(self):
+        cases = (
+            (ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused"),
+             "connection refused.*nperf server.*TCP port 12000"),
+            (OSError(errno.EHOSTUNREACH, "No route to host"),
+             "no route.*IPv6 routing"),
+            (socket.timeout("timed out"),
+             "connection timed out.*TCP port 12000"),
+        )
+        for failure, detail_pattern in cases:
+            with self.subTest(failure=failure):
+                cfg = engine.ThroughputClientConfig(
+                    "2602:81c:e001:31::10", ipv6=True, path_mtu=1500)
+                control_sock = Mock()
+                control_sock.connect.side_effect = failure
+                with patch.object(
+                        engine.addr, "resolve_host",
+                        return_value="2602:81c:e001:31::10"), \
+                     patch.object(engine.socket, "socket", return_value=control_sock), \
+                     self.assertRaisesRegex(
+                         engine.ThroughputError,
+                         r"\[2602:81c:e001:31::10\]:12000.*" + detail_pattern):
+                    engine._run_throughput_test_once(cfg)
+                control_sock.close.assert_called_once()
 
     def test_udp_tuning_rejects_rate_below_one_packet_per_stream_window(self):
         cfg = engine.ThroughputClientConfig(
@@ -105,7 +132,7 @@ class EngineTests(unittest.TestCase):
         with patch.object(
                 engine.addr, "resolve_host", return_value="198.51.100.10"), \
              patch.object(engine.socket, "socket", return_value=control_sock), \
-             self.assertRaisesRegex(OSError, "validated"):
+             self.assertRaisesRegex(engine.ThroughputError, "validated"):
             engine._run_throughput_test_once(cfg)
 
     def test_discovery_uses_selected_total_mtu_ceiling(self):

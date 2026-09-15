@@ -378,11 +378,13 @@ class ServerUdpIntegrationTests(unittest.TestCase):
              patch.object(throughput_session.udp_batch, "backend_status",
                           return_value=backend):
             throughput_session.handle_control_connection(
-                ctx, SimpleNamespace(family=socket.AF_INET), ("127.0.0.1", 30000))
+                ctx, SimpleNamespace(family=socket.AF_INET6), ("::1", 30000, 0, 0))
 
         hello = next(message for message in control.sent
                      if message["type"] == "hello_ack")
         self.assertTrue(hello["ok"])
+        self.assertEqual(params["family"], socket.AF_INET6)
+        self.assertEqual(params["ip_version"], "IPv6")
         self.assertEqual(hello["udp_wire_version"], 3)
         self.assertEqual(hello["udp_batch"], backend)
 
