@@ -273,6 +273,38 @@ worker processes so send/receive work can use multiple cores:
 A good starting point is `--procs` equal to `-P`, up to the number of physical
 cores on the slower of the two hosts.
 
+### Large stream counts
+
+TCP and UDP support 1-1024 parallel data streams with `tput -P N` or
+`fullbench --streams ...`, for both IPv4 and IPv6. Streams are independent
+data flows, not worker processes; use a modest `--procs` value to spread them
+across CPU cores:
+
+```bash
+python nperf.py tput --server-ip 10.0.0.5 --tcp -P 1024 --procs 8 --time 30
+python nperf.py fullbench --server-ip 10.0.0.5 --streams 64,256,1024 --procs 8
+```
+
+Update both client and server; older servers reject counts above 64. Large
+runs require sufficient file descriptors, threads, memory, and available data
+ports on both hosts. Check `ulimit -n` on Unix and, if permitted by the host's
+hard limit, raise it (for example, `ulimit -n 8192`) in the shell launching
+each endpoint. UDP allocates receive buffers per stream, so memory use can be
+substantial. See Ports below for the ranges to allow through firewalls.
+Normal TCP receive-side cleanup allows up to 45 seconds for queued data and
+retransmissions to drain before EOF, within the 60-second final-statistics
+deadline. Aborts and forced worker stops retain the shorter 10-second budget;
+a drain timeout still fails the run instead of reporting incomplete counters.
+Workers prepare their stream threads before releasing data flow so busy early
+streams do not starve later streams during startup. The portable UDP backend
+uses smaller batches to stay responsive to stop/trial changes; native Linux
+batching remains unchanged. Control messages tolerate transient kernel-buffer
+pressure without extending their write deadline.
+For more than 64 TCP streams on macOS, NPERF requests socket buffers from a
+64 MiB aggregate budget per direction (64 KiB per socket at 1024 streams) to
+avoid exhausting the global network-buffer pool through autotuning. Linux
+socket-buffer behavior is unchanged.
+
 ### UDP loss-target tuning (`--acceptable-loss`)
 
 Unpaced UDP simply blasts as fast as the sender can, which overruns the
@@ -406,7 +438,7 @@ python nperf.py fullbench --server-ip 10.0.0.5 --transports udp --directions dow
 ```
 
 - `--streams` is a comma-separated list of stream counts (e.g. `1,8,16,32`).
-  Every count must be between 1 and the wire-protocol limit of 64.
+  Every count must be between 1 and the supported limit of 1024.
 - `--procs` is either a single value applied to every run, or a comma-separated
   list **paired** with `--streams` (so `1,8,16,32` + `1,4,8,8` uses 1 proc for
   the 1-stream run, 4 for 8 streams, 8 for 16 and 32).
@@ -737,7 +769,11 @@ for the UDP/TCP/control port configuration.
 | IPSEC UDP-over-ESP (NAT-T, fixed)           | 4500    |
 
 Parallel streams (`-P N`) use sequential ports starting at the configured
-UDP/TCP base port (`base_port + stream_index`). Each stream is an independent
+UDP/TCP base port, skipping the TCP control port for TCP streams and UDP/4500
+(NAT-T) for UDP streams. The server sends the actual port list to the client.
+With defaults, 1024 TCP streams use TCP/11000-12024 except TCP/12000, which
+remains the control listener; 1024 UDP streams use UDP/10000-11023.
+Each stream is an independent
 concurrent data flow; `--procs` only controls how those streams are distributed
 across worker processes and does not replace the stream count. All ports are
 configurable on the server via CLI flags / the Settings tab, and the client

@@ -223,7 +223,8 @@ def render_throughput_tab():
     with col2:
         direction = st.radio("Direction", ["Upload", "Download"], horizontal=True, disabled=busy, key="tp_direction")
     with col3:
-        streams = st.number_input("Parallel data streams (-P)", min_value=1, max_value=32, value=1,
+        streams = st.number_input("Parallel data streams (-P)", min_value=1,
+                                  max_value=constants.MAX_PARALLEL_STREAMS, value=1,
                                   disabled=busy, key="tp_streams",
                                   help="One independent socket/data flow is created per stream. This is separate from worker processes.")
     with col4:
@@ -500,7 +501,7 @@ def render_fullbench_tab():
                                     default=["Upload", "Download"], disabled=busy,
                                     key="fb_directions")
 
-    streams = st.multiselect("Parallel data streams per test", [1, 8, 16, 32],
+    streams = st.multiselect("Parallel data streams per test", [1, 8, 16, 32, 64, 128, 256, 512, 1024],
                              default=[1, 8, 16, 32], disabled=busy, key="fb_streams",
                              help="Each selected value is a separate test. Each test creates that many concurrent data flows.")
     st.caption(f"Matrix size: {len(transports) * len(directions) * len(streams)} test(s).")

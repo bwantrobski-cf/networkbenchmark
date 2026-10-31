@@ -112,7 +112,7 @@ def udp_base_listener(ctx):
             df_enabled[sock] = False
             ctx.log(f"UDP PMTUD echo {net.family_label(sock.family)} DF unavailable: {exc}")
         receive_buffers[sock] = [
-            bytearray(65535) for _ in range(stream_worker.UDP_BATCH_SIZE)]
+            bytearray(65535) for _ in range(stream_worker.udp_io_batch_size())]
         socket_metadata[sock] = stream_worker.configure_udp_socket(sock)
         overflow_states[sock] = stream_worker._UdpReceiveState()
         try:
@@ -132,7 +132,8 @@ def udp_base_listener(ctx):
         for sock in readable:
             try:
                 if batched[sock]:
-                    received = udp_batch.recvmmsg_into(sock, receive_buffers[sock])
+                    received = udp_batch.recvmmsg_into(
+                        sock, receive_buffers[sock][:stream_worker.udp_io_batch_size()])
                 else:
                     data, from_addr = sock.recvfrom(constants.BUFSZ)
                     received = [(len(data), from_addr, 0, None)]

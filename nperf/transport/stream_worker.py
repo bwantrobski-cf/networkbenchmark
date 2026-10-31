@@ -12,6 +12,7 @@ new data connection/flow so it can be demultiplexed from a lightweight
 """
 
 import bisect
+import errno
 import hashlib
 import math
 import operator
@@ -34,6 +35,7 @@ UDP_HEADER_SIZE = UDP_HEADER_STRUCT.size
 UDP_FLAG_DATA = 0
 UDP_FLAG_STOP = 1
 UDP_BATCH_SIZE = 64
+_UDP_PYTHON_BATCH_SIZE = 8
 UDP_SOCKET_BUFFER_BYTES = 16 * 1024 * 1024
 
 _UDP_MAX_DATAGRAM_SIZE = 65535
@@ -43,6 +45,7 @@ _UINT64_MAX = (1 << 64) - 1
 _INT64_MAX = (1 << 63) - 1
 _SEQUENCE_REORDER_WINDOW = 1 << 16
 _UDP_STOP_DRAIN_SEC = 0.5
+_MACOS_TCP_BUFFER_BUDGET_BYTES = 64 * 1024 * 1024
 
 _RUN_ID_LEN = 36  # uuid4 string length
 PREAMBLE_FMT = f"{len(constants.DATA_STREAM_MAGIC)}s{_RUN_ID_LEN}sI"
@@ -167,7 +170,18 @@ def tcp_write_size_for_path_mtu(path_mtu, family=socket.AF_INET):
     return min(constants.TCP_CHUNK_SIZE, max(mss, mss * 32))
 
 
-def configure_tcp_socket(sock: socket.socket, path_mtu=None, family=None, counters=None):
+def configure_tcp_socket(sock: socket.socket, path_mtu=None, family=None, counters=None,
+                         total_streams=None):
+    # macOS has a small global mbuf pool even on machines with ample RAM.
+    # Bound autotuning for large runs; leave Linux and small runs unchanged.
+    if (sys.platform == "darwin" and isinstance(total_streams, int)
+            and total_streams > 64):
+        per_stream_bytes = _MACOS_TCP_BUFFER_BUDGET_BYTES // total_streams
+        for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, option, per_stream_bytes)
+            except OSError:
+                pass
     mss = tcp_mss_for_path_mtu(path_mtu, family=_family_or_socket_family(family, sock))
     option = getattr(socket, "TCP_MAXSEG", None)
     if mss is not None and option is not None:
@@ -210,6 +224,12 @@ def tcp_sender_loop(sock: socket.socket, counters, stop_event: threading.Event,
             if n > 0:
                 counters.add_sent(n)
     finally:
+        # Finish each stream independently; waiting for every sender in a large
+        # worker group before sending EOF can stall the peer's drain phase.
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
         try:
             retrans = tcp_info.get_tcp_retransmits(sock)
             if retrans is not None:
@@ -521,6 +541,11 @@ def _wait_for_udp_ready(sock, stop_event, readable, timeout=0.05):
     if stop_event.is_set():
         return False
     try:
+        # poll() handles descriptors above FD_SETSIZE in large stream runs.
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(sock, select.POLLIN if readable else select.POLLOUT)
+            return bool(poller.poll(math.ceil(max(0.0, timeout) * 1000)))
         readers = [sock] if readable else []
         writers = [] if readable else [sock]
         ready_read, ready_write, _ = select.select(
@@ -545,6 +570,23 @@ def _publish_udp_backend(counters):
         pass
 
 
+def _record_udp_io_error(sock, counters, stop_event, exc):
+    closed = isinstance(exc, OSError) and exc.errno == errno.EBADF
+    if (isinstance(exc, ValueError)
+            and str(exc).startswith("file descriptor cannot be a negative integer")):
+        closed = sock.fileno() < 0
+    # Closing a socket during a requested stop is harmless. An unexpected close
+    # or another native backend error must still invalidate the stream.
+    if not (stop_event.is_set() and closed):
+        counters.set_error(str(exc))
+
+
+def udp_io_batch_size():
+    # The portable backend performs one syscall per packet. Keep its work
+    # bounded so hundreds of threads can observe stop/trial changes promptly.
+    return UDP_BATCH_SIZE if udp_batch.BACKEND == "native" else _UDP_PYTHON_BATCH_SIZE
+
+
 def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
                      stop_event: threading.Event, duration_sec: float, start_time: float,
                      rate_value=None, path_mtu=None, trial_value=None,
@@ -559,7 +601,8 @@ def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
         path_mtu, family=getattr(sock, "family", socket.AF_INET))
     payload = _padding(max(0, udp_packet_size - UDP_HEADER_SIZE))
     packet_size = UDP_HEADER_SIZE + len(payload)
-    send_buffers = [bytearray(packet_size) for _ in range(UDP_BATCH_SIZE)]
+    batch_size = udp_io_batch_size()
+    send_buffers = [bytearray(packet_size) for _ in range(batch_size)]
     for buffer in send_buffers:
         buffer[UDP_HEADER_SIZE:] = payload
 
@@ -614,7 +657,7 @@ def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
                     # pacing still attains low target rates, while bounding any
                     # catch-up burst to one syscall batch.
                     burst_cap = min(
-                        packet_size * UDP_BATCH_SIZE,
+                        packet_size * batch_size,
                         max(packet_size * 4, rate * 0.005),
                     )
                     tokens = min(tokens, burst_cap)
@@ -626,12 +669,12 @@ def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
                         continue
                     cap_packets = max(1, int(burst_cap // packet_size))
                     pending_count = min(
-                        UDP_BATCH_SIZE, cap_packets, int(tokens // packet_size))
+                        batch_size, cap_packets, int(tokens // packet_size))
                     pending_paced = True
                 else:
                     tokens = 0.0
                     last_refill = now
-                    pending_count = UDP_BATCH_SIZE
+                    pending_count = batch_size
                     pending_paced = False
 
                 pending_offset = 0
@@ -645,8 +688,9 @@ def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
 
             try:
                 send_started_ns = time.monotonic_ns()
+                batch_end = min(pending_count, pending_offset + udp_io_batch_size())
                 sent = udp_batch.sendmmsg(
-                    sock, send_buffers[pending_offset:pending_count],
+                    sock, send_buffers[pending_offset:batch_end],
                     address=send_address)
                 send_finished_ns = time.monotonic_ns()
             except BlockingIOError:
@@ -656,11 +700,11 @@ def udp_sender_loop(sock: socket.socket, dest_addr, stream_index: int, counters,
                 _wait_for_udp_ready(
                     sock, stop_event, readable=False, timeout=wait)
                 continue
-            except OSError as exc:
-                counters.set_error(str(exc))
+            except (OSError, ValueError) as exc:
+                _record_udp_io_error(sock, counters, stop_event, exc)
                 break
 
-            remaining_count = pending_count - pending_offset
+            remaining_count = batch_end - pending_offset
             if sent < 0 or sent > remaining_count:
                 counters.set_error(
                     "UDP batch backend returned an invalid send count")
@@ -851,7 +895,7 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
     state = _udp_receive_state(counters)
     receive_size = udp_packet_size_for_path_mtu(
         path_mtu, family=getattr(sock, "family", socket.AF_INET))
-    receive_buffers = [bytearray(receive_size) for _ in range(UDP_BATCH_SIZE)]
+    receive_buffers = [bytearray(receive_size) for _ in range(udp_io_batch_size())]
     _address, usable = _prepare_udp_socket(
         sock, known_peer_addr, counters, connect_socket)
     if not usable:
@@ -864,12 +908,12 @@ def udp_receiver_loop(sock: socket.socket, counters, stop_event: threading.Event
             break
         overflow_before = state.overflow_total
         try:
-            received = udp_batch.recvmmsg_into(sock, receive_buffers)
+            received = udp_batch.recvmmsg_into(sock, receive_buffers[:udp_io_batch_size()])
         except BlockingIOError:
             _wait_for_udp_ready(sock, stop_event, readable=True)
             continue
-        except OSError as exc:
-            counters.set_error(str(exc))
+        except (OSError, ValueError) as exc:
+            _record_udp_io_error(sock, counters, stop_event, exc)
             break
         if not received:
             _wait_for_udp_ready(sock, stop_event, readable=True)
@@ -951,46 +995,62 @@ def run_stream_group(socks: dict, role: str, transport: str, counter_views: dict
     Event's shared Condition lock could be left held by such a worker and
     deadlock the parent's ``set()``. Lock-free polling avoids that entirely.
     """
-    if wait_start is not None:
-        while not wait_start():
-            if on_wait_tick is not None:
-                on_wait_tick()
-            time.sleep(0.02)
-    start_time = time.time()
-
+    start_gate = threading.Event()
+    start_time = None
     local_stops = {}
     threads = []
-    for i, (sock, dest) in socks.items():
-        stop_ev = threading.Event()
-        local_stops[i] = stop_ev
+
+    def _run_stream(i, sock, dest, stop_ev):
+        start_gate.wait()
+        if stop_ev.is_set():
+            return
         view = counter_views[i]
         if role == "send":
             if transport == "tcp":
-                th = threading.Thread(target=tcp_sender_loop,
-                                       args=(sock, view, stop_ev, duration_sec, start_time, path_mtu),
-                                       daemon=True)
+                tcp_sender_loop(sock, view, stop_ev, duration_sec, start_time, path_mtu)
             else:
-                th = threading.Thread(target=udp_sender_loop,
-                                       args=(sock, dest, i, view, stop_ev, duration_sec, start_time),
-                                       kwargs={"rate_value": rate_value,
-                                                "path_mtu": path_mtu,
-                                                "trial_value": trial_value,
-                                                "connect_socket": connect_udp,
-                                                "session_cookie": session_cookie}, daemon=True)
+                udp_sender_loop(
+                    sock, dest, i, view, stop_ev, duration_sec, start_time,
+                    rate_value=rate_value, path_mtu=path_mtu, trial_value=trial_value,
+                    connect_socket=connect_udp, session_cookie=session_cookie)
         else:
             if transport == "tcp":
-                th = threading.Thread(target=tcp_receiver_loop,
-                                       args=(sock, view, stop_ev, path_mtu), daemon=True)
+                tcp_receiver_loop(sock, view, stop_ev, path_mtu)
             else:
-                th = threading.Thread(target=udp_receiver_loop,
-                                       args=(sock, view, stop_ev),
-                                        kwargs={"known_peer_addr": dest,
-                                                "stream_index": i,
-                                                "connect_socket": connect_udp,
-                                                "path_mtu": path_mtu,
-                                                "session_cookie": session_cookie}, daemon=True)
-        th.start()
-        threads.append(th)
+                udp_receiver_loop(
+                    sock, view, stop_ev, known_peer_addr=dest, stream_index=i,
+                    connect_socket=connect_udp, path_mtu=path_mtu,
+                    session_cookie=session_cookie)
+
+    prepared = False
+    try:
+        # Prepare every thread before releasing data flow. Otherwise busy early
+        # streams can starve thread creation until the test duration has elapsed.
+        for i, (sock, dest) in socks.items():
+            stop_ev = threading.Event()
+            local_stops[i] = stop_ev
+            th = threading.Thread(
+                target=_run_stream, args=(i, sock, dest, stop_ev), daemon=True)
+            th.start()
+            threads.append(th)
+        if wait_start is not None:
+            while not wait_start():
+                if stopped is not None and stopped():
+                    return
+                if on_wait_tick is not None:
+                    on_wait_tick()
+                time.sleep(0.02)
+        start_time = time.time()
+        prepared = True
+    finally:
+        if not prepared:
+            for ev in local_stops.values():
+                ev.set()
+        start_gate.set()
+        if not prepared:
+            deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
+            for th in threads:
+                th.join(timeout=max(0.0, deadline - time.monotonic()))
 
     if stopped is not None:
         def _monitor():

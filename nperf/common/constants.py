@@ -10,8 +10,8 @@ APP_NAME = "nperf"
 DEFAULT_CONTROL_PORT = 12000
 
 # Base ports used BOTH for the quick "check connectivity" echo probes AND as
-# the base port for throughput-test parallel data streams (stream i uses
-# base_port + i, opened on demand for the duration of a throughput test).
+# the base port for throughput-test parallel data streams (opened on demand,
+# skipping ports reserved by the server for the same transport).
 DEFAULT_UDP_PORT = 10000
 DEFAULT_TCP_PORT = 11000
 
@@ -50,11 +50,15 @@ STDOUT_INTERVAL_SEC = 1.0
 SOCKET_TIMEOUT_SEC = 30
 FINAL_STATS_TIMEOUT_SEC = 60
 WORKER_DRAIN_TIMEOUT_SEC = 10
+# TCP receivers must consume queued data and retransmissions before seeing EOF.
+# Leave room for the final control exchange within FINAL_STATS_TIMEOUT_SEC.
+TCP_RECEIVER_DRAIN_TIMEOUT_SEC = 45
 CONTROL_RECV_POLL_SEC = 0.05
 PROBE_INTERVAL_SEC = 0.1
 MAX_RUN_TIME_FAILSAFE_SEC = 3600
 DEFAULT_TEST_DURATION_SEC = 10
 DEFAULT_STREAMS = 1
+MAX_PARALLEL_STREAMS = 1024
 
 BUFSZ = 128 * 1024
 UDP_PAYLOAD_SIZE = 1200
@@ -66,7 +70,6 @@ FALLBACK_PATH_MTU = 1300
 PMTUD_MIN_MTU = 68
 PMTUD_DEFAULT_MAX_MTU = 1500
 PMTUD_JUMBO_MAX_MTU = 9000
-MAX_PARALLEL_STREAMS = 64
 
 # ---------------------------------------------------------------------------
 # UDP loss-target tuning (multiplicative rate search)

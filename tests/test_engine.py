@@ -36,6 +36,19 @@ class _FreshPeerStats:
 
 
 class EngineTests(unittest.TestCase):
+    def test_config_accepts_1024_streams_for_both_transports_and_families(self):
+        for transport in ("tcp", "udp"):
+            for ipv6 in (False, True):
+                with self.subTest(transport=transport, ipv6=ipv6):
+                    cfg = engine.ThroughputClientConfig(
+                        "::1" if ipv6 else "127.0.0.1", transport=transport,
+                        streams=1024, procs=4, ipv6=ipv6)
+                    self.assertEqual(cfg.streams, 1024)
+                    self.assertEqual(cfg.procs, 4)
+        for streams in (0, -1, 1025):
+            with self.subTest(streams=streams), self.assertRaisesRegex(ValueError, "1 to 1024"):
+                engine.ThroughputClientConfig("127.0.0.1", streams=streams)
+
     def test_config_rejects_nonfinite_or_excessive_durations(self):
         invalid = (0, -1, float("nan"), float("inf"),
                    constants.MAX_RUN_TIME_FAILSAFE_SEC + 1)
@@ -77,6 +90,43 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(cfg.pmtud_info["path_mtu_source"], "provided")
         self.assertIsNone(cfg.pmtud_info["probe_max_mtu"])
         self.assertFalse(cfg.pmtud_info["probe_ceiling_reached"])
+
+    def test_failed_tuning_stops_receiver_threads_before_closing_sockets(self):
+        cfg = engine.ThroughputClientConfig(
+            "198.51.100.10", transport="udp", direction="down", streams=2,
+            acceptable_loss_pct=0.5, path_mtu=1500, calibration_sec=0)
+        sockets = {index: (socket.socket(socket.AF_INET, socket.SOCK_DGRAM), None)
+                   for index in range(2)}
+        for sock, _ in sockets.values():
+            self.addCleanup(sock.close)
+        control = Mock()
+        control.recv.side_effect = [
+            {"type": "hello_ack", "ok": True, "udp_wire_version": 3, "ports": [10000, 10001]},
+            {"type": "stream_ready"}, {"type": "stream_ready"}, {"type": "start_ack"},
+        ]
+        observed = []
+        def receiver(sock, _counters, stop, **_kwargs):
+            if stop.wait(2):
+                observed.append(sock.fileno() >= 0)
+            else:
+                observed.append(False)
+
+        with patch.object(engine.addr, "resolve_host", return_value="198.51.100.10"), \
+             patch.object(engine.socket, "socket", return_value=Mock()), \
+             patch.object(engine, "ControlChannel", return_value=control), \
+             patch.object(engine, "_connect_streams", return_value=(sockets, {0: 1234, 1: 1235})), \
+             patch.object(engine, "_start_preamble_resender_thread", return_value=threading.Event()), \
+             patch.object(engine, "_client_dispatch_loop"), \
+             patch.object(engine.latency_probe, "prober_loop"), \
+             patch.object(engine._TrialAckTracker, "wait_for", return_value=True), \
+             patch.object(engine.stream_worker, "udp_receiver_loop", side_effect=receiver), \
+             patch.object(engine, "_run_udp_tuning", side_effect=engine.ThroughputError("tuning control failed")), \
+             self.assertRaisesRegex(engine.ThroughputError, "tuning control failed"):
+            engine._run_throughput_test_once(cfg)
+
+        self.assertEqual(observed, [True, True])
+        self.assertTrue(all(sock.fileno() == -1 for sock, _ in sockets.values()))
+        control.close.assert_called_once()
 
     def test_control_connection_errors_include_ipv6_endpoint_and_guidance(self):
         cases = (
@@ -992,6 +1042,33 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(joined_after_stop), 1)
         self.assertEqual(joined_after_stop[0][0], 1)
         self.assertLessEqual(joined_after_stop[0][1], constants.WORKER_DRAIN_TIMEOUT_SEC)
+
+    def test_tcp_download_workers_share_a_longer_eof_drain_budget(self):
+        stop_flag = SimpleNamespace(value=0)
+        clock = [100.0]
+        waits = []
+
+        def join(timeout):
+            waits.append((stop_flag.value, timeout))
+            clock[0] += 12
+
+        processes = [
+            SimpleNamespace(name=f"worker-{index}", pid=index, exitcode=0,
+                            is_alive=lambda: False, join=join)
+            for index in range(2)
+        ]
+        state = {"stop_flag": stop_flag, "procs": processes,
+                 "worker_status_q": queue.Queue()}
+        with patch.object(engine.time, "monotonic", side_effect=lambda: clock[0]):
+            failure = engine._stop_client_workers(
+                state, wait_for_peer=True,
+                peer_drain_timeout_sec=constants.TCP_RECEIVER_DRAIN_TIMEOUT_SEC)
+
+        self.assertIsNone(failure)
+        self.assertEqual(waits, [(0, 45.0), (0, 33.0)])
+        self.assertEqual(stop_flag.value, 0)
+        self.assertLess(constants.TCP_RECEIVER_DRAIN_TIMEOUT_SEC,
+                        constants.FINAL_STATS_TIMEOUT_SEC)
 
     def test_stream_validation_rejects_inactive_stream(self):
         cfg = engine.ThroughputClientConfig("198.51.100.10", streams=1)

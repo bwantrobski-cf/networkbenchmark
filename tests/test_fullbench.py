@@ -32,11 +32,13 @@ class FullbenchTests(unittest.TestCase):
         self.assertFalse(config.jumbo_mtu)
 
     def test_stream_counts_are_validated_against_protocol_cap(self):
-        config = FullBenchConfig("198.51.100.10", streams=[64])
-        self.assertEqual(config.streams, [64])
+        config = FullBenchConfig("198.51.100.10", streams=[64, 65, 1024])
+        self.assertEqual(config.streams, [64, 65, 1024])
+        self.assertEqual({spec["streams"] for spec in config.build_plan()}, {64, 65, 1024})
 
-        with self.assertRaisesRegex(ValueError, "1 to 64"):
-            FullBenchConfig("198.51.100.10", streams=[65])
+        for streams in (0, -1, 1025):
+            with self.subTest(streams=streams), self.assertRaisesRegex(ValueError, "1 to 1024"):
+                FullBenchConfig("198.51.100.10", streams=[streams])
 
     def test_pmtud_ceiling_mode_is_propagated_and_recorded(self):
         for jumbo_mtu, expected_max_mtu in ((False, 1500), (True, 9000)):

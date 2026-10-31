@@ -1,11 +1,18 @@
+import errno
 import multiprocessing
+import select
 import socket
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from nperf.transport import metrics, shared_counters, stream_worker
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 def _frame(stream_index, sequence, trial_id, flag=stream_worker.UDP_FLAG_DATA,
@@ -53,6 +60,155 @@ class _RecordingCounters(metrics.StreamCounters):
 
 
 class UdpFastPathTests(unittest.TestCase):
+    def test_large_macos_tcp_runs_bound_socket_buffers_without_changing_linux(self):
+        for platform, streams, expected in (
+                ("darwin", 1024, 65536),
+                ("darwin", 65, (64 * 1024 * 1024) // 65),
+                ("darwin", 64, None),
+                ("darwin", None, None),
+                ("linux", 1024, None)):
+            with self.subTest(platform=platform, streams=streams):
+                sock = Mock(family=socket.AF_INET)
+                with patch.object(stream_worker.sys, "platform", platform):
+                    stream_worker.configure_tcp_socket(sock, total_streams=streams)
+                calls = sock.setsockopt.call_args_list
+                if expected is None:
+                    self.assertEqual(calls, [])
+                else:
+                    self.assertEqual([call.args for call in calls], [
+                        (socket.SOL_SOCKET, socket.SO_SNDBUF, expected),
+                        (socket.SOL_SOCKET, socket.SO_RCVBUF, expected),
+                    ])
+
+    def test_sender_bounds_portable_batches_without_reducing_native_batches(self):
+        for backend, expected in (("python", 8), ("native", 64)):
+            with self.subTest(backend=backend):
+                counters = metrics.StreamCounters(0)
+                stop = threading.Event()
+                batch_lengths = []
+
+                def send_batch(_sock, buffers, **kwargs):
+                    batch_lengths.append(len(buffers))
+                    stop.set()
+                    return len(buffers)
+
+                with patch.object(stream_worker.udp_batch, "BACKEND", backend), \
+                     patch.object(stream_worker.udp_batch, "sendmmsg", side_effect=send_batch):
+                    stream_worker.udp_sender_loop(
+                        _FakeSendSocket(), None, 0, counters, stop, 1, time.time())
+
+                self.assertEqual(batch_lengths, [expected, 1])
+                self.assertEqual(counters.snapshot()["packets_sent"], expected)
+
+    def test_sender_reduces_pending_batch_after_native_runtime_fallback(self):
+        counters = metrics.StreamCounters(0)
+        stop = threading.Event()
+        lengths = []
+
+        def send_batch(_sock, buffers, **kwargs):
+            lengths.append(len(buffers))
+            if len(lengths) == 1:
+                stream_worker.udp_batch.BACKEND = "python"
+                return 1
+            stop.set()
+            return len(buffers)
+
+        with patch.object(stream_worker.udp_batch, "BACKEND", "native"), \
+             patch.object(stream_worker.udp_batch, "sendmmsg", side_effect=send_batch):
+            stream_worker.udp_sender_loop(
+                _FakeSendSocket(), None, 0, counters, stop, 1, time.time())
+
+        self.assertEqual(lengths, [64, 8, 1])
+        self.assertEqual(counters.snapshot()["packets_sent"], 9)
+
+    def test_worker_group_prepares_every_thread_before_starting_data(self):
+        real_thread = threading.Thread
+        count = 32
+        for transport in ("tcp", "udp"):
+            for role in ("send", "recv"):
+                with self.subTest(transport=transport, role=role):
+                    created = []
+                    observed = []
+                    start_checks = []
+
+                    def create_thread(*args, **kwargs):
+                        thread = real_thread(*args, **kwargs)
+                        created.append(thread)
+                        return thread
+
+                    def wait_start():
+                        start_checks.append((len(created), len(observed)))
+                        return True
+
+                    def run_loop(*args, **kwargs):
+                        observed.append(len(created))
+
+                    loop_name = f"{transport}_{'sender' if role == 'send' else 'receiver'}_loop"
+                    with patch.object(stream_worker.threading, "Thread", side_effect=create_thread), \
+                         patch.object(stream_worker, loop_name, side_effect=run_loop), \
+                         patch.object(stream_worker.tcp_info, "get_tcp_retransmits", return_value=None):
+                        stream_worker.run_stream_group(
+                            {i: (Mock(), None) for i in range(count)},
+                            role, transport, {i: Mock() for i in range(count)}, 1,
+                            wait_start=wait_start)
+
+                    self.assertEqual(start_checks, [(count, 0)])
+                    self.assertEqual(observed, [count] * count)
+                    self.assertTrue(all(not thread.is_alive() for thread in created))
+
+    def test_worker_group_can_stop_before_start_without_leaking_threads(self):
+        with patch.object(stream_worker, "udp_sender_loop") as sender:
+            stream_worker.run_stream_group(
+                {i: (Mock(), None) for i in range(8)}, "send", "udp",
+                {i: Mock() for i in range(8)}, 1,
+                wait_start=lambda: False, stopped=lambda: True)
+        sender.assert_not_called()
+
+    def test_tcp_sender_signals_eof_before_its_worker_group_closes_sockets(self):
+        sender, receiver = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        receiver.settimeout(1)
+        stop = threading.Event()
+        stop.set()
+        stream_worker.tcp_sender_loop(
+            sender, metrics.StreamCounters(0), stop, 1, time.time())
+        self.assertGreaterEqual(sender.fileno(), 0)
+        self.assertEqual(receiver.recv(1), b"")
+
+    @unittest.skipUnless(fcntl is not None and hasattr(select, "poll"), "requires Unix poll")
+    def test_udp_readiness_supports_descriptors_above_1023(self):
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        original = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sender.close)
+        self.addCleanup(original.close)
+        original.bind(("127.0.0.1", 0))
+        try:
+            descriptor = fcntl.fcntl(original.fileno(), fcntl.F_DUPFD, 1024)
+        except OSError as exc:
+            self.skipTest(f"file descriptor limit prevents high-fd test: {exc}")
+        receiver = socket.socket(fileno=descriptor)
+        self.addCleanup(receiver.close)
+        sender.sendto(b"ready", receiver.getsockname())
+        self.assertGreaterEqual(receiver.fileno(), 1024)
+        self.assertTrue(stream_worker._wait_for_udp_ready(
+            receiver, threading.Event(), readable=True, timeout=1))
+        self.assertTrue(stream_worker._wait_for_udp_ready(
+            receiver, threading.Event(), readable=False, timeout=1))
+
+    def test_last_of_1024_streams_has_independent_counters_and_framing(self):
+        shared = shared_counters.SharedCounters(1024)
+        counters = shared.view(1023)
+        preamble = stream_worker.build_preamble(
+            "12345678-1234-1234-1234-123456789abc", 1023)
+        self.assertEqual(stream_worker.parse_preamble(preamble)[2], 1023)
+        self.assertTrue(stream_worker.feed_udp_data_frame(counters, _frame(1023, 0, 1)))
+        counters.add_sent(64)
+        self.assertEqual(counters.snapshot()["packets_received"], 1)
+        self.assertEqual(counters.snapshot()["packets_sent"], 1)
+        self.assertEqual(shared.view(0).snapshot()["packets_received"], 0)
+        self.assertEqual(shared.view(0).snapshot()["packets_sent"], 0)
+
     def test_v3_header_round_trip_uses_uint64_sequence_and_cookie(self):
         sequence = (1 << 48) + 123
         packet = _frame(7, sequence, 41)
@@ -477,6 +633,55 @@ class UdpFastPathTests(unittest.TestCase):
         self.assertEqual(counters.snapshot()["error"],
                          "truncated UDP datagram")
         self.assertEqual(counters.snapshot()["packets_received"], 0)
+
+    def test_receiver_handles_closed_socket_during_stop_without_thread_error(self):
+        for failure in (ValueError("file descriptor cannot be a negative integer (-1)"),
+                        OSError(errno.EBADF, "Bad file descriptor")):
+            with self.subTest(failure=failure):
+                receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.addCleanup(receiver.close)
+                counters = metrics.StreamCounters(0)
+                stop = threading.Event()
+
+                def receive_batch(_sock, _buffers):
+                    stop.set()
+                    receiver.close()
+                    raise failure
+
+                with patch.object(stream_worker, "_prepare_udp_socket", return_value=(None, True)), \
+                     patch.object(stream_worker.udp_batch, "recvmmsg_into", side_effect=receive_batch):
+                    stream_worker.udp_receiver_loop(receiver, counters, stop)
+                self.assertIsNone(counters.snapshot()["error"])
+
+    def test_receiver_records_unexpected_close_and_native_backend_errors(self):
+        for stopping, failure in ((False, ValueError("file descriptor cannot be a negative integer (-1)")),
+                                  (True, ValueError("receive buffer is read-only"))):
+            with self.subTest(stopping=stopping, failure=failure):
+                receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.addCleanup(receiver.close)
+                counters = metrics.StreamCounters(0)
+                stop = threading.Event()
+
+                def receive_batch(_sock, _buffers):
+                    if stopping:
+                        stop.set()
+                    receiver.close()
+                    raise failure
+
+                with patch.object(stream_worker, "_prepare_udp_socket", return_value=(None, True)), \
+                     patch.object(stream_worker.udp_batch, "recvmmsg_into", side_effect=receive_batch):
+                    stream_worker.udp_receiver_loop(receiver, counters, stop)
+                self.assertEqual(counters.snapshot()["error"], str(failure))
+
+    def test_sender_records_native_backend_value_error(self):
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(sender.close)
+        counters = metrics.StreamCounters(0)
+        stop = threading.Event()
+        with patch.object(stream_worker, "_prepare_udp_socket", return_value=(None, True)), \
+             patch.object(stream_worker.udp_batch, "sendmmsg", side_effect=ValueError("invalid send buffer")):
+            stream_worker.udp_sender_loop(sender, None, 0, counters, stop, 1, time.time())
+        self.assertEqual(counters.snapshot()["error"], "invalid send buffer")
 
     def test_socket_metadata_records_actual_buffer_values(self):
         sock = _FakeSendSocket()

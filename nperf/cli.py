@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tp.add_argument("-R", "--reverse", action="store_true", default=False,
                        help="download direction (server to client); default is upload")
     p_tp.add_argument("-P", "--parallel", type=int, default=constants.DEFAULT_STREAMS,
-                       help="number of parallel streams (default: 1)")
+                       help=f"number of parallel streams (1-{constants.MAX_PARALLEL_STREAMS}; default: 1)")
     p_tp.add_argument("-t", "--time", type=float, default=constants.DEFAULT_TEST_DURATION_SEC,
                        help="test duration in seconds (default: 10)")
     p_tp.add_argument("--start-port", type=int, default=None,

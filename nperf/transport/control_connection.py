@@ -6,15 +6,20 @@ background reader thread so callers can send latency "probe" messages at any
 time (even while waiting for other control messages) without races.
 """
 
+import errno
 import json
 import queue
 import socket
 import threading
 import time
 
-_MAX_CONTROL_FRAME_BYTES = 1 << 20
-_MAX_QUEUED_MESSAGES = 64
-_MAX_QUEUED_BYTES = 4 << 20
+from ..common import constants
+
+# Bound memory while allowing full telemetry and one stream_ready per stream
+# to arrive before the client finishes connecting all its data sockets.
+_MAX_CONTROL_FRAME_BYTES = constants.MAX_PARALLEL_STREAMS * 4096
+_MAX_QUEUED_MESSAGES = constants.MAX_PARALLEL_STREAMS + 64
+_MAX_QUEUED_BYTES = _MAX_CONTROL_FRAME_BYTES * 4
 _MAX_QUEUED_WRITES = 64
 _DEFAULT_WRITE_TIMEOUT_SEC = 30.0
 
@@ -119,7 +124,27 @@ class ControlChannel:
                     request, BrokenPipeError("control connection is closed"))
                 continue
             try:
-                self.sock.sendall(request.data)
+                offset = 0
+                while offset < len(request.data):
+                    if self._closed.is_set():
+                        raise BrokenPipeError("control connection is closed")
+                    try:
+                        sent = self.sock.send(
+                            memoryview(request.data)[offset:offset + 65536])
+                    except OSError as exc:
+                        if exc.errno not in (
+                                errno.ENOBUFS, errno.EAGAIN, errno.EWOULDBLOCK,
+                                errno.EINTR):
+                            raise
+                        # Large runs can temporarily exhaust kernel buffers.
+                        # Preserve the offset; retrying sendall could duplicate
+                        # a partially transmitted JSON frame. The public send()
+                        # method still enforces the original write deadline.
+                        self._closed.wait(0.01)
+                        continue
+                    if sent == 0:
+                        raise BrokenPipeError("control connection is closed")
+                    offset += sent
             except OSError as exc:
                 self._finish_write(request, exc)
                 self.close()

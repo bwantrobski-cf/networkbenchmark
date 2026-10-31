@@ -1219,7 +1219,8 @@ def _connect_streams(cfg: ThroughputClientConfig, run_id: str, ports: list):
         if cfg.transport == "tcp":
             sock = socket.socket(cfg.family, socket.SOCK_STREAM)
             sock.bind(net.sockaddr(cfg.bind, 0, cfg.family))
-            stream_worker.configure_tcp_socket(sock, cfg.path_mtu)
+            stream_worker.configure_tcp_socket(
+                sock, cfg.path_mtu, total_streams=cfg.streams)
             sock.settimeout(constants.SOCKET_TIMEOUT_SEC)
             sock.connect(net.sockaddr(cfg.server_host, port, cfg.family))
             sock.sendall(stream_worker.build_preamble(run_id, i))
@@ -1319,7 +1320,8 @@ def _client_worker_proc_inner(conn: dict, run_id: str, assignments: list, role: 
             if conn["transport"] == "tcp":
                 s = socket.socket(conn["family"], socket.SOCK_STREAM)
                 s.bind(net.sockaddr(conn["bind"], 0, conn["family"]))
-                stream_worker.configure_tcp_socket(s, conn.get("path_mtu"))
+                stream_worker.configure_tcp_socket(
+                    s, conn.get("path_mtu"), total_streams=conn.get("streams"))
                 s.settimeout(constants.SOCKET_TIMEOUT_SEC)
                 s.connect(net.sockaddr(conn["server_ip"], port, conn["family"]))
                 s.sendall(stream_worker.build_preamble(run_id, i))
@@ -1410,10 +1412,13 @@ def _worker_process_failure(procs: list, status_q, require_stopped: bool = False
     return "\n".join(details) or None
 
 
-def _stop_client_workers(mp_state: dict, wait_for_peer: bool = False):
+def _stop_client_workers(mp_state: dict, wait_for_peer: bool = False,
+                         peer_drain_timeout_sec=None):
     """Stop all workers within one shared drain timeout."""
     if wait_for_peer:
-        deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
+        timeout = (constants.WORKER_DRAIN_TIMEOUT_SEC if peer_drain_timeout_sec is None
+                   else peer_drain_timeout_sec)
+        deadline = time.monotonic() + timeout
         for process in mp_state["procs"]:
             process.join(timeout=max(0.0, deadline - time.monotonic()))
         if all(not process.is_alive() for process in mp_state["procs"]):
@@ -1444,7 +1449,7 @@ def _start_client_workers(cfg: ThroughputClientConfig, server_ip: str, run_id: s
     role = "send" if cfg.direction == "up" else "recv"
     conn = {"server_ip": server_ip, "bind": cfg.bind, "transport": cfg.transport,
             "duration_sec": cfg.sender_duration_sec, "path_mtu": cfg.path_mtu,
-            "family": cfg.family}
+            "family": cfg.family, "streams": cfg.streams}
     start_flag = mp_ctx.Value("b", 0, lock=False)
     stop_flag = mp_ctx.Value("b", 0, lock=False)
     # Per-stream target send rate in bytes/sec (0 = unpaced); driven by the UDP
@@ -2212,7 +2217,9 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
 
         stream_stop_events = {}
         stream_threads = []
-        start_time = time.time()
+        stream_start_gate = threading.Event()
+        stream_entered = {}
+        start_time = None
 
         # Per-stream target send rate (bytes/sec, 0 = unpaced). For upload this
         # drives the local senders; the tuning controller updates it live.
@@ -2242,49 +2249,53 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
         client_host_baseline = _snapshot_client_endpoint(
             client_topology, tested_family=cfg.family)
 
+        def run_local_stream(i, sock, dest, stop_ev):
+            stream_start_gate.wait()
+            if stop_ev.is_set():
+                return
+            stream_entered[i].set()
+            if cfg.direction == "up":
+                if cfg.transport == "tcp":
+                    stream_worker.tcp_sender_loop(
+                        sock, counters[i], stop_ev, cfg.sender_duration_sec,
+                        start_time, cfg.path_mtu)
+                else:
+                    stream_worker.udp_sender_loop(
+                        sock, dest, i, counters[i], stop_ev,
+                        cfg.sender_duration_sec, start_time,
+                        rate_value=client_rate_value, path_mtu=cfg.path_mtu,
+                        trial_value=client_trial_value,
+                        session_cookie=stream_worker.udp_session_cookie(run_id))
+            elif cfg.transport == "tcp":
+                stream_worker.tcp_receiver_loop(sock, counters[i], stop_ev, cfg.path_mtu)
+            else:
+                stream_worker.udp_receiver_loop(
+                    sock, counters[i], stop_ev, known_peer_addr=dest,
+                    path_mtu=cfg.path_mtu,
+                    session_cookie=stream_worker.udp_session_cookie(run_id))
+
+        if not use_mp:
+            for i, (sock, dest) in streams.items():
+                stop_ev = threading.Event()
+                stream_stop_events[i] = stop_ev
+                stream_entered[i] = threading.Event()
+                th = threading.Thread(
+                    target=run_local_stream, args=(i, sock, dest, stop_ev), daemon=True)
+                th.start()
+                stream_threads.append(th)
+
+        start_time = time.time()
         measurement_started_at = time.monotonic()
         phase.start_running()
         control.send("start_data")
-
         if use_mp:
             mp_state["start_flag"].value = 1
-        elif cfg.direction == "up":
-            for i, (sock, dest) in streams.items():
-                stop_ev = threading.Event()
-                stream_stop_events[i] = stop_ev
-                if cfg.transport == "tcp":
-                    th = threading.Thread(target=stream_worker.tcp_sender_loop,
-                                           args=(sock, counters[i], stop_ev, cfg.sender_duration_sec, start_time,
-                                                 cfg.path_mtu),
-                                           daemon=True)
-                else:
-                    th = threading.Thread(target=stream_worker.udp_sender_loop,
-                                           args=(sock, dest, i, counters[i], stop_ev,
-                                                 cfg.sender_duration_sec, start_time),
-                                            kwargs={"rate_value": client_rate_value,
-                                                    "path_mtu": cfg.path_mtu,
-                                                    "trial_value": client_trial_value,
-                                                    "session_cookie":
-                                                        stream_worker.udp_session_cookie(run_id)},
-                                           daemon=True)
-                th.start()
-                stream_threads.append(th)
         else:
-            for i, (sock, dest) in streams.items():
-                stop_ev = threading.Event()
-                stream_stop_events[i] = stop_ev
-                if cfg.transport == "tcp":
-                    th = threading.Thread(target=stream_worker.tcp_receiver_loop,
-                                           args=(sock, counters[i], stop_ev, cfg.path_mtu), daemon=True)
-                else:
-                    th = threading.Thread(target=stream_worker.udp_receiver_loop,
-                                            args=(sock, counters[i], stop_ev),
-                                            kwargs={"known_peer_addr": dest,
-                                                    "path_mtu": cfg.path_mtu,
-                                                    "session_cookie":
-                                                        stream_worker.udp_session_cookie(run_id)}, daemon=True)
-                th.start()
-                stream_threads.append(th)
+            stream_start_gate.set()
+            deadline = time.monotonic() + constants.SOCKET_TIMEOUT_SEC
+            for i, entered in stream_entered.items():
+                if not entered.wait(timeout=max(0.0, deadline - time.monotonic())):
+                    raise ThroughputError(f"data stream {i} did not start in time")
 
         recorder = metrics.IntervalRecorder(transport=cfg.transport)
         tuning = None
@@ -2402,17 +2413,22 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
                 f"timed out after {constants.FINAL_STATS_TIMEOUT_SEC}s waiting for final peer statistics")
 
         if not local_workers_stopped:
+            drain_timeout = (constants.TCP_RECEIVER_DRAIN_TIMEOUT_SEC
+                             if cfg.transport == "tcp"
+                             else constants.WORKER_DRAIN_TIMEOUT_SEC)
             if use_mp:
-                client_worker_failure = _stop_client_workers(mp_state, wait_for_peer=True)
+                client_worker_failure = _stop_client_workers(
+                    mp_state, wait_for_peer=True, peer_drain_timeout_sec=drain_timeout)
             else:
-                join_deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
+                join_deadline = time.monotonic() + drain_timeout
                 for thread in stream_threads:
                     thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
                 if any(thread.is_alive() for thread in stream_threads):
                     for ev in stream_stop_events.values():
                         ev.set()
+                    join_deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
                     for thread in stream_threads:
-                        thread.join(timeout=constants.WORKER_DRAIN_TIMEOUT_SEC)
+                        thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
                 stuck_threads = [thread.name for thread in stream_threads
                                  if thread.is_alive()]
                 if stuck_threads:
@@ -2497,6 +2513,21 @@ def _run_throughput_test_once(cfg: ThroughputClientConfig, on_interval=None,
     finally:
         if 'preamble_resend_stop' in locals() and preamble_resend_stop is not None:
             preamble_resend_stop.set()
+        if 'prober_stop' in locals():
+            prober_stop.set()
+        if 'phase' in locals():
+            phase.stop()
+        if 'stream_stop_events' in locals():
+            for event in stream_stop_events.values():
+                event.set()
+        if 'stream_start_gate' in locals():
+            stream_start_gate.set()
+        # Exception paths (including tuning retries) must drain data threads
+        # before closing sockets, just like the successful path does.
+        if 'stream_threads' in locals():
+            deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
+            for thread in stream_threads:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if 'mp_state' in locals() and mp_state is not None:
             mp_state["stop_flag"].value = 1
             for process in mp_state["procs"]:

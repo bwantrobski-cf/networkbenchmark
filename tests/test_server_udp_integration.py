@@ -136,14 +136,78 @@ class ServerUdpIntegrationTests(unittest.TestCase):
         sock.shutdown.assert_not_called()
         sock.close.assert_not_called()
 
+    def test_tcp_upload_drain_waits_for_eof_without_extending_abort_cleanup(self):
+        for transport, direction, abort, budget in (
+                ("tcp", "up", False, 45),
+                ("tcp", "up", True, 10),
+                ("tcp", "down", False, 10),
+                ("udp", "up", False, 10)):
+            with self.subTest(transport=transport, direction=direction, abort=abort):
+                session = throughput_session.ThroughputSession(
+                    RUN_ID, _params(transport=transport, direction=direction), Mock())
+                session.mp_enabled = True
+                session.stop_flag = SimpleNamespace(value=0)
+                clock = [100.0]
+                waits = []
+
+                def join(timeout):
+                    waits.append((session.stop_flag.value, timeout))
+                    clock[0] += 12
+
+                session.worker_procs = [
+                    SimpleNamespace(pid=index, is_alive=lambda: False, join=join)
+                    for index in range(2)
+                ]
+                with patch.object(throughput_session.time, "monotonic",
+                                  side_effect=lambda: clock[0]):
+                    session.stop_all_streams(abort=abort)
+
+                stopping = int(abort or transport != "tcp" or direction == "down")
+                self.assertEqual(waits, [
+                    (stopping, budget), (stopping, max(0, budget - 12))])
+                self.assertFalse(session.cleanup_terminated_pids)
+
     def test_session_parameters_bound_streams_and_mtu(self):
-        with self.assertRaisesRegex(throughput_session.ProtocolError, "streams"):
-            throughput_session._validate_session_params({"streams": 65})
+        for streams in (0, -1, 1025):
+            with self.subTest(streams=streams), self.assertRaisesRegex(
+                    throughput_session.ProtocolError, "streams"):
+                throughput_session._validate_session_params({"streams": streams})
         with self.assertRaisesRegex(throughput_session.ProtocolError, "path_mtu"):
             throughput_session._validate_session_params({
                 "streams": 1, "path_mtu": 1_000_000_000})
         self.assertEqual(throughput_session._validate_session_params({
-            "streams": 64, "path_mtu": 9000}), 64)
+            "streams": 1024, "path_mtu": 9000}), 1024)
+
+    def test_1024_stream_ports_skip_the_control_listener(self):
+        config = state.ServerConfig()
+        ports = throughput_session._allocate_stream_ports(config, "tcp", 1024)
+        self.assertEqual(len(set(ports)), 1024)
+        self.assertEqual(ports[:2], [11000, 11001])
+        self.assertEqual(ports[999:1002], [11999, 12001, 12002])
+        self.assertEqual(ports[-1], 12024)
+        self.assertNotIn(config.control_port, ports)
+        self.assertEqual(
+            throughput_session._allocate_stream_ports(config, "udp", 1024),
+            list(range(10000, 11024)))
+
+    def test_stream_ports_skip_custom_control_and_natt_ports(self):
+        config = state.ServerConfig(tcp_port=20000, control_port=20001, udp_port=4499)
+        self.assertEqual(
+            throughput_session._allocate_stream_ports(config, "tcp", 3),
+            [20000, 20002, 20003])
+        self.assertEqual(
+            throughput_session._allocate_stream_ports(config, "udp", 3),
+            [4499, 4501, 4502])
+
+    def test_stream_ports_reject_reserved_base_and_port_exhaustion(self):
+        for transport, config in (
+                ("tcp", state.ServerConfig(tcp_port=12000)),
+                ("udp", state.ServerConfig(udp_port=4500)),
+                ("tcp", state.ServerConfig(tcp_port=65535)),
+                ("udp", state.ServerConfig(udp_port=65535))):
+            with self.subTest(transport=transport, config=config), self.assertRaises(
+                    throughput_session.ProtocolError):
+                throughput_session._allocate_stream_ports(config, transport, 2)
 
     def test_session_parameters_require_a_finite_bounded_duration(self):
         for duration in (0, -1, float("nan"), float("inf"),
@@ -524,7 +588,7 @@ class ServerUdpIntegrationTests(unittest.TestCase):
         self.assertEqual(attached, [(0, sock, peer, False)])
         self.assertEqual(bytes(feed.call_args.args[1][0]), bytes(frame))
         self.assertEqual(counter.snapshot()["kernel_rxq_drops"], 9)
-        self.assertEqual(len(captured_buffers[0]), stream_worker.UDP_BATCH_SIZE)
+        self.assertEqual(len(captured_buffers[0]), stream_worker.udp_io_batch_size())
 
 
 if __name__ == "__main__":

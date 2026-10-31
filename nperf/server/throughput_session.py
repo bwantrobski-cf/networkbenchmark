@@ -37,6 +37,25 @@ def _server_should_use_mp(params: dict, n: int) -> bool:
     return "fork" in multiprocessing.get_all_start_methods()
 
 
+def _allocate_stream_ports(config, transport, streams):
+    base_port = config.udp_port if transport == "udp" else config.tcp_port
+    reserved = (constants.IPSEC_NATT_PORT if transport == "udp"
+                else getattr(config, "control_port", constants.DEFAULT_CONTROL_PORT))
+    if not 1 <= base_port <= 65535 or base_port == reserved:
+        raise ProtocolError(f"{transport} base port {base_port} is invalid or reserved")
+    ports = []
+    port = base_port
+    while len(ports) < streams and port <= 65535:
+        if port != reserved:
+            ports.append(port)
+        port += 1
+    if len(ports) != streams:
+        raise ProtocolError(
+            f"not enough {transport} data ports for {streams} streams starting "
+            f"at {base_port}; choose a lower server base port")
+    return ports
+
+
 class ThroughputSession:
     def __init__(self, run_id: str, params: dict, control: ControlChannel):
         self.run_id = run_id
@@ -183,7 +202,7 @@ class ThroughputSession:
                 if self.params["transport"] == "tcp":
                     stream_worker.configure_tcp_socket(
                         sock, self.params.get("path_mtu"),
-                        counters=self.counters[index])
+                        counters=self.counters[index], total_streams=self.num_streams)
                 else:
                     # Stream 0 borrows the always-on base socket, so a rejected
                     # or failed claim must never close it.
@@ -260,7 +279,9 @@ class ThroughputSession:
         if self.mp_enabled:
             if stop_receivers:
                 self.stop_flag.value = 1
-            deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
+            drain_timeout = (constants.WORKER_DRAIN_TIMEOUT_SEC if stop_receivers
+                             else constants.TCP_RECEIVER_DRAIN_TIMEOUT_SEC)
+            deadline = time.monotonic() + drain_timeout
             for p in self.worker_procs:
                 p.join(timeout=max(0.0, deadline - time.monotonic()))
             for p in self.worker_procs:
@@ -462,7 +483,8 @@ def _server_worker_proc_inner(assignments, run_id, role, transport, bind, durati
                     ready_q.put(("error", i, "preamble timeout"))
                 continue
             conn, addr = result
-            stream_worker.configure_tcp_socket(conn, path_mtu)
+            stream_worker.configure_tcp_socket(
+                conn, path_mtu, total_streams=shared.num_streams)
             socks[i] = (conn, None)
             ready_q.put(("ready", i, addr))
         else:
@@ -638,35 +660,48 @@ def _start_sender_threads(ctx, session: ThroughputSession):
     main process only drives stream 0."""
     transport = session.params["transport"]
     duration_sec = session.params.get("duration_sec")
-    start_time = time.time()
+    start_time = None
+    start_gate = threading.Event()
 
-    for i in range(session.num_streams):
-        if session.mp_enabled and i in session.worker_indices:
-            continue
-        sock = session.stream_sockets.get(i)
-        addr = session.stream_addrs.get(i)
-        if sock is None:
-            continue
-        stop_ev = threading.Event()
-        session.stream_stop_events[i] = stop_ev
+    def run_sender(i, sock, addr, stop_ev):
+        start_gate.wait()
+        if stop_ev.is_set():
+            return
         if transport == "tcp":
-            th = threading.Thread(target=stream_worker.tcp_sender_loop,
-                                   args=(sock, session.counters[i], stop_ev, duration_sec, start_time,
-                                         session.params.get("path_mtu")),
-                                   daemon=True)
+            stream_worker.tcp_sender_loop(
+                sock, session.counters[i], stop_ev, duration_sec, start_time,
+                session.params.get("path_mtu"))
         else:
-            th = threading.Thread(target=stream_worker.udp_sender_loop,
-                                   args=(sock, addr, i, session.counters[i], stop_ev, duration_sec, start_time),
-                                   kwargs={"rate_value": session.rate_value,
-                                           "path_mtu": session.params.get("path_mtu"),
-                                            "trial_value": session.trial_value,
-                                            "session_cookie":
-                                                stream_worker.udp_session_cookie(session.run_id),
-                                            # The base-port socket also serves PMTUD and
-                                           # connectivity traffic and must stay unconnected.
-                                           "connect_socket": i != 0}, daemon=True)
-        th.start()
-        session.threads.append(th)
+            stream_worker.udp_sender_loop(
+                sock, addr, i, session.counters[i], stop_ev, duration_sec, start_time,
+                rate_value=session.rate_value, path_mtu=session.params.get("path_mtu"),
+                trial_value=session.trial_value,
+                session_cookie=stream_worker.udp_session_cookie(session.run_id),
+                # The borrowed base port must stay available for echo traffic.
+                connect_socket=i != 0)
+
+    prepared = False
+    try:
+        for i in range(session.num_streams):
+            if session.mp_enabled and i in session.worker_indices:
+                continue
+            sock = session.stream_sockets.get(i)
+            addr = session.stream_addrs.get(i)
+            if sock is None:
+                continue
+            stop_ev = threading.Event()
+            session.stream_stop_events[i] = stop_ev
+            th = threading.Thread(
+                target=run_sender, args=(i, sock, addr, stop_ev), daemon=True)
+            th.start()
+            session.threads.append(th)
+        start_time = time.time()
+        prepared = True
+    finally:
+        if not prepared:
+            for event in session.stream_stop_events.values():
+                event.set()
+        start_gate.set()
 
 
 def _wait_for_sender_trial(session: ThroughputSession, trial_id: int) -> list[int]:
@@ -944,12 +979,13 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
         params = msg["params"]
         try:
             n = _validate_session_params(params)
+            transport = params.get("transport", "tcp")
+            ports = _allocate_stream_ports(ctx.config, transport, n)
         except ProtocolError as exc:
             control.send("hello_ack", ok=False, error=str(exc))
             raise
         params["family"] = sock.family
         params["ip_version"] = net.ip_version_label(family=sock.family)
-        transport = params.get("transport", "tcp")
         params["streams"] = n
 
         if transport == "udp":
@@ -968,9 +1004,6 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
                 control.send("hello_ack", ok=False, error=error,
                              **_udp_hello_fields())
                 raise ProtocolError(error)
-
-        base_port = ctx.config.udp_port if transport == "udp" else ctx.config.tcp_port
-        ports = [base_port + i for i in range(n)]
 
         session = ThroughputSession(run_id, params, control)
         if ctx.set_session(session) is False:
@@ -1064,8 +1097,11 @@ def handle_control_connection(ctx, sock: socket.socket, peer_addr):
 
         # Capture the terminal host state before signalling or joining workers.
         final_host_sample = _server_host_sample(session)
+        drain_timeout = (constants.TCP_RECEIVER_DRAIN_TIMEOUT_SEC
+                         if transport == "tcp" and params["direction"] == "up"
+                         else constants.WORKER_DRAIN_TIMEOUT_SEC)
+        thread_deadline = time.monotonic() + drain_timeout
         session.stop_all_streams()
-        thread_deadline = time.monotonic() + constants.WORKER_DRAIN_TIMEOUT_SEC
         for thread in session.threads:
             thread.join(timeout=max(0.0, thread_deadline - time.monotonic()))
         stuck_threads = [thread.name for thread in session.threads if thread.is_alive()]
