@@ -14,6 +14,9 @@ This project folder is fully self-contained: it holds all the
 code, dependencies, and metadata needed to run and redistribute NPERF
 (e.g. commit this folder directly to GitHub).
 
+Before publishing, review the [publication and privacy checklist](SECURITY.md).
+Ignore rules do not remove private data already present in Git history.
+
 ## Project layout
 
 ```

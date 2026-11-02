@@ -140,16 +140,16 @@ class EngineTests(unittest.TestCase):
         for failure, detail_pattern in cases:
             with self.subTest(failure=failure):
                 cfg = engine.ThroughputClientConfig(
-                    "2602:81c:e001:31::10", ipv6=True, path_mtu=1500)
+                    "2001:db8::10", ipv6=True, path_mtu=1500)
                 control_sock = Mock()
                 control_sock.connect.side_effect = failure
                 with patch.object(
                         engine.addr, "resolve_host",
-                        return_value="2602:81c:e001:31::10"), \
+                        return_value="2001:db8::10"), \
                      patch.object(engine.socket, "socket", return_value=control_sock), \
                      self.assertRaisesRegex(
                          engine.ThroughputError,
-                         r"\[2602:81c:e001:31::10\]:12000.*" + detail_pattern):
+                         r"\[2001:db8::10\]:12000.*" + detail_pattern):
                     engine._run_throughput_test_once(cfg)
                 control_sock.close.assert_called_once()
 

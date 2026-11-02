@@ -5,15 +5,55 @@ __pycache__/
 .eggs/
 build/
 dist/
+.pytest_cache/
+.coverage*
+htmlcov/
 
 # Virtual environments
 .venv/
 venv/
 env/
 
+# Local configuration and credentials (examples must contain placeholders only)
+.env
+.env.*
+!.env.example
+!.env.sample
+.streamlit/secrets.toml
+.streamlit/secrets.*.toml
+.secrets/
+.aws/
+.ssh/
+.git-credentials
+.netrc
+_netrc
+.npmrc
+.pypirc
+credentials*.json
+*service-account*.json
+secrets.json
+secrets.yaml
+secrets.yml
+secrets.toml
+*.pem
+*.key
+*.p8
+*.p12
+*.pfx
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
 # Test result logs (keep the directory, ignore its contents)
 logs/*
 !logs/.gitkeep
+*.log
+
+# Packet captures and HTTP archives can contain private traffic and credentials
+*.pcap
+*.pcapng
+*.har
 
 # OS / editor
 .DS_Store
